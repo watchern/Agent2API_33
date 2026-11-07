@@ -38,7 +38,11 @@ jobs:
 
       - name: Extract release body from annotated tag
         shell: bash
-        run: git tag -l --format='%(contents)' "${{ github.ref_name }}" > RELEASE_BODY.md
+        run: |
+          # checkout 在 CI 里会把本地 tag 建成轻量引用,这里强制取回附注对象,
+          # 否则 %(contents) 只会给出 commit 消息
+          git fetch --force origin "refs/tags/${{ github.ref_name }}:refs/tags/${{ github.ref_name }}"
+          git tag -l --format='%(contents)' "${{ github.ref_name }}" > RELEASE_BODY.md
 
       - name: Publish release
         uses: softprops/action-gh-release@v2
