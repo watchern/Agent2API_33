@@ -285,6 +285,351 @@
       hint: wbI18n.t('商汤日日新的 OpenAI 兼容端点；余额查询走控制台账号密码（见下方「余额查询」一段）'),
       balance: { scheme: 'sensenova' },
     },
+    // ── FreeLLMAPI 提供商目录移植(2026-11-07,共 67 家)─────────────
+    // 端点抄自 FreeLLMAPI 0.7.x 的 server/src/providers,协议统一 chat_completions。
+    // 已排除:搜索/决策类 9 家、与现有卡同端点 7 家(nvidia/openrouter/huggingface/
+    // opencode/siliconflow/zhipu/volcengine)、custom(FreeLLMAPI 的手动入口,本网关自带)。
+    // google 走官方 OpenAI 兼容层;cloudflare 需在地址里填自己的账户 ID。
+    {
+      key: 'aclide', name: 'ACLIDE',
+      protocol: P.openai, baseUrl: 'https://aclide.com/v1',
+      hint: wbI18n.t('来源 FreeLLMAPI 目录 · shared monthly credits · Key 申请: https://aclide.com/en/dashboard/api-keys · 注意:上游 FreeLLMAPI 已隐藏该入口'),
+    },
+    {
+      key: 'agnes', name: 'Agnes AI',
+      protocol: P.openai, baseUrl: 'https://apihub.agnes-ai.com/v1',
+      hint: wbI18n.t('来源 FreeLLMAPI 目录 · free key · Key 申请: https://platform.agnes-ai.com'),
+    },
+    {
+      key: 'aihorde', name: 'AI Horde',
+      protocol: P.openai, baseUrl: 'https://oai.aihorde.net/v1',
+      hint: wbI18n.t('来源 FreeLLMAPI 目录 · no key needed, slow · Key 申请: https://aihorde.net/register · 官方兼容网关,匿名慢速,异常请换其它家'),
+      account: { noAuth: true },
+    },
+    {
+      key: 'ainative', name: 'AINative Studio',
+      protocol: P.openai, baseUrl: 'https://api.ainative.studio/api/v1',
+      hint: wbI18n.t('来源 FreeLLMAPI 目录 · free key · Key 申请: https://ainative.studio'),
+    },
+    {
+      key: 'aion', name: 'Aion Labs',
+      protocol: P.openai, baseUrl: 'https://api.aionlabs.ai/v1',
+      hint: wbI18n.t('来源 FreeLLMAPI 目录 · free key · Key 申请: https://www.aionlabs.ai'),
+    },
+    {
+      key: 'airforce', name: 'Api.Airforce',
+      protocol: P.openai, baseUrl: 'https://api.airforce/v1',
+      hint: wbI18n.t('来源 FreeLLMAPI 目录 · daily free requests; 1 per minute · Key 申请: https://api.airforce'),
+    },
+    {
+      key: 'anyapi', name: 'AnyAPI',
+      protocol: P.openai, baseUrl: 'https://api.anyapi.ai/v1',
+      hint: wbI18n.t('来源 FreeLLMAPI 目录 · free key · Key 申请: https://anyapi.ai'),
+    },
+    {
+      key: 'apinex', name: 'APINex',
+      protocol: P.openai, baseUrl: 'https://api.apinex.bond/v1',
+      hint: wbI18n.t('来源 FreeLLMAPI 目录 · shared daily free chat and decisions · Key 申请: https://apinex.bond/keys'),
+    },
+    {
+      key: 'bai', name: 'B.AI',
+      protocol: P.openai, baseUrl: 'https://api.b.ai/v1',
+      hint: wbI18n.t('来源 FreeLLMAPI 目录 · promotional free model · Key 申请: https://b.ai'),
+    },
+    {
+      key: 'bazaarlink', name: 'BazaarLink',
+      protocol: P.openai, baseUrl: 'https://bazaarlink.ai/api/v1',
+      hint: wbI18n.t('来源 FreeLLMAPI 目录 · free key · Key 申请: https://bazaarlink.ai'),
+    },
+    {
+      key: 'beatapi', name: 'BeatAPI',
+      protocol: P.openai, baseUrl: 'https://api.beatapi.io/v1',
+      hint: wbI18n.t('来源 FreeLLMAPI 目录 · JEV decisions; temporary free offer · Key 申请: https://beatapi.io'),
+    },
+    {
+      key: 'blaze', name: 'BlazeAPI',
+      protocol: P.openai, baseUrl: 'https://api.blazeapi.org/paid/v1',
+      hint: wbI18n.t('来源 FreeLLMAPI 目录 · daily free tokens; Discord verification · Key 申请: https://blazeapi.org/dashboard'),
+    },
+    {
+      key: 'blockrun', name: 'BlockRun',
+      protocol: P.openai, baseUrl: 'https://api.blockrun.ai/v1',
+      hint: wbI18n.t('来源 FreeLLMAPI 目录 · zero-priced models · Key 申请: https://user.blockrun.ai/dashboard/keys'),
+    },
+    {
+      key: 'cerebras', name: 'Cerebras',
+      protocol: P.openai, baseUrl: 'https://api.cerebras.ai/v1',
+      hint: wbI18n.t('来源 FreeLLMAPI 目录 · Key 申请: https://cloud.cerebras.ai'),
+    },
+    {
+      key: 'clod', name: 'CLōD',
+      protocol: P.openai, baseUrl: 'https://api.clod.io/v1',
+      hint: wbI18n.t('来源 FreeLLMAPI 目录 · shared daily free requests · Key 申请: https://app.clod.io'),
+    },
+    {
+      key: 'cloudflare', name: 'Cloudflare Workers AI',
+      protocol: P.openai, baseUrl: '',
+      placeholder: 'https://api.cloudflare.com/client/v4/accounts/你的账户ID/ai/v1',
+      hint: wbI18n.t('来源 FreeLLMAPI 目录 · Key 申请: https://dash.cloudflare.com'),
+    },
+    {
+      key: 'cohere', name: 'Cohere',
+      protocol: P.openai, baseUrl: 'https://api.cohere.ai/compatibility/v1',
+      hint: wbI18n.t('来源 FreeLLMAPI 目录 · Key 申请: https://dashboard.cohere.com/api-keys'),
+    },
+    {
+      key: 'dreamprompting', name: 'DreamPrompting',
+      protocol: P.openai, baseUrl: 'https://dreamprompting.com/api/v1',
+      hint: wbI18n.t('来源 FreeLLMAPI 目录 · rolling 24h free tokens and requests · Key 申请: https://dreamprompting.com'),
+    },
+    {
+      key: 'electronhub', name: 'ElectronHub',
+      protocol: P.openai, baseUrl: 'https://api.electronhub.ai/v1',
+      hint: wbI18n.t('来源 FreeLLMAPI 目录 · shared weekly credits · Key 申请: https://app.electronhub.ai'),
+    },
+    {
+      key: 'experiential', name: 'Experiential Labs',
+      protocol: P.openai, baseUrl: 'https://api.experientiallabs.ai/v1',
+      hint: wbI18n.t('来源 FreeLLMAPI 目录 · shared monthly credits · Key 申请: https://platform.experientiallabs.ai'),
+    },
+    {
+      key: 'freeai', name: 'Free.ai',
+      protocol: P.openai, baseUrl: 'https://api.free.ai',
+      hint: wbI18n.t('来源 FreeLLMAPI 目录 · shared free speech / transcription quota · Key 申请: https://free.ai/account/#api-keys'),
+    },
+    {
+      key: 'freeinference', name: 'FreeInference',
+      protocol: P.openai, baseUrl: 'https://freeinference.org/v1',
+      hint: wbI18n.t('来源 FreeLLMAPI 目录 · research; requests logged · Key 申请: https://freeinference.org'),
+    },
+    {
+      key: 'freemodel', name: 'FreeModel',
+      protocol: P.openai, baseUrl: 'https://freemodel.in/v1',
+      hint: wbI18n.t('来源 FreeLLMAPI 目录 · monthly allowance; Telegram verification · Key 申请: https://freemodel.in/dashboard'),
+    },
+    {
+      key: 'gizmo', name: 'Gizmo',
+      protocol: P.openai, baseUrl: 'https://api.gizmoplatforms.com/api/v1',
+      hint: wbI18n.t('来源 FreeLLMAPI 目录 · monthly free-model requests · Key 申请: https://gizmoplatforms.com/developers'),
+    },
+    {
+      key: 'google', name: 'Google AI Studio',
+      protocol: P.openai, baseUrl: 'https://generativelanguage.googleapis.com/v1beta/openai',
+      hint: wbI18n.t('来源 FreeLLMAPI 目录 · Key 申请: https://aistudio.google.com/apikey'),
+    },
+    {
+      key: 'groq', name: 'Groq',
+      protocol: P.openai, baseUrl: 'https://api.groq.com/openai/v1',
+      hint: wbI18n.t('来源 FreeLLMAPI 目录 · Key 申请: https://console.groq.com/keys'),
+    },
+    {
+      key: 'inferbase', name: 'Inferbase',
+      protocol: P.openai, baseUrl: 'https://api.inferbase.ai/v1',
+      hint: wbI18n.t('来源 FreeLLMAPI 目录 · shared monthly and daily allowance · Key 申请: https://inferbase.ai'),
+    },
+    {
+      key: 'iteracompute', name: 'IteraCompute',
+      protocol: P.openai, baseUrl: 'https://api.iteracompute.com/v1',
+      hint: wbI18n.t('来源 FreeLLMAPI 目录 · 30M free tokens / month, shared · Key 申请: https://iteracompute.com/free/'),
+    },
+    {
+      key: 'jamai', name: 'JamAI Base',
+      protocol: P.openai, baseUrl: 'https://api.jamaibase.com/api/v1',
+      hint: wbI18n.t('来源 FreeLLMAPI 目录 · monthly ELLM allowance · Key 申请: https://cloud.jamaibase.com'),
+    },
+    {
+      key: 'kenari', name: 'Kenari',
+      protocol: P.openai, baseUrl: 'https://kenari.id/v1',
+      hint: wbI18n.t('来源 FreeLLMAPI 目录 · shared daily free chat and images · Key 申请: https://kenari.id'),
+    },
+    {
+      key: 'kilo', name: 'Kilo Gateway',
+      protocol: P.openai, baseUrl: 'https://api.kilo.ai/api/gateway/v1',
+      hint: wbI18n.t('来源 FreeLLMAPI 目录 · no key needed · Key 申请: https://app.kilo.ai'),
+      account: { noAuth: true },
+    },
+    {
+      key: 'kiosapi', name: 'KiosAPI',
+      protocol: P.openai, baseUrl: 'https://api.kiosapi.id/v1',
+      hint: wbI18n.t('来源 FreeLLMAPI 目录 · shared daily free chat · Key 申请: https://kiosapi.id/dashboard/keys'),
+    },
+    {
+      key: 'llm7', name: 'LLM7',
+      protocol: P.openai, baseUrl: 'https://api.llm7.io/v1',
+      hint: wbI18n.t('来源 FreeLLMAPI 目录 · anon ok · Key 申请: https://llm7.io'),
+    },
+    {
+      key: 'llmtr', name: 'LLMTR',
+      protocol: P.openai, baseUrl: 'https://llmtr.com/v1',
+      hint: wbI18n.t('来源 FreeLLMAPI 目录 · daily free-model quotas · Key 申请: https://llmtr.com'),
+    },
+    {
+      key: 'logfare', name: 'Logfare',
+      protocol: P.openai, baseUrl: 'https://logfare.ai/v1',
+      hint: wbI18n.t('来源 FreeLLMAPI 目录 · fair-use free models · Key 申请: https://logfare.ai'),
+    },
+    {
+      key: 'longcat', name: 'LongCat',
+      protocol: P.openai, baseUrl: 'https://api.longcat.chat/openai/v1',
+      hint: wbI18n.t('来源 FreeLLMAPI 目录 · free daily, email signup ok · Key 申请: https://longcat.chat/platform'),
+    },
+    {
+      key: 'lucidity', name: 'Lucidity Composite',
+      protocol: P.openai, baseUrl: 'https://composite.lucidity.sh/v1',
+      hint: wbI18n.t('来源 FreeLLMAPI 目录 · daily free-model requests · Key 申请: https://composite.lucidity.sh'),
+    },
+    {
+      key: 'mistral', name: 'Mistral',
+      protocol: P.openai, baseUrl: 'https://api.mistral.ai/v1',
+      hint: wbI18n.t('来源 FreeLLMAPI 目录 · Key 申请: https://console.mistral.ai/api-keys/'),
+    },
+    {
+      key: 'modelscope', name: 'ModelScope',
+      protocol: P.openai, baseUrl: 'https://api-inference.modelscope.cn/v1',
+      hint: wbI18n.t('来源 FreeLLMAPI 目录 · free key, needs Aliyun cn binding · Key 申请: https://modelscope.cn/my/myaccesstoken'),
+    },
+    {
+      key: 'moondream', name: 'Moondream',
+      protocol: P.openai, baseUrl: 'https://api.moondream.ai/v1',
+      hint: wbI18n.t('来源 FreeLLMAPI 目录 · $5 shared monthly credits · Key 申请: https://moondream.ai/c/cloud/api-keys'),
+    },
+    {
+      key: 'nabh', name: 'nabh.cloud',
+      protocol: P.openai, baseUrl: 'https://api.nabh.cloud/v1',
+      hint: wbI18n.t('来源 FreeLLMAPI 目录 · 50 shared monthly credits · Key 申请: https://app.nabh.cloud'),
+    },
+    {
+      key: 'nara', name: 'NaraRouter',
+      protocol: P.openai, baseUrl: 'https://router.bynara.id/v1',
+      hint: wbI18n.t('来源 FreeLLMAPI 目录 · free key · Key 申请: https://router.bynara.id'),
+    },
+    {
+      key: 'navy', name: 'NavyAI',
+      protocol: P.openai, baseUrl: 'https://api.navy/v1',
+      hint: wbI18n.t('来源 FreeLLMAPI 目录 · free key · Key 申请: https://api.navy'),
+    },
+    {
+      key: 'novai', name: 'NovAI',
+      protocol: P.openai, baseUrl: 'https://aiapi-pro.com/v1',
+      hint: wbI18n.t('来源 FreeLLMAPI 目录 · daily free chat + video quota · Key 申请: https://aiapi-pro.com'),
+    },
+    {
+      key: 'ollama', name: 'Ollama Cloud',
+      protocol: P.openai, baseUrl: 'https://ollama.com/v1',
+      hint: wbI18n.t('来源 FreeLLMAPI 目录 · Key 申请: https://ollama.com/settings/keys'),
+    },
+    {
+      key: 'onomeo', name: 'onomeo',
+      protocol: P.openai, baseUrl: 'https://onomeo.com/v1',
+      hint: wbI18n.t('来源 FreeLLMAPI 目录 · 30 free calls / 5 hours, shared · Key 申请: https://onomeo.com/dashboard'),
+    },
+    {
+      key: 'orcarouter', name: 'OrcaRouter',
+      protocol: P.openai, baseUrl: 'https://api.orcarouter.ai/v1',
+      hint: wbI18n.t('来源 FreeLLMAPI 目录 · free key · Key 申请: https://www.orcarouter.ai'),
+    },
+    {
+      key: 'ovh', name: 'OVH AI Endpoints',
+      protocol: P.openai, baseUrl: 'https://oai.endpoints.kepler.ai.cloud.ovh.net/v1',
+      hint: wbI18n.t('来源 FreeLLMAPI 目录 · no key needed · Key 申请: https://endpoints.ai.cloud.ovh.net'),
+      account: { noAuth: true },
+    },
+    {
+      key: 'plugsky', name: 'Plugsky',
+      protocol: P.openai, baseUrl: 'https://plugsky.com/v1',
+      hint: wbI18n.t('来源 FreeLLMAPI 目录 · free chat aliases · Key 申请: https://plugsky.com/dashboard'),
+    },
+    {
+      key: 'pollinations', name: 'Pollinations',
+      protocol: P.openai, baseUrl: 'https://gen.pollinations.ai/v1',
+      hint: wbI18n.t('来源 FreeLLMAPI 目录 · Key 申请: https://enter.pollinations.ai'),
+    },
+    {
+      key: 'qianfan', name: 'Baidu Qianfan',
+      protocol: P.openai, baseUrl: 'https://qianfan.baidubce.com/v2',
+      hint: wbI18n.t('来源 FreeLLMAPI 目录 · free ERNIE, needs cn real-name · Key 申请: https://console.bce.baidu.com/qianfan/overview'),
+    },
+    {
+      key: 'radeon', name: 'AMD Radeon Cloud',
+      protocol: P.openai, baseUrl: 'https://developer.amd.com.cn/radeon/api/v1',
+      hint: wbI18n.t('来源 FreeLLMAPI 目录 · free shared models · Key 申请: https://developer.amd.com.cn/radeon/tokenfactory'),
+    },
+    {
+      key: 'reka', name: 'Reka',
+      protocol: P.openai, baseUrl: 'https://api.reka.ai/v1',
+      hint: wbI18n.t('来源 FreeLLMAPI 目录 · prepaid credits · Key 申请: https://platform.reka.ai'),
+    },
+    {
+      key: 'requesty', name: 'Requesty',
+      protocol: P.openai, baseUrl: 'https://router.requesty.ai/v1',
+      hint: wbI18n.t('来源 FreeLLMAPI 目录 · free key · Key 申请: https://www.requesty.ai'),
+    },
+    {
+      key: 'router9', name: 'Router9',
+      protocol: P.openai, baseUrl: 'https://api.router9.com/v1',
+      hint: wbI18n.t('来源 FreeLLMAPI 目录 · shared monthly credits · Key 申请: https://www.router9.com'),
+    },
+    {
+      key: 'routeway', name: 'Routeway',
+      protocol: P.openai, baseUrl: 'https://api.routeway.ai/v1',
+      hint: wbI18n.t('来源 FreeLLMAPI 目录 · free key · Key 申请: https://routeway.ai'),
+    },
+    {
+      key: 'sail', name: 'Sail Research',
+      protocol: P.openai, baseUrl: 'https://api.sailresearch.com/v1',
+      hint: wbI18n.t('来源 FreeLLMAPI 目录 · $5 monthly with payment method · Key 申请: https://app.sailresearch.com'),
+    },
+    {
+      key: 'sealion', name: 'SEA-LION',
+      protocol: P.openai, baseUrl: 'https://api.sea-lion.ai/v1',
+      hint: wbI18n.t('来源 FreeLLMAPI 目录 · free key · Key 申请: https://sea-lion.ai'),
+    },
+    {
+      key: 'septor', name: 'Septor Labs',
+      protocol: P.openai, baseUrl: 'https://api.septorlabs.com/v1',
+      hint: wbI18n.t('来源 FreeLLMAPI 目录 · daily free-model quota · Key 申请: https://septorlabs.com/dashboard'),
+    },
+    {
+      key: 'simplellm', name: 'SimpleLLM',
+      protocol: P.openai, baseUrl: 'https://api.simplellm.eu/v1',
+      hint: wbI18n.t('来源 FreeLLMAPI 目录 · shared hourly and daily free quota · Key 申请: https://app.simplellm.eu'),
+    },
+    {
+      key: 'speechify', name: 'Speechify',
+      protocol: P.openai, baseUrl: 'https://api.speechify.ai/v1',
+      hint: wbI18n.t('来源 FreeLLMAPI 目录 · monthly free TTS characters · Key 申请: https://platform.speechify.ai'),
+    },
+    {
+      key: 'speka', name: 'Speka',
+      protocol: P.openai, baseUrl: 'https://speka.me/v1',
+      hint: wbI18n.t('来源 FreeLLMAPI 目录 · $1 shared monthly credits · Key 申请: https://speka.me/dashboard/keys'),
+    },
+    {
+      key: 'typhoon', name: 'Typhoon',
+      protocol: P.openai, baseUrl: 'https://api.opentyphoon.ai/v1',
+      hint: wbI18n.t('来源 FreeLLMAPI 目录 · free research API · Key 申请: https://playground.opentyphoon.ai'),
+    },
+    {
+      key: 'unorouter', name: 'UnoRouter',
+      protocol: P.openai, baseUrl: 'https://api.unorouter.com/v1',
+      hint: wbI18n.t('来源 FreeLLMAPI 目录 · free key · Key 申请: https://unorouter.com'),
+    },
+    {
+      key: 'waterfall', name: 'Waterfall',
+      protocol: P.openai, baseUrl: 'https://api.getwaterfall.org/v1',
+      hint: wbI18n.t('来源 FreeLLMAPI 目录 · community free models · Key 申请: https://getwaterfall.org'),
+    },
+    {
+      key: 'xfyun', name: 'iFlytek Spark',
+      protocol: P.openai, baseUrl: 'https://spark-api-open.xf-yun.com/v1',
+      hint: wbI18n.t('来源 FreeLLMAPI 目录 · free Lite, needs cn real-name · Key 申请: https://console.xfyun.cn'),
+    },
+    {
+      key: 'xkiro', name: 'xKiro',
+      protocol: P.openai, baseUrl: 'https://api.xkiro.com/v1',
+      hint: wbI18n.t('来源 FreeLLMAPI 目录 · free key · Key 申请: https://xkiro.com'),
+    },
+
   ];
 
   /** 按 key 取一家（找不到给 null，调用方自行回落到手动新建） */
