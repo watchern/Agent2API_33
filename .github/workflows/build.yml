@@ -122,9 +122,9 @@ name: build
 # `scripts/release.sh` 挂到构建仓库（脚本里的 `BUILD_REPO` 已指向那里）。
 
 on:
-  push:
-    tags:
-      - 'v*'
+  # fork 只需要 Windows 包(由 build-windows.yml 在 tag 推送时自动构建);
+  # 本多平台流水线依赖派发到构建仓库的 secret,fork 缺失必然失败,故关闭
+  # tag 触发,仅保留手动入口。
   workflow_dispatch:
     inputs:
       version:
