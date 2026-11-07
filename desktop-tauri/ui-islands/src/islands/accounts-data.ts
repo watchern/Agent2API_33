@@ -84,8 +84,9 @@ export function refreshCaches(validIds: Set<string>): void {
  * 单独一条 2 秒轮询而不是跟着 app.js 那 20 秒一轮：连接数的全部意义就在「现在」。
  * 后端那边是进程内计数（不读盘、不出网），所以这条链路的代价足够低。 */
 
-/** 2 秒：够快看得出「正在跑」，又不至于让 DevTools 的网络面板刷屏 */
-export const CONNECTIONS_POLL_MS = 2000
+/** 10 秒：连接数对实时性要求低（「正在跑」晚几秒可见无所谓），降频把轮询成本
+ * 压到可忽略；原 2 秒间隔在慢环境下请求会堆叠，账号页跟着发卡。 */
+export const CONNECTIONS_POLL_MS = 10000
 
 export function connectionsOf(id: string): number {
   return getStore().connections.get(id) || 0
@@ -105,7 +106,12 @@ export function connectionsOf(id: string): number {
  * 比较口径与写入口径必须一致（都是「只放 count > 0 的项」）—— 两个 Map 的构造
  * 走的是同一段代码，所以「key 集合 + 每个值」全等都等价于「这份读数与上一份相同」。
  */
+let connectionsInFlight = false
+
 export async function syncConnections(): Promise<boolean> {
+  // 防重入：上一轮还没回来就跳过本轮（慢环境下定时器会堆叠出请求洪峰）
+  if (connectionsInFlight) return true
+  connectionsInFlight = true
   try {
     const data = await shared().workbuddyDesktop?.getAccountConnections?.()
     const counts = data?.counts && typeof data.counts === 'object' ? data.counts : {}
@@ -120,6 +126,8 @@ export async function syncConnections(): Promise<boolean> {
   } catch {
     // 静默：下一次轮询自然重试（与 app.js 的 refresh / syncLogsBadge 同一取舍）
     return false
+  } finally {
+    connectionsInFlight = false
   }
 }
 

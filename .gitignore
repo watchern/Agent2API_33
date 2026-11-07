@@ -79,3 +79,4 @@ desktop-tauri/mobile/ios/DerivedData/
 # 提供商插件（独立仓库的本地开发目录，不得进入本仓库历史）
 /agent2api-providers/
 /plugin/
+.idea

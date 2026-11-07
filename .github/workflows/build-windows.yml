@@ -1,0 +1,47 @@
+name: build-windows
+
+# 推送 v* tag 时自动构建 Windows 版并发布 Release。
+# Release 正文取自 **附注 tag 的消息**(git tag -a -m "..." vXXX),
+# 所以「发布说明」随 tag 一起维护,流水线零改动。
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: desktop-tauri/src-tauri
+
+      - name: Build (release)
+        working-directory: desktop-tauri/src-tauri
+        run: cargo build --release
+
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path dist | Out-Null
+          Copy-Item target/release/workbuddy-proxy-desktop.exe dist/agent2api.exe
+          Compress-Archive -Path dist/agent2api.exe -DestinationPath "dist/agent2api-${env:GITHUB_REF_NAME}-x64.zip"
+
+      - name: Extract release body from annotated tag
+        shell: bash
+        run: git tag -l --format='%(contents)' "${{ github.ref_name }}" > RELEASE_BODY.md
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          body_path: RELEASE_BODY.md
+          files: dist/agent2api-*.zip
