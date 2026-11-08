@@ -268,13 +268,29 @@ pub async fn call_with_timeout(
     body: Option<&Value>,
     timeout_ms: u64,
 ) -> Result<Value, String> {
-    crate::startup::wait().await?;
-    let first = send_once(method, path, body, timeout_ms).await?;
-    if recover_management_session(&first, path)? {
-        let retried = send_once(method, path, body, timeout_ms).await?;
-        return unwrap_envelope(&retried.text, retried.status);
+    let started = std::time::Instant::now();
+    let result = async {
+        crate::startup::wait().await?;
+        let first = send_once(method, path, body, timeout_ms).await?;
+        if recover_management_session(&first, path)? {
+            let retried = send_once(method, path, body, timeout_ms).await?;
+            return unwrap_envelope(&retried.text, retried.status);
+        }
+        unwrap_envelope(&first.text, first.status)
     }
-    unwrap_envelope(&first.text, first.status)
+    .await;
+    // 慢调用观测（2026-11-09 排障）：正常管理请求是毫秒级。这条与网关侧
+    // get_session 的分段计时配对 —— 壳侧慢而网关侧毫秒级 = 请求没被调度或
+    // 响应传输卡住；两侧都慢 = handler 真慢。
+    let elapsed = started.elapsed();
+    if elapsed >= std::time::Duration::from_secs(5) {
+        crate::server::logging::log_with_level(
+            "[Bridge]",
+            &format!("{method} {path} 耗时 {} ms（壳侧总时长，含会话恢复与重试）", elapsed.as_millis()),
+            "warn",
+        );
+    }
+    result
 }
 
 /// 一次请求的原始结果（保留文本与解析值，供鉴权判定与信封解包共用）。

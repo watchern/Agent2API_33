@@ -43,21 +43,43 @@ use crate::server::logging;
 use crate::server::ServerState;
 
 /// GET /api/session —— 首屏状态（管理面鉴权见 http.rs）
+///
+/// ── 分段计时（2026-11-09 排障插桩）──────────────────────────
+/// 这个 handler **没有任何 await**：一旦客户端侧 60 秒超时而这里记录的总耗时
+/// 是毫秒级，就说明请求根本没被调度到（tokio 工作线程被别处的同步库操作饿死）
+/// 或响应卡在传输层 —— 而不是 handler 慢。每段耗时落在哪一格，痕迹里一眼可辨。
 pub async fn get_session(State(state): State<ServerState>) -> Response {
+    let started = std::time::Instant::now();
+    let mut stages: Vec<(&'static str, std::time::Duration)> = Vec::new();
     let snapshot = config::current();
     // 可见账号与路由页预演共用同一份快照，插件未就绪的账号不参与。
-    let accounts = state.store().list_visible_accounts();
-    let routed = super::routing_api::queue_for_accounts(
-        &state, snapshot.last_request_model().map(str::to_string), &crate::server::core::routing::accounts_of(&accounts),
-    )
-        .get("pickedId").and_then(Value::as_str).filter(|id| !id.is_empty())
-        .map(|id| Value::String(id.to_string())).unwrap_or(Value::Null);
-    let summary = state.auth().get_config_summary();
+    let accounts = {
+        let stage = std::time::Instant::now();
+        let value = state.store().list_visible_accounts();
+        stages.push(("列表", stage.elapsed()));
+        value
+    };
+    let routed = {
+        let stage = std::time::Instant::now();
+        let value = super::routing_api::queue_for_accounts(
+            &state, snapshot.last_request_model().map(str::to_string), &crate::server::core::routing::accounts_of(&accounts),
+        )
+            .get("pickedId").and_then(Value::as_str).filter(|id| !id.is_empty())
+            .map(|id| Value::String(id.to_string())).unwrap_or(Value::Null);
+        stages.push(("路由预演", stage.elapsed()));
+        value
+    };
+    let summary = {
+        let stage = std::time::Instant::now();
+        let value = state.auth().get_config_summary();
+        stages.push(("认证摘要", stage.elapsed()));
+        value
+    };
     let configured = summary
         .get("configured")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    ok_json(json!({
+    let payload = json!({
         "health": {
             "upstreamConfigured": configured,
             "upstreamBaseUrl": summary.get("baseUrl").cloned().unwrap_or(Value::Null),
@@ -105,7 +127,20 @@ pub async fn get_session(State(state): State<ServerState>) -> Response {
         //
         // 没申报的家不在表里 —— 界面走自己的兜底表，旧插件照常工作。
         "accountFeatures": account_features(),
-    }))
+    });
+    let total = started.elapsed();
+    if total >= std::time::Duration::from_millis(200) {
+        let detail = stages.iter()
+            .map(|(name, elapsed)| format!("{name} {}ms", elapsed.as_millis()))
+            .collect::<Vec<_>>()
+            .join(" / ");
+        crate::server::logging::log_with_level(
+            "[Session]",
+            &format!("GET /api/session 总耗时 {} ms（{detail}）—— 超过 200ms 属异常，正常毫秒级", total.as_millis()),
+            "warn",
+        );
+    }
+    ok_json(payload)
 }
 
 /// 已加载插件的公开账号能力表。
