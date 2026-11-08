@@ -50,16 +50,19 @@ use crate::server::ServerState;
 /// 或响应卡在传输层 —— 而不是 handler 慢。每段耗时落在哪一格，痕迹里一眼可辨。
 pub async fn get_session(State(state): State<ServerState>) -> Response {
     let started = std::time::Instant::now();
+    crate::server::logging::log("[Session]", "→ 进入 handler（入口即日志：入口出现而出口不出现 = 卡在某个阶段内部）");
     let mut stages: Vec<(&'static str, std::time::Duration)> = Vec::new();
     let snapshot = config::current();
     // 可见账号与路由页预演共用同一份快照，插件未就绪的账号不参与。
     let accounts = {
+        crate::server::logging::log("[Session]", "→ 阶段：列表");
         let stage = std::time::Instant::now();
         let value = state.store().list_visible_accounts();
         stages.push(("列表", stage.elapsed()));
         value
     };
     let routed = {
+        crate::server::logging::log("[Session]", "→ 阶段：路由预演");
         let stage = std::time::Instant::now();
         let value = super::routing_api::queue_for_accounts(
             &state, snapshot.last_request_model().map(str::to_string), &crate::server::core::routing::accounts_of(&accounts),
@@ -70,6 +73,7 @@ pub async fn get_session(State(state): State<ServerState>) -> Response {
         value
     };
     let summary = {
+        crate::server::logging::log("[Session]", "→ 阶段：认证摘要");
         let stage = std::time::Instant::now();
         let value = state.auth().get_config_summary();
         stages.push(("认证摘要", stage.elapsed()));
@@ -79,7 +83,16 @@ pub async fn get_session(State(state): State<ServerState>) -> Response {
         .get("configured")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let payload = json!({
+    let payload = {
+        crate::server::logging::log("[Session]", "→ 阶段：会话状态（get_status）");
+        let session_status = state.auth().get_status();
+        crate::server::logging::log("[Session]", "→ 阶段：模型聚合目录（session_models）");
+        let models = crate::server::core::providers::catalog::session_models(state.store());
+        crate::server::logging::log("[Session]", "→ 阶段：代理摘要（proxies_summary）");
+        let proxies = proxies_summary();
+        crate::server::logging::log("[Session]", "→ 阶段：插件账号能力（account_features）");
+        let features = account_features();
+        json!({
         "health": {
             "upstreamConfigured": configured,
             "upstreamBaseUrl": summary.get("baseUrl").cloned().unwrap_or(Value::Null),
@@ -93,7 +106,7 @@ pub async fn get_session(State(state): State<ServerState>) -> Response {
                     .unwrap_or_else(|| Value::String(UNCONFIGURED_REASON.to_string()))
             },
         },
-        "session": state.auth().get_status(),
+        "session": session_status,
         // accounts.currentAccountId = **不限模型**的队首（判据 = 启用 + 有可用凭证 +
         // 优先级序，见 core::account_store）。它回答「队列第一位是谁」，别的地方
         // （凭证来源、刷新目标）读的也一直是它，语义不变。
@@ -105,13 +118,13 @@ pub async fn get_session(State(state): State<ServerState>) -> Response {
         // 与路由页共用的无会话预演队首，包含自动消耗规则与运行期保护。
         "routedAccountId": routed,
         "defaultModel": snapshot.default_model(),
-        "proxies": proxies_summary(),
+        "proxies": proxies,
         // 模型目录真值（对照 server.mjs 802-804 的字段形状 {id, name, isDefault, credits}）。
         // 来源是**聚合目录**（`providers::catalog::session_models`），与 `GET /v1/models`
         // 同一份合并结果：界面上的模型清单必须等于客户端能拿到的清单，否则用户会照着一个
         // 路由不到的模型名去调（改造前这里只读 workbuddy 单家，另三家在界面上不可见）。
         // 每条另带 provider / providerLabel，供网关页按家分组。
-        "models": crate::server::core::providers::catalog::session_models(state.store()),
+        "models": models,
         // 启动期的历史统计整理是否还在后台跑（模型维度回填 / 来源维度回填 /
         // 保留期裁剪）。界面可据此显示一条轻提示；它不影响账号与转发。
         "maintenance": { "running": state.startup_maintenance_running() },
@@ -126,8 +139,9 @@ pub async fn get_session(State(state): State<ServerState>) -> Response {
         // 中间态（那会让整列闪一下）。
         //
         // 没申报的家不在表里 —— 界面走自己的兜底表，旧插件照常工作。
-        "accountFeatures": account_features(),
-    });
+        "accountFeatures": features,
+        })
+    };
     let total = started.elapsed();
     if total >= std::time::Duration::from_millis(200) {
         let detail = stages.iter()
