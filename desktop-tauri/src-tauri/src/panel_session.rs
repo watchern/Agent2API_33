@@ -62,6 +62,13 @@ pub fn credential_headers() -> Result<serde_json::Map<String, Value>, String> {
 }
 
 /// 只在明确的管理鉴权失败后调用；不轮换模型 Key 或网页用户的会话。
+///
+/// ── 为什么网关说拒就换新，不再看本地 `valid()`（2026-11-09 实测教训）──
+/// 中间件与本表是同一份数据，理论上不该分叉；但实测出现过「中间件拒了一发
+/// 请求、几毫秒后 `valid()` 对同一枚令牌返回 true」的窗口（表现为 UI 一发
+/// 列表请求被 401 后壳不重试，用户界面永远停在「刷新中」）。本地校验无论如何
+/// 都不该推翻网关的结论 —— 分叉的成因在别处（别的闸门 / 撤销时序），壳侧该
+/// 做的就是无条件换新令牌重试一次：重试仍 401 时响应原样交回 UI，有界不兜圈。
 pub fn recover_rejected(headers: &reqwest::header::HeaderMap) -> Result<bool, String> {
     let rejected = headers.get("x-panel-token").and_then(|value| value.to_str().ok());
     let Some(rejected) = rejected else { return Ok(false) };
@@ -70,10 +77,8 @@ pub fn recover_rejected(headers: &reqwest::header::HeaderMap) -> Result<bool, St
         return Err("本地网关正在退出，无法恢复管理会话".to_string());
     }
     if current.as_ref().is_some_and(|session| session.access_token != rejected) {
+        // 已经换过新会话（并发请求先一步恢复）：直接带新令牌重试
         return Ok(true);
-    }
-    if access::local_session::valid(rejected) {
-        return Ok(false);
     }
     *current = Some(access::local_session::issue()?);
     Ok(true)

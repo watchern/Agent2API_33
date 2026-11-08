@@ -17,6 +17,46 @@ let stateError = '';
 // 账号操作与网页登录共用这把锁；只读刷新使用自己的请求队列。
 let busy = false;
 
+/**
+ * 「最后已知状态」的本地缓存（localStorage）。
+ *
+ * ── 为什么要有它 ────────────────────────────────────────────
+ * 账号页的列表来自 `refresh()` 的**在途请求**：页面加载时 state 还是 null，
+ * 只能干等第一发 `/api/session` 回来。请求通路偶发挂起时（实测：壳的会话
+ * 恢复竞态会让一发管理请求悬住不返），用户面对的就是白屏「加载中」—— 而这
+ * 些数据上一分钟明明还在。把最近一次成功拉到的 state 存进 localStorage，
+ * 加载时先渲染缓存再后台刷新（stale-while-revalidate），通路卡住时看到的
+ * 也是旧数据而不是空屏；活数据一到即整页覆盖，口径不变。
+ *
+ * 只在**启动引导**时用缓存：state 一旦被活数据填过，就完全走活路，缓存仅在
+ * 下次打开页面时再当一次「首屏」。存失败（配额满 / 隐私模式）静默跳过 ——
+ * 缓存是体验优化，不是功能依赖。内容是管理面的**公开投影**（无令牌明文，
+ * 只有尾号），留在本机 localStorage 与页面同源。
+ */
+const STATE_CACHE_KEY = 'workbuddy-accounts-snapshot';
+
+function loadStateCache() {
+  try {
+    const raw = localStorage.getItem(STATE_CACHE_KEY);
+    if (!raw) return null;
+    const cached = JSON.parse(raw);
+    return cached && Array.isArray(cached?.state?.accounts?.accounts) ? cached : null;
+  } catch {
+    return null;
+  }
+}
+
+function saveStateCache() {
+  try {
+    if (!state?.accounts?.accounts) return;
+    const payload = JSON.stringify({ savedAt: Date.now(), state });
+    // localStorage 一般 5MB；超限就不存（try/catch 也会兜配额异常）
+    if (payload.length <= 3000000) localStorage.setItem(STATE_CACHE_KEY, payload);
+  } catch {
+    /* 缓存是锦上添花，存不下就算了 */
+  }
+}
+
 // ─── 工具 ────────────────────────────────────
 
 function esc(value) {
@@ -1085,6 +1125,20 @@ function releaseBusy() {
   busy = false;
 }
 
+/**
+ * 给在途请求兜一个 UI 侧的期限：壳自己有 60 秒超时（gateway.rs 的
+ * REQUEST_TIMEOUT_MS），正常时这层永远不触发；它防的是 invoke 本身悬住不返
+ * 的极端情形（实测发生过）—— 没有这层，「刷新中」会永远挂着，按钮置灰连
+ * 重试都点不了。期限到了按失败收敛，走 refresh() 既有的错误出口。
+ */
+function withTimeout(promise, ms, message) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(message)), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
 // 在途请求可能早于插件操作；后来的刷新必须补读，不能复用那份旧响应。
 function refresh({ force = true } = {}) {
   if (refreshTask && !force) return refreshTask;
@@ -1097,13 +1151,18 @@ function refresh({ force = true } = {}) {
     do {
       completed = refreshRequested;
       try {
-        const next = await api.getState();
+        const next = await withTimeout(
+          Promise.resolve(api.getState()),
+          90_000,
+          wbI18n.t('账号列表响应超时，请稍后重试'),
+        );
         if (!next || typeof next !== 'object' || !Array.isArray(next.accounts?.accounts)) {
           throw new Error(wbI18n.t('账号列表响应异常'));
         }
         if (completed !== refreshRequested) continue;
         state = next;
         stateError = '';
+        saveStateCache();
         const validIds = new Set(state.accounts.accounts.map(account => account.id));
         window.wbAccountsView?.refreshCaches(validIds);
         window.wbAccountPanel?.invalidate();
@@ -1294,6 +1353,14 @@ function restoredPage() {
   return api.firstVisibleKey(layout) || saved;
 }
 const initialPage = restoredPage();
+// 先用「最后已知状态」铺一帧（有缓存才铺）：活数据由下面的 refresh() 拉到后
+// 整页覆盖。请求通路挂起时页面停留在缓存上而不是白屏「加载中」—— 见
+// STATE_CACHE_KEY 处的说明。
+const cachedSnapshot = loadStateCache();
+if (cachedSnapshot) {
+  state = cachedSnapshot.state;
+  render();
+}
 if (document.readyState === 'loading') {
   document.addEventListener('DOMContentLoaded', () => {
     showPage(initialPage, { persist: false });

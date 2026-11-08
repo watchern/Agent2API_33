@@ -563,6 +563,7 @@
   "账号 / 登录出网代理": "Account / sign-in outbound proxy",
   "账号不在当前队列里": "The account is not in the current queue",
   "账号列表响应异常": "Unexpected account list response",
+  "账号列表响应超时，请稍后重试": "Account list request timed out. Try again later.",
   "账号已删除": "Account deleted",
   "账号已在全局队列第一位": "Account is already first in the global queue",
   "账号排序接口不可用，请确认网关与界面已更新": "Account sorting API unavailable. Ensure both the gateway and interface are updated.",

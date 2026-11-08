@@ -563,6 +563,7 @@
   "账号 / 登录出网代理": "Proxy de saída da conta / do login",
   "账号不在当前队列里": "A conta não está na fila atual",
   "账号列表响应异常": "Resposta inesperada da lista de contas",
+  "账号列表响应超时，请稍后重试": "Tempo de resposta da lista de contas esgotado. Tente novamente mais tarde.",
   "账号已删除": "Conta excluída",
   "账号已在全局队列第一位": "A conta já está em primeiro lugar na fila global",
   "账号排序接口不可用，请确认网关与界面已更新": "API de ordenação de contas indisponível. Verifique se o gateway e a interface estão atualizados.",
