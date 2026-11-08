@@ -87,8 +87,41 @@ pub(crate) use revisions::AccountChanges;
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use rusqlite::Connection;
+
+/// 单次库操作取连接的等待超过这个值就在日志里提醒（毫秒）。
+///
+/// 单连接互斥意味着任何慢操作都会让所有 store 的读写排队 —— 正常时等待是
+/// 微秒级；超过说明有某个操作占着连接太久（大事务 / 慢查询 / 磁盘或杀软）。
+/// 这条日志就是定位「列表为什么慢」的第一现场（2026-11-09 排障所加）。
+const SLOW_DB_WAIT: Duration = Duration::from_millis(500);
+
+thread_local! {
+    /// 慢等待告警的重入守卫：logging 本身也走这张库（logs 表），不打这条守卫，
+    /// 「写日志 → 等待超时 → 再写日志」会在连接拥堵时自我递归。同一线程上
+    /// 已在告警时静默跳过 —— 丢一条提醒没关系，别把队列堵成死循环。
+    static SLOW_WAIT_WARN_INSIDE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn warn_slow_wait(waited: Duration) {
+    SLOW_WAIT_WARN_INSIDE.with(|inside| {
+        if inside.get() {
+            return;
+        }
+        inside.set(true);
+        crate::server::logging::log_with_level(
+            "[Storage]",
+            &format!(
+                "数据库连接等待 {} ms —— 被其它库操作占住（单连接互斥，全网关的库读写都排这一把锁）",
+                waited.as_millis()
+            ),
+            "warn",
+        );
+        inside.set(false);
+    });
+}
 
 /// 数据库文件名。放配置目录（`~/.agent2api`）里，与 config.json / 日志并排 ——
 /// 用户在设置页看到的「配置目录」就是这一个位置，备份与排障只需要它。
@@ -186,7 +219,13 @@ impl Db {
     /// （真正的数据在库里）。两处判据不同正是因为**保护对象不同**：这里持的是
     /// 连接本身（状态可能停在事务中间），那里持的是空标记。
     pub fn with<T>(&self, f: impl FnOnce(&Connection) -> T) -> Option<T> {
-        match self.inner.conn.lock() {
+        let started = Instant::now();
+        let outcome = self.inner.conn.lock();
+        let waited = started.elapsed();
+        if waited >= SLOW_DB_WAIT {
+            warn_slow_wait(waited);
+        }
+        match outcome {
             Ok(conn) => Some(f(&conn)),
             Err(_) => None,
         }
@@ -209,7 +248,13 @@ impl Db {
     /// 调用点：`AccountStore::with_conn_mut`（账号层的批量写与整份状态差异写 ——
     /// 批量改/删、`migrate_startup`、三家旧数据导入、导入合并）。
     pub fn with_mut<T>(&self, f: impl FnOnce(&mut Connection) -> T) -> Option<T> {
-        match self.inner.conn.lock() {
+        let started = Instant::now();
+        let outcome = self.inner.conn.lock();
+        let waited = started.elapsed();
+        if waited >= SLOW_DB_WAIT {
+            warn_slow_wait(waited);
+        }
+        match outcome {
             Ok(mut conn) => Some(f(&mut conn)),
             Err(_) => None,
         }
@@ -226,6 +271,7 @@ impl Db {
     pub(crate) fn invalidate_accounts(&self) {
         self.inner.accounts.invalidate();
     }
+
 
     /// 库文件路径（排障直读 / 启动日志展示）。
     ///

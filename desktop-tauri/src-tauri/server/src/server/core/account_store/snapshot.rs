@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Map, Value};
 
+use super::state::{AccountState, StoredAccount};
 use super::{read_rows, AccountStore};
 
 #[derive(Default)]
@@ -18,6 +19,12 @@ struct CachedSnapshot {
     data_version: i64,
     checked_at: Instant,
     rows: Arc<BTreeMap<i64, Arc<Value>>>,
+    /// 与 `rows` 同一份 rowid 键的**完整解码记录**（`read_rows::decode` 的产物，
+    /// 含 extra 合并 —— 选路投影 `rows` 只是它的字段子集）。UI 列表
+    /// （`read_state`）与 `read_record` 的热路径读这份，命中时不打库；
+    /// 由同一轮增量更新维护，见 `build_routing_snapshot`。
+    decoded: Arc<BTreeMap<i64, Arc<StoredAccount>>>,
+    priority_scope: Option<String>,
     snapshot: Arc<RoutingSnapshot>,
 }
 
@@ -61,14 +68,16 @@ impl AccountStore {
         let metadata = crate::server::core::providers::catalog::generation();
         if let Some(snapshot) = fresh(cache, db.account_revision(), metadata) { return snapshot; }
         let previous = cache.state.read().ok().and_then(|state| state.as_ref().map(|cached| {
-            (cached.revision, cached.metadata, cached.data_version, cached.rows.clone())
+            (cached.revision, cached.metadata, cached.data_version, cached.rows.clone(), cached.decoded.clone())
         }));
         // 连接锁只复制密文行；解密、规则推导和轻量投影全部在锁外执行。
         let batch = db.with(|conn| -> rusqlite::Result<_> {
             let data_version: i64 = conn.pragma_query_value(None, "data_version", |row| row.get(0))?;
-            let since = previous.as_ref().filter(|(_, old_metadata, old_version, _)| {
+            // 队列作用域与账号数据同库同版本号：随这一轮增量一并刷新
+            let priority_scope = super::sql::load_priority_scope(conn).ok().flatten();
+            let since = previous.as_ref().filter(|(_, old_metadata, old_version, _, _)| {
                 *old_metadata == metadata && *old_version == data_version
-            }).map(|(revision, _, _, _)| *revision);
+            }).map(|(revision, _, _, _, _)| *revision);
             let changes = db.account_changes(since);
             let (replace, rows, unchanged) = match changes.rows {
                 Some(ids) => {
@@ -77,9 +86,9 @@ impl AccountStore {
                 }
                 None => (true, read_rows::all(conn)?.into_iter().map(|row| (row.rowid, Some(row))).collect(), false),
             };
-            Ok((changes.revision, data_version, replace, rows, unchanged))
+            Ok((changes.revision, data_version, priority_scope, replace, rows, unchanged))
         }).and_then(Result::ok);
-        let Some((revision, data_version, replace, changes, unchanged)) = batch else { return empty() };
+        let Some((revision, data_version, priority_scope, replace, changes, unchanged)) = batch else { return empty() };
         if unchanged && db.account_revision() == revision
             && crate::server::core::providers::catalog::generation() == metadata {
             if let Ok(mut state) = cache.state.write() {
@@ -90,14 +99,21 @@ impl AccountStore {
             }
         }
         let mut rows = if replace { BTreeMap::new() } else {
-            previous.map(|(_, _, _, rows)| (*rows).clone()).unwrap_or_default()
+            previous.as_ref().map(|(_, _, _, rows, _)| (**rows).clone()).unwrap_or_default()
+        };
+        let mut decoded = if replace { BTreeMap::new() } else {
+            previous.as_ref().map(|(_, _, _, _, decoded)| (**decoded).clone()).unwrap_or_default()
         };
         let mut failed = 0;
         for (rowid, raw) in changes {
             rows.remove(&rowid);
+            decoded.remove(&rowid);
             if let Some(raw) = raw {
                 match read_rows::decode(raw) {
-                    Ok((_, record)) => { rows.insert(rowid, Arc::new(route_account(&self.public_account(&record)))); }
+                    Ok((_, record)) => {
+                        decoded.insert(rowid, Arc::new(record.clone()));
+                        rows.insert(rowid, Arc::new(route_account(&self.public_account(&record))));
+                    }
                     Err(_) => failed += 1,
                 }
             }
@@ -109,10 +125,32 @@ impl AccountStore {
         if db.account_revision() == revision && crate::server::core::providers::catalog::generation() == metadata {
             if let Ok(mut state) = cache.state.write() {
                 *state = Some(CachedSnapshot { revision, metadata, data_version,
-                    checked_at: Instant::now(), rows: Arc::new(rows), snapshot: snapshot.clone() });
+                    checked_at: Instant::now(), rows: Arc::new(rows),
+                    decoded: Arc::new(decoded), priority_scope, snapshot: snapshot.clone() });
             }
         }
         snapshot
+    }
+
+    /// 解码态缓存：先调 `routing_snapshot()`（负责过期校验与行级增量更新），
+    /// 再从同一缓存取**完整解码记录**。命中时不打库 —— `/api/session`（账号
+    /// 列表）、`read_record`（auth 状态 / 转发链路）都是每请求级的热路径，
+    /// 2026-11-09 起不再每次全表读。None = 缓存不可用（库未打开 / 锁中毒）。
+    pub(super) fn decoded_state(&self) -> Option<AccountState> {
+        self.routing_snapshot();
+        let cache = self.snapshot_cache();
+        let state = cache.state.read().ok()?;
+        let cached = state.as_ref()?;
+        let accounts = cached.decoded.values().map(|record| (**record).clone()).collect();
+        Some(AccountState { accounts, priority_scope: cached.priority_scope.clone() })
+    }
+
+    pub(super) fn decoded_record(&self, id: &str) -> Option<StoredAccount> {
+        self.routing_snapshot();
+        let cache = self.snapshot_cache();
+        let state = cache.state.read().ok()?;
+        let cached = state.as_ref()?;
+        cached.decoded.values().find(|record| record.id() == id).map(|record| (**record).clone())
     }
 
     pub(crate) fn route_account_ids_for_provider(&self, provider: &str) -> Vec<String> {
