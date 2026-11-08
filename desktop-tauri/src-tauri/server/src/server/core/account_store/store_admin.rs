@@ -398,6 +398,22 @@ impl AccountStore {
         Some((expires_at, record.updated_at() as f64))
     }
 
+    /// 账号是否是「桌面端实时登录态」记录（`desktop: true`，架构文档 §3.2）。
+    ///
+    /// 这类记录按设计**不落凭证**：token 每次实时读本机客户端的登录态文件
+    /// （AutoClaw 的 auth.json / account-credentials.enc、小浣熊的 auth.json），
+    /// 而且插件刷新成功也**不回写记录**（理由见插件侧 persist_refresh / refresh
+    /// 的模块头：safeStorage 回写有写坏登录态的风险，且服务端轮换 refresh_token，
+    /// 网关回写会与桌面端自己的刷新互相顶掉）。因此「记录指纹是否推进」的刷新
+    /// 核对（[`Self::credential_stamp`]，issue #407）对它们的前提不成立 ——
+    /// 调用方（`credential_maintenance::refresh_checked`）要先问这一条再核对。
+    pub fn account_is_desktop(&self, id: &str) -> bool {
+        let _guard = self.guard();
+        self.record_by_id(&_guard, id)
+            .map(|record| record.is_desktop())
+            .unwrap_or(false)
+    }
+
     /// 一次性迁移：清掉**按请求名（映射别名）记下的限额键**（幂等，可重复调用）。
     ///
     /// ── 修的是什么（2026-09 的事故）─────────────────────────────

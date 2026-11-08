@@ -96,11 +96,24 @@ pub const STATUS_FAILED: &str = "failed";
 /// `expiresAt` 或 `updatedAt` **任一**推进都算成功：有些家刷新后只换 token
 /// 不延长有效期（反过来也有），单看一个字段会误判。账号读不到时放行 ——
 /// 那是「记录不存在」的问题，由刷新本身报错，不该在这里编一个。
+///
+/// ── 桌面端实时账号不做这道核对（2026-11-08 修正）────────────
+/// `desktop: true` 的账号凭证**不在记录里**：每次实时读本机客户端的登录态
+/// 文件，插件刷新成功也按设计不回写记录（safeStorage 回写风险 + 服务端轮换
+/// refresh_token，回写会与桌面端自己的刷新互相顶掉，见插件侧 persist_refresh）。
+/// 于是记录指纹**永远**不推进，这道核对会对它们必然误报 —— AutoClaw 桌面账号
+/// 的每小时例行刷新（`token_expiring` 的「每小时强制刷一次」）在 2026-11-07/08
+/// 的日志里每轮都记 ❌「凭证刷新未产生变化」，刷新本身却是真实成功的（插件侧
+/// 只有上游 code=0 且拿到新 token 才回 Ok）。所以桌面账号先早退：刷新照做，
+/// 成败以插件的 Ok/Err 为准，转发链路的 401 自愈兜底。
 pub async fn refresh_checked(
     store: &AccountStore,
     adapter: &dyn ProviderAdapter,
     id: &str,
 ) -> Result<String, GatewayError> {
+    if store.account_is_desktop(id) {
+        return adapter.refresh_access_token(store, id).await;
+    }
     let before = store.credential_stamp(id);
     let token = adapter.refresh_access_token(store, id).await?;
     let after = store.credential_stamp(id);

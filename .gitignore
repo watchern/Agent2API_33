@@ -80,3 +80,4 @@ desktop-tauri/mobile/ios/DerivedData/
 /agent2api-providers/
 /plugin/
 .idea
+.cargo
