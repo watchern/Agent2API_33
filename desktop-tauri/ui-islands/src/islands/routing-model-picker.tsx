@@ -22,6 +22,19 @@ export function RoutingModelPicker({ choices, selected, onChange, disabled = fal
     if (disabled || on && picked.size >= limit) return
     onChange(on ? [...new Set([...selected, key])] : selected.filter(value => value !== key))
   }
+  // 反选：当前提供商（受搜索过滤）可见的模型勾选态整体翻转 —— 勾上的取消、
+  // 没勾的勾上。成员上限与单个 Checkbox 同一口径：加满 limit 后其余保持未选，
+  // 不静默丢弃已勾选项；取消勾选不受上限约束（超限时反选也能用来快速减成员）。
+  const invertVisible = () => {
+    const next = new Set(selected)
+    let added = 0
+    for (const choice of models) {
+      const key = routeModelKey(choice)
+      if (next.has(key)) next.delete(key)
+      else if (picked.size + added < limit) { next.add(key); added += 1 }
+    }
+    onChange([...next])
+  }
   return <div className='routing-model-selection'>
     <div className='routing-model-columns'>
       <aside className='routing-model-providers'>
@@ -40,7 +53,9 @@ export function RoutingModelPicker({ choices, selected, onChange, disabled = fal
         </NavList>
       </aside>
       <section className='routing-model-choices'>
-        <div className='routing-model-choices-head'><b>{current?.label || t('选择提供商')}</b><span>{t('{n} 个模型', { n: models.length })}</span></div>
+        <div className='routing-model-choices-head'><b>{current?.label || t('选择提供商')}</b>
+          <Button variant='link' size='sm' disabled={disabled || !models.length} onClick={invertVisible}>{t('反选')}</Button>
+          <span>{t('{n} 个模型', { n: models.length })}</span></div>
         <Input value={modelSearch} disabled={disabled} placeholder={t('搜索模型')} aria-label={t('搜索模型')}
           onChange={event => setModelSearch(event.currentTarget.value)} />
         <div className='routing-model-choice-list'>
