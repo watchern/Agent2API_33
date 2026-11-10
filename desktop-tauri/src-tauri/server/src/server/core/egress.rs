@@ -47,6 +47,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 
 use crate::server::config::TimeoutSettings;
 use crate::server::core::proxies::ResolvedProxy;
@@ -92,9 +93,7 @@ struct CacheEntry {
 
 /// 出口 → Client 的缓存。
 ///
-/// 键是**不含凭证**的 `协议://主机:端口`（与 Node 的 dispatcher 键一致）：
-/// 把密码放进缓存键会让它在内存里多留一份，而且同主机不同密码本就不该共用一个池。
-/// 凭证通过 `reqwest::Proxy::basic_auth` 挂在客户端上，仍然生效。
+/// 同一代理地址可能通过不同认证信息选择不同出口；缓存必须区分认证指纹，不能串用连接。
 #[derive(Default)]
 struct ClientCache {
     entries: HashMap<String, CacheEntry>,
@@ -104,7 +103,7 @@ struct ClientCache {
 
 static CLIENTS: Mutex<Option<ClientCache>> = Mutex::new(None);
 
-/// 缓存键：`协议://主机:端口`（不含凭证，理由见 ClientCache 的注释）。
+/// 缓存键不保存明文认证信息。
 ///
 /// 直连（proxy 为 None）不在这里 —— 它走独立的 `DIRECT` 键，
 /// 保证「某个出口被淘汰」不会把直连的客户端也一起丢掉。
@@ -121,12 +120,15 @@ const DIRECT_KEY: &str = "__direct__";
 fn cache_key(proxy: Option<&ResolvedProxy>, timeouts: &TimeoutSettings) -> String {
     let egress = match proxy {
         None => DIRECT_KEY.to_string(),
-        Some(proxy) => format!(
-            "{}://{}:{}",
-            proxy.protocol,
-            proxy.host,
-            proxy.port.map(|port| port.to_string()).unwrap_or_else(|| "?".to_string())
-        ),
+        Some(proxy) => {
+            let mut fingerprint = Sha256::new();
+            fingerprint.update((proxy.username.len() as u64).to_be_bytes());
+            fingerprint.update(proxy.username.as_bytes());
+            fingerprint.update(proxy.password.as_bytes());
+            let fingerprint: String = fingerprint.finalize().iter().map(|byte| format!("{byte:02x}")).collect();
+            format!("{}://{}:{}|a{fingerprint}|n{}", proxy.protocol, proxy.host,
+                proxy.port.map(|port| port.to_string()).unwrap_or_else(|| "?".to_string()), proxy.non_direct)
+        }
     };
     // 两项传输层超时进键：见上面的说明
     format!(
@@ -149,10 +151,8 @@ fn cache_key(proxy: Option<&ResolvedProxy>, timeouts: &TimeoutSettings) -> Strin
 /// 意图落空。因此这里在构造 reqwest 代理 URI 时换成 socks5h ——
 /// 账号里存的、UI 上显示的仍然是 socks5，只有内部实现换了个等价 scheme。
 fn build_proxy_url(proxy: &ResolvedProxy) -> String {
-    let auth = if proxy.username.is_empty() {
+    let auth = if proxy.username.is_empty() && proxy.password.is_empty() {
         String::new()
-    } else if proxy.password.is_empty() {
-        format!("{}@", urlencoding(&proxy.username))
     } else {
         format!("{}:{}@", urlencoding(&proxy.username), urlencoding(&proxy.password))
     };
@@ -247,16 +247,7 @@ fn build_client_with(
             builder = builder.no_proxy();
         }
         Some(proxy) => {
-            let port = proxy
-                .port
-                .ok_or_else(|| format!("代理端口非法（{}）", describe_proxy(proxy)))?;
-            let url = build_proxy_url(&ResolvedProxy { port: Some(port), ..proxy.clone() });
-            // Proxy::all 返回 Result：release 是 panic=abort，绝不能用 unwrap
-            let parsed = reqwest::Proxy::all(&url)
-                .map_err(|error| format!("代理地址无效（{}）: {error}", describe_proxy(proxy)))?;
-            // reqwest 从 URI 里解析用户名/密码作为 basic auth（build_proxy_url 已编码），
-            // http/socks5 两种协议都支持；这里不再单独调 basic_auth，
-            // 免得两个来源的凭证打架
+            let parsed = transport_proxy(proxy)?;
             builder = builder.proxy(parsed);
         }
     }
@@ -264,6 +255,14 @@ fn build_client_with(
     builder
         .build()
         .map_err(|error| format!("创建 HTTP 客户端失败: {error}"))
+}
+
+fn transport_proxy(proxy: &ResolvedProxy) -> Result<reqwest::Proxy, String> {
+    let proxy = crate::server::core::proxies::chain::endpoint(proxy)?;
+    if proxy.port.is_none_or(|port| port == 0) {
+        return Err(format!("代理端口非法（{}）", describe_proxy(&proxy)));
+    }
+    reqwest::Proxy::all(build_proxy_url(&proxy)).map_err(|_| "代理地址无效".to_string())
 }
 
 /// 构造一个**跟随系统代理**的 Client（Windows / macOS 的系统设置 + 环境变量）。
@@ -327,6 +326,21 @@ pub fn resolved_client(
     host: &str,
     addresses: &[std::net::SocketAddr],
 ) -> Result<reqwest::Client, String> {
+    resolved_builder(proxy, system_proxy_when_unset, host, addresses)?
+        .build().map_err(|_| "无法创建出站连接".to_string())
+}
+
+pub fn websocket_client(proxy: Option<&ResolvedProxy>) -> Result<reqwest::Client, String> {
+    resolved_builder(proxy, false, "", &[])?.http1_only()
+        .build().map_err(|_| "无法创建 WebSocket 出站连接".to_string())
+}
+
+fn resolved_builder(
+    proxy: Option<&ResolvedProxy>,
+    system_proxy_when_unset: bool,
+    host: &str,
+    addresses: &[std::net::SocketAddr],
+) -> Result<reqwest::ClientBuilder, String> {
     let timeouts = crate::server::config::timeout_settings();
     let mut builder = base_builder(&timeouts)
         .redirect(reqwest::redirect::Policy::none());
@@ -334,17 +348,16 @@ pub fn resolved_client(
         builder = builder.resolve_to_addrs(host, addresses);
     }
     if let Some(proxy) = proxy {
-        if proxy.port.is_none_or(|port| port == 0) { return Err("代理端口无效".to_string()); }
-        let parsed = reqwest::Proxy::all(build_proxy_url(proxy))
-            .map_err(|_| "代理地址无效".to_string())?;
-        builder = builder.no_proxy().proxy(parsed);
+        builder = builder.no_proxy().proxy(transport_proxy(proxy)?);
     } else if !system_proxy_when_unset {
         builder = builder.no_proxy();
     }
-    builder.build().map_err(|_| "无法创建出站连接".to_string())
+    Ok(builder)
 }
 
 pub fn client_for_github(proxy: Option<&ResolvedProxy>) -> Result<Arc<reqwest::Client>, String> {
+    let transport = proxy.map(crate::server::core::proxies::chain::endpoint).transpose()?;
+    let proxy = transport.as_ref();
     let timeouts = crate::server::config::timeout_settings();
     let key = format!("github|{}", cache_key(proxy, &timeouts));
     {
@@ -422,6 +435,14 @@ pub fn client_for_system_proxy() -> Arc<reqwest::Client> {
 /// 并发构造同一个出口时两次都建 Client（各自持自己的连接池），
 /// 后者覆盖前者 —— 最坏结果是多建了一个池，不影响正确性。
 pub fn client_for(proxy: Option<&ResolvedProxy>) -> Arc<reqwest::Client> {
+    let transport = match proxy.map(crate::server::core::proxies::chain::endpoint).transpose() {
+        Ok(proxy) => proxy,
+        Err(reason) => {
+            logging::log("[Upstream]", &format!("账号出口不可用，未改走直连：{reason}"));
+            return Arc::new(blocked_client());
+        }
+    };
+    let proxy = transport.as_ref();
     // 超时设置逐次取用（配置一改，下一次就命中新键并建新 Client，见 cache_key）
     let timeouts = crate::server::config::timeout_settings();
     let key = cache_key(proxy, &timeouts);
@@ -437,22 +458,13 @@ pub fn client_for(proxy: Option<&ResolvedProxy>) -> Arc<reqwest::Client> {
         }
     }
     // ② 未命中才构造（锁外，可能阻塞）
-    let client = Arc::new(build_client(proxy, &timeouts).unwrap_or_else(|error| {
+    let client = Arc::new(build_client(proxy, &timeouts).unwrap_or_else(|_error| {
         // 这条**保留在运行日志**（不像同类的「账号代理不可用」那样进请求日志）：
         // 它每个出口缓存条目最多触发一次 —— 构造失败的兜底 Client 也会被缓存
         // （见下面 ③），后续请求直接命中缓存、不再走到这里，所以条数**不随
         // 请求量增长**。判据与其它日志一致：看它的条数会不会跟着请求一起涨。
-        logging::log("[Upstream]", &format!("⚠️ {error}，本次回退直连"));
-        // 构造失败的兜底客户端：TLS 后端初始化都失败时没有别的退路，只能返回
-        // 一个「请求时才报错」的客户端（几乎不会失败）。这里显式 `.no_proxy()`：
-        // 本函数是**显式出口**（直连 / 指定代理），兜底也不能变成跟随系统代理
-        // —— `Client::new()` 的 auto_sys_proxy 默认开启（见 Cargo.toml 的
-        // `system-proxy` 说明），直接用它会让「直连」出口在极端路径上悄悄
-        // 走系统代理；二级兜底才是裸 Client::new()（两处 build 都失败）。
-        reqwest::Client::builder()
-            .no_proxy()
-            .build()
-            .unwrap_or_else(|_| reqwest::Client::new())
+        logging::log("[Upstream]", "账号出口连接无法创建，本次请求未改走直连");
+        blocked_client()
     }));
     // ③ 回填缓存（锁内只做插入与淘汰）
     let mut guard = lock_clients();
@@ -482,6 +494,12 @@ pub fn client_for(proxy: Option<&ResolvedProxy>) -> Arc<reqwest::Client> {
     client
 }
 
+fn blocked_client() -> reqwest::Client {
+    let blocked = reqwest::Proxy::custom(|_: &url::Url| Some("http://127.0.0.1:0"));
+    reqwest::Client::builder().use_rustls_tls().no_proxy().proxy(blocked)
+        .timeout(Duration::from_secs(1)).build().unwrap_or_default()
+}
+
 /// 取 Client 缓存的锁；锁中毒（某次持锁 panic）不致命，接管内部数据继续用
 fn lock_clients() -> std::sync::MutexGuard<'static, Option<ClientCache>> {
     match CLIENTS.lock() {
@@ -508,10 +526,10 @@ impl ConnectivityResult {
     pub fn to_json(&self) -> Value {
         let mut map = serde_json::Map::new();
         map.insert("success".to_string(), Value::Bool(self.success));
+        if let Some(status) = self.status {
+            map.insert("status".to_string(), Value::from(status));
+        }
         if self.success {
-            if let Some(status) = self.status {
-                map.insert("status".to_string(), Value::from(status));
-            }
             map.insert("ip".to_string(), Value::String(self.ip.clone()));
         }
         map.insert("durationMs".to_string(), Value::from(self.duration_ms));
@@ -554,9 +572,8 @@ async fn read_exit_ip(client: &reqwest::Client, proxy: Option<&ResolvedProxy>, t
 
 /// 测试某个出口是否可用。
 ///
-/// 判据是「能否连上 WorkBuddy 上游」，而**不是**能否访问第三方站点：
-/// 上游在国内可直连、国外站点常常恰恰相反，用第三方站点当判据会把能用的
-/// 配置报成失败。只要能拿到 HTTP 响应（含 401/404 这类未鉴权响应）就算通。
+/// 测试目标必须返回成功状态（2xx）；收到 HTTP 响应不等于目标可用。
+/// 重定向由客户端跟随，以最终响应状态为准。
 ///
 /// `target_url` 为 None 时用 `https://copilot.tencent.com/v2/config`。
 pub async fn test_connectivity(
@@ -566,7 +583,14 @@ pub async fn test_connectivity(
 ) -> ConnectivityResult {
     let started = logging::now_ms();
     let url = target_url.unwrap_or(DEFAULT_TEST_URL);
-    let client = client_for(proxy);
+    let transport = match proxy.map(crate::server::core::proxies::chain::endpoint).transpose() {
+        Ok(proxy) => proxy,
+        Err(reason) => return ConnectivityResult {
+            success: false, status: None, ip: String::new(),
+            duration_ms: logging::now_ms() - started, error: Some(reason),
+        },
+    };
+    let client = client_for(transport.as_ref());
     let request = client
         .get(url)
         .header("Accept", "application/json")
@@ -575,17 +599,21 @@ pub async fn test_connectivity(
         .timeout(Duration::from_millis(timeout_ms));
     match request.send().await {
         Ok(response) => {
-            let status = response.status().as_u16();
+            let status = response.status();
             let duration_ms = logging::now_ms() - started;
-            // 只关心「连得上」，不读响应体（drop 掉即可，连接会回到池里或直接关闭）
             drop(response);
-            let ip = read_exit_ip(&client, proxy, timeout_ms.min(IP_LOOKUP_MAX_MS)).await;
+            let success = status.is_success();
+            let ip = if success {
+                read_exit_ip(&client, proxy, timeout_ms.min(IP_LOOKUP_MAX_MS)).await
+            } else {
+                String::new()
+            };
             ConnectivityResult {
-                success: true,
-                status: Some(status),
+                success,
+                status: Some(status.as_u16()),
                 ip,
                 duration_ms,
-                error: None,
+                error: (!success).then(|| format!("测试目标返回 HTTP {status}，出口不可用")),
             }
         }
         Err(error) => ConnectivityResult {
@@ -657,6 +685,7 @@ pub fn describe_public(proxy: Option<&ResolvedProxy>) -> Value {
             "label": proxy.label,
             "host": proxy.host,
             "port": proxy.port_json(),
+            "nonDirect": proxy.non_direct,
         }),
     }
 }

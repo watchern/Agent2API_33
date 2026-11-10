@@ -13,11 +13,11 @@ import {
   type CustomModelContext, type MappingContext,
 } from './models-panel-state'
 import { t } from '../i18n'
+import { SearchableSelect } from '../../../ui-shared/searchable-select'
 
 /* ─── 映射弹窗 ───────────────────────────────── */
 
-/** 映射等级只在客户端未显式指定思考参数时作为默认值。 */
-const REASONING_TIP = t('思考等级绑定是这条映射的默认值，客户端显式指定时不覆盖。WorkBuddy 按当前地区的上游目录注入 reasoning_effort；不支持的正向等级取不高于请求的最高可用档，固定档位不能调高，目录未声明时跳过。off / none 不由映射注入；自定义等级只有提供商能确认支持时才发送。注入、归一与跳过原因写入详细日志。')
+const REASONING_TIP = t('设置思考等级后，会覆盖下游请求中的等级；选择“不覆盖”则保留下游参数。实际档位以提供商支持范围为准，无法注入时保留原请求并记录原因。off / none 仍不由映射注入。')
 
 /** 上游下拉的初值：候选里有就用候选里的原始拼写（value 必须与 option 逐字相同才会选中） */
 function pickUpstream(providerId: string, keep: string, locked: boolean): string {
@@ -355,17 +355,10 @@ export function CustomModelDialog({ initial, onClose }: { initial: CustomModelCo
         <DialogBody>
           <div className='flex flex-col gap-1.5'>
             <Label htmlFor='custom-model-provider'>{t('提供商')}</Label>
-            <Select value={providerValue} disabled={initial.locked}
-              onValueChange={next => setProvider(String(next))}>
-              <SelectTrigger id='custom-model-provider' className='w-full'>
-                <SelectValue>{providerLabel}</SelectValue>
-              </SelectTrigger>
-              <SelectContent>
-                {choices.map(item => (
-                  <SelectItem key={item.id} value={item.id}>{item.label}</SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
+            <SearchableSelect value={providerValue} disabled={initial.locked} onValueChange={setProvider}
+              id='custom-model-provider' className='w-full' displayValue={providerLabel}
+              aria-label={t('提供商')} searchPlaceholder={t('搜索提供商')}
+              options={choices.map(item => ({ value: item.id, label: item.label }))} />
           </div>
           <div className='flex flex-col gap-1.5'>
             <Label htmlFor='custom-model-id'>{t('上游模型 ID')}</Label>

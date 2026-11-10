@@ -17,6 +17,7 @@
  * 见该函数自己的说明。
  */
 
+import type { GithubFailure } from '../../../ui-shared/github-access'
 import type * as React from 'react'
 import type { AssetProbe, UpdateChannels, ForceUpdatePolicy, UpdateCapability, ServiceUpdateTask } from '../../../ui-shared/updates'
 import { assetMissingReason, githubErrorMessage, updateUnavailableReason } from '../../../ui-shared/updates'
@@ -32,7 +33,7 @@ import { t } from '../i18n'
 
 /** 更新检查结果（checkUpdate 的壳命令返回 / getUpdateStatus 的缓存）。字段按可选收：
  *  后端在「仓库暂无发布版本」「版本号无法解析」等情形下会给 null */
-export type UpdateInfo = {
+export type UpdateInfo = GithubFailure & {
   updateCapability?: UpdateCapability
   systemdTask?: ServiceUpdateTask | null
   serviceTask?: ServiceUpdateTask | null
@@ -318,8 +319,8 @@ export async function openExternal(url: string): Promise<void> {
 }
 
 /**
- * 官方 QQ 群号（三个群）。加群弹窗里逐个显示并可复制；群 1、群 2 都已接近满员，
- * 加群时优先给群 3 —— 这条提示写在弹窗里，不在常量上。
+ * 官方 QQ 群号。加群弹窗里逐个显示并可复制；群 1、群 2 都已接近满员，
+ * 加群时优先给群 3、群 4 —— 这条提示写在弹窗里，不在常量上。
  *
  * 为什么不摆二维码：二维码是打进包里的静态图，换群 / 换码就得跟着发一次版。
  * 现在群号会变（群 1 满员、后续可能再开群），只留群号 + 复制按钮，改一个常量即可。
@@ -332,6 +333,7 @@ export const QQ_GROUPS = [
   { no: '1127656296', nearlyFull: true },
   { no: '1130894674', nearlyFull: true },
   { no: '1108276647', nearlyFull: false },
+  { no: '1054072416', nearlyFull: false },
 ] as const
 
 /**

@@ -113,6 +113,11 @@ pub const KEY_SANITIZE_FINGERPRINTS: &str = "sanitizeBlacklistFingerprints";
 /// 转换实施点见 `core::upstream::payload`（send_body 的角色归一层）。
 pub const KEY_DEVELOPER_ROLE_COMPAT: &str = "developerRoleCompat";
 
+/// 第三方模型回答完自动折叠过程开关，默认关闭。
+/// 仅影响严格识别的 Codex Responses 请求；正常完成的非空回答才补最终阶段。
+/// 报表规则与来源声明不改变此开关的作用范围。
+pub const KEY_THIRD_PARTY_REASONING_COLLAPSE: &str = "thirdPartyReasoningCollapse";
+
 /// **Cline 转发头的逐键覆盖**（config.json 键）。
 ///
 /// 形状：`{"User-Agent": "Cline/3.0.62", ...}`（string → string）。语义是

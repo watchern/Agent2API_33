@@ -18,6 +18,7 @@ export type ProxyPoolItem = ProxyUsage & {
   port: number | null
   username: string
   password: string
+  nonDirect?: boolean
   createdAt: number
   updatedAt: number
   lastTest: {
@@ -37,6 +38,7 @@ export type ProxyPoolPayload = {
   clash?: ClashProxySnapshot
   changes?: number
   syncError?: string | null
+  imported?: import('../../../ui-shared/proxy-import').ProxyImportReport
 }
 
 export type ProxyTestResult = {
@@ -316,7 +318,7 @@ export async function removeItem(item: ProxyPoolItem): Promise<void> {
   if (typeof bridge?.removeProxyPoolItem !== 'function') return
   const used = item.usedBy || []
   const usedHtml = used.length
-    ? `<p style="margin-top:6px">${t('有 <strong>{n}</strong> 个账号正在使用它（{names}）—— 删除后这些账号会回退直连。', {
+    ? `<p style="margin-top:6px">${t('有 <strong>{n}</strong> 个账号正在使用它（{names}）—— 删除后需重新设置这些账号的代理，不会自动直连。', {
         n: used.length,
         names: used.map(entry => escapeHtml(String(entry.name || entry.id || ''))).join(t('、')),
       })}</p>`
@@ -405,7 +407,7 @@ export async function batchRemove(): Promise<void> {
     : names
   const usedCount = deletable.filter(item => (item.usedBy || []).length).length
   const usedHtml = usedCount
-    ? `<p style="margin-top:6px">${t('其中 <strong>{n}</strong> 条正被账号使用 —— 删除后那些账号会回退直连。', { n: usedCount })}</p>`
+    ? `<p style="margin-top:6px">${t('其中 <strong>{n}</strong> 条正被账号使用 —— 删除后需重新设置相关账号的代理，不会自动直连。', { n: usedCount })}</p>`
     : ''
   const services = [...new Set(deletable.flatMap(item => proxyServiceLabels(item, t)))]
   const serviceHtml = services.length

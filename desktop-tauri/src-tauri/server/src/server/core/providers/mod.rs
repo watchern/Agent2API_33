@@ -406,6 +406,7 @@ pub const fn kind_id(kind: ProviderKind) -> &'static str {
 /// 必须另问 `is_executable_provider`。
 pub fn is_known_provider_id(id: &str) -> bool {
     kind_from_id(id).is_some() || availability::is_suspended(id) || is_executable_provider(id)
+        || crate::server::core::plugin_host::script::known_provider(id)
 }
 
 /// 使用独立 FULL-auth 边界的稳定身份；停用不改变存量账号与错误分类语义。
@@ -458,6 +459,7 @@ pub fn label_of(id: &str) -> String {
         // runtime id 不靠占位 kind 取名：插件登记优先，最后回显原 ID。
         None => crate::server::core::plugin_host::lookup(id)
             .map(|adapter| adapter.label().to_string())
+            .or_else(|| crate::server::core::plugin_host::provider_label(id))
             .unwrap_or_else(|| id.to_string()),
     }
 }
@@ -500,9 +502,12 @@ where
 
 /// 注册表摘要：旧身份保持展示顺序，再追加插件 runtime ID。
 ///
-/// 每行包含 `{id, label, count, category, source}`；插件保留宿主申报的
-/// category / `plugin`。缺执行体的残留账号不列。
+/// 每行包含 `{id, label, count, category, source, userAgentOverridable}`；
+/// 插件保留宿主申报的 category / `plugin`。缺执行体的残留账号不列。
 /// `account_providers` 参数保留既有公开签名。
+///
+/// `userAgentOverridable`：该执行体支持对账号的全部上游请求覆盖 User-Agent。
+/// 脚本和 Wasm 由宿主执行，原生插件必须明确申报支持，避免旧插件显示无效设置。
 pub fn summary_json<F>(count: F, account_providers: &[String]) -> Vec<Value>
 where
     F: Fn(&str) -> usize,
@@ -522,6 +527,10 @@ where
                     json!(crate::server::core::plugin_host::provider_category(detail.id))
                 } else { json!("agent") },
                 "source": if plugin { "plugin" } else { "builtin" },
+                "loginAvailable": !plugin || crate::server::core::plugin_host::startup::provider(detail.id)
+                    .is_some_and(|state| state.available),
+                "userAgentOverridable": user_agent_overridable(detail.id),
+                "dynamicLogin": crate::server::core::plugin_host::wasm::owns(detail.id),
             })
         })
         .collect();
@@ -543,9 +552,20 @@ where
             "count": count(&id),
             "category": crate::server::core::plugin_host::provider_category(&id),
             "source": "plugin",
+            "loginAvailable": crate::server::core::plugin_host::startup::provider(&id)
+                .is_some_and(|state| state.available),
+            "userAgentOverridable": user_agent_overridable(&id),
+            "dynamicLogin": crate::server::core::plugin_host::wasm::owns(&id),
         }));
     }
     // 缺插件的残留账号仍不列，记录留在账号库里等待执行体恢复。
     let _ = account_providers;
     list
+}
+
+/// 自定义 API 没有适配器实例，由网关直接覆盖；插件按加载时的能力声明判断。
+fn user_agent_overridable(id: &str) -> bool {
+    adapter::adapter_by_id(id)
+        .map(|adapter| adapter.supports_account_user_agent())
+        .unwrap_or(true)
 }

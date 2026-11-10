@@ -10,12 +10,15 @@ pub use matcher::{identify, rule_matches};
 
 pub const CLIENT_OTHER: &str = "other";
 
+/// Codex 的严格行为归类值；报表显示规则与来源声明不参与协议兼容判断。
+pub const CLIENT_CODEX: &str = "Codex";
+
 /// 行为判断保留原来的严格识别，不读取显示规则或调用方声明。
 pub fn classify(ua: &str) -> String {
     let ua = ua.trim();
     if ua.is_empty() { return String::new(); }
     if ua.starts_with("Codex Desktop/") || ua.starts_with("codex_vscode/") || ua.starts_with("codex-tui/") {
-        return "Codex".into();
+        return CLIENT_CODEX.into();
     }
     if ua.starts_with("ZCode/") { return "ZCode".into(); }
     if ua.starts_with("claude-cli/") { return "Claude Code".into(); }

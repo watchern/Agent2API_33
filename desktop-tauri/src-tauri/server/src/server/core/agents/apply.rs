@@ -2,6 +2,10 @@ use serde_json::{json, Value};
 use std::path::Path;
 use std::sync::{Mutex, OnceLock};
 
+#[cfg(test)]
+#[path = "apply_tests.rs"]
+mod tests;
+
 use super::{
     backups, clients,
     files::{self, Change},
@@ -29,6 +33,7 @@ pub fn apply(
     }
     let plan = clients::plan(def, path, profile, operation, port)?;
     preview::verify(&plan, def.id, token)?;
+    for change in &plan.changes { change.check()?; }
     let changes: Vec<_> = plan
         .changes
         .iter()
@@ -95,12 +100,21 @@ pub fn apply_plan(def: &ClientDef, path: &Path, plan: &clients::Plan, token: &st
     write_plan(def, path, plan)
 }
 
+pub fn apply_plan_with<T>(def: &ClientDef, path: &Path, plan: &clients::Plan, token: &str,
+    persist: impl FnOnce(&mut dyn FnMut() -> Result<(), String>) -> Result<T, String>,
+) -> Result<T, String> {
+    let _guard = mutation_lock().lock().map_err(|_| "客户端配置写入锁不可用")?;
+    preview::verify(plan, def.id, token)?;
+    persist(&mut || write_plan(def, path, plan))
+}
+
 pub fn apply_resource(def: &ClientDef, path: &Path, plan: &clients::Plan) -> Result<(), String> {
     let _guard = mutation_lock().lock().map_err(|_| "客户端配置写入锁不可用")?;
     write_plan(def, path, plan)
 }
 
 fn write_plan(def: &ClientDef, path: &Path, plan: &clients::Plan) -> Result<(), String> {
+    for change in &plan.changes { change.check()?; }
     let changes = plan.changes.iter().filter(|change| !change.unchanged()).cloned().collect::<Vec<_>>();
     if changes.is_empty() { return Ok(()); }
     for change in &changes { change.check()?; }

@@ -3,14 +3,12 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-mod required;
-pub(super) use required::required_release;
 pub(crate) use super::packages::MAX_PACK_BYTES;
 
 use crate::server::core::update::client::{
     fetch_candidate, fetch_json, fetch_public, github_headers,
 };
-use crate::server::core::update::{compare_versions, is_prerelease_version, source};
+use crate::server::core::update::{compare_versions, is_prerelease_version, source, UpdateError};
 
 pub const INDEX_REPO: &str = "Agent2plugin/Agent2plugin";
 pub const FALLBACK_REPO: &str = "Agent2Builder/agent2api-providers-releases";
@@ -36,7 +34,6 @@ pub struct IndexEntry {
     pub id: String,
     pub name: String,
     pub description: String,
-    pub official: bool,
     pub require_signed: bool,
     pub manifest: String,
     pub icon: String,
@@ -66,13 +63,13 @@ pub struct ReleaseAssets {
 
 impl ReleaseAssets {
     pub fn asset(&self, id: &str, target: &str) -> Option<PackAsset> {
-        let (_, url, size) = self
+        let (platform, url, size) = self
             .platforms
             .iter()
-            .find(|(platform, _, _)| platform == target)?;
+            .find(|(platform, _, _)| platform == target || platform == super::wasm::manifest::TARGET)?;
         Some(PackAsset {
             version: self.version.clone(),
-            name: asset_name(id, &self.version, target),
+            name: asset_name(id, &self.version, platform),
             url: url.clone(),
             size: *size,
             page: self.page.clone(),
@@ -89,79 +86,36 @@ fn text(value: &Value, key: &str) -> String {
         .to_string()
 }
 
-pub(super) fn retry_key() -> String {
-    format!("pluginGithub:{INDEX_REPO}")
-}
-
 pub(super) fn waiting_message(state: &crate::server::core::task_state::TaskState) -> String {
     source::GithubSettings::Plugin.waiting_message(state)
 }
 
-pub(super) fn describe_error(message: &str, retry_at: i64) -> String {
-    source::GithubSettings::Plugin.describe_error(message, retry_at)
-}
-
 pub fn clear_cooldown() {
-    super::compatibility::clear_cooldown();
     super::catalog::clear_cooldown();
-    if let Err(error) = crate::server::core::task_state::clear_cooldown(&retry_key()) {
-        crate::server::logging::verbose("[Plugin]", &error);
-    }
 }
 
 async fn fetch(url: &str) -> Result<reqwest::Response, String> {
-    let state = crate::server::core::task_state::read(&retry_key())?;
-    if source::is_official_api(url) && state.retry_at > crate::server::logging::now_ms() {
-        return Err(waiting_message(&state));
-    }
-    let response = fetch_public(url, &github_headers(), Some(QUERY_TIMEOUT_MS))
-        .await
-        .map_err(|error| describe_error(&error, 0))?;
-    let status = response.status().as_u16();
-    if source::is_official_api(url) && (status == 403 || status == 429) {
-        let retry_at = source::retry_deadline(response.headers(), status);
-        let message = source::GithubSettings::Plugin.rate_limit_message(retry_at);
-        if let Ok(crate::server::core::task_state::Claim::Acquired(guard)) =
-            crate::server::core::task_state::claim(
-                &retry_key(),
-                60_000,
-                true,
-                crate::server::core::task_state::ManualBackoff::Respect,
-                0,
-            )
-        {
-            let _ = guard.finish(
-                false,
-                message.clone(),
-                None,
-                retry_at,
-                60_000,
-            );
-        }
-        return Err(message);
-    }
-    Ok(response)
+    fetch_public(url, &github_headers(), Some(QUERY_TIMEOUT_MS)).await
 }
 
-pub async fn read_index_result() -> Result<Vec<IndexEntry>, String> {
+pub async fn read_index_result() -> Result<Vec<IndexEntry>, UpdateError> {
     let url = format!("https://raw.githubusercontent.com/{INDEX_REPO}/main/index.json");
     let response = fetch_json(&url, &github_headers(), QUERY_TIMEOUT_MS, |value| {
         value.get("plugins").and_then(Value::as_array).is_some()
     })
-    .await
-    .map_err(|error| describe_error(&error.message, 0))?;
+    .await?;
     if !response.status.is_success() {
-        return Err(format!(
+        return Err(UpdateError::new(format!(
             "读取插件索引失败：HTTP {}",
             response.status.as_u16()
-        ));
+        )));
     }
     let require_signed = !response.official;
     let document = response.value;
     let items = document
         .get("plugins")
         .and_then(Value::as_array)
-        .ok_or_else(|| "插件索引缺少 plugins 数组".to_string())?;
+        .ok_or_else(|| UpdateError::new("插件索引缺少 plugins 数组"))?;
     Ok(items
         .iter()
         .filter_map(|item| {
@@ -178,7 +132,6 @@ pub async fn read_index_result() -> Result<Vec<IndexEntry>, String> {
                 name: if name.is_empty() { id.clone() } else { name },
                 id,
                 description: text(item, "description"),
-                official: item.get("official").and_then(Value::as_bool) == Some(true),
                 require_signed,
                 manifest: text(item, "manifest"),
                 icon: text(item, "icon"),
@@ -344,7 +297,7 @@ pub async fn release_for(
     id: &str,
     detail: Option<&PluginDetail>,
     current: Option<&str>,
-) -> Result<Option<ReleaseAssets>, String> {
+) -> Result<Option<ReleaseAssets>, UpdateError> {
     release_for_channels(repo, id, detail, current, super::settings::current().channels()).await
 }
 
@@ -354,9 +307,9 @@ pub(super) async fn release_for_channels(
     detail: Option<&PluginDetail>,
     current: Option<&str>,
     channels: crate::server::config::UpdateChannels,
-) -> Result<Option<ReleaseAssets>, String> {
+) -> Result<Option<ReleaseAssets>, UpdateError> {
     if !valid_repo(repo) {
-        return Err("插件发布仓库必须是 owner/repo".to_string());
+        return Err(UpdateError::new("插件发布仓库必须是 owner/repo"));
     }
     let custom_tag = detail
         .map(|detail| detail.tag_template != "v{version}")
@@ -376,7 +329,7 @@ pub(super) async fn release_for_channels(
     let list: Vec<&Value> = if listed {
         document
             .as_array()
-            .ok_or_else(|| "插件 Release 列表格式错误".to_string())?
+            .ok_or_else(|| UpdateError::new("插件 Release 列表格式错误"))?
             .iter()
             .collect()
     } else {
@@ -399,7 +352,7 @@ pub(super) async fn release_for_channels(
             && !assets
                 .platforms
                 .iter()
-                .any(|(target, _, _)| *target == super::host_target())
+                .any(|(target, _, _)| *target == super::host_target() || target == super::wasm::manifest::TARGET)
         {
             continue;
         }
@@ -418,13 +371,9 @@ async fn query_releases(
     repo: &str,
     suffix: &str,
     listed: bool,
-) -> Result<Option<crate::server::core::update::client::JsonResponse>, String> {
+) -> Result<Option<crate::server::core::update::client::JsonResponse>, UpdateError> {
     if !valid_repo(repo) {
-        return Err("插件发布仓库必须是 owner/repo".to_string());
-    }
-    let state = crate::server::core::task_state::read(&retry_key())?;
-    if state.retry_at > crate::server::logging::now_ms() {
-        return Err(waiting_message(&state));
+        return Err(UpdateError::new("插件发布仓库必须是 owner/repo"));
     }
     let url = format!("{GITHUB_API}/repos/{repo}/releases{suffix}");
     let response = fetch_json(&url, &github_headers(), QUERY_TIMEOUT_MS, |value| {
@@ -434,20 +383,15 @@ async fn query_releases(
             value.get("tag_name").and_then(Value::as_str).is_some()
         }
     })
-    .await
-    .map_err(|error| describe_error(&error.message, 0))?;
+    .await?;
     if response.status.as_u16() == 404 {
         return Ok(None);
     }
-    if matches!(response.status.as_u16(), 403 | 429) {
-        let retry_at = source::retry_deadline(&response.headers, response.status.as_u16());
-        return Err(source::GithubSettings::Plugin.rate_limit_message(retry_at));
-    }
     if !response.status.is_success() {
-        return Err(format!(
+        return Err(UpdateError::new(format!(
             "查询插件更新失败：GitHub 返回 HTTP {}",
             response.status.as_u16()
-        ));
+        )));
     }
     Ok(Some(response))
 }
@@ -462,11 +406,11 @@ pub async fn latest_in(
     target: &str,
 ) -> Result<Option<PackAsset>, String> {
     Ok(release_for(repo, pack_id, None, None)
-        .await?
+        .await.map_err(|error| error.message)?
         .and_then(|release| release.asset(pack_id, target)))
 }
 
-pub async fn release_assets_in(repo: &str, id: &str) -> Result<Option<ReleaseAssets>, String> {
+pub async fn release_assets_in(repo: &str, id: &str) -> Result<Option<ReleaseAssets>, UpdateError> {
     release_for(repo, id, None, None).await
 }
 
@@ -490,22 +434,22 @@ pub async fn download(
             .map(|(id, _)| id.to_string())
     });
     let mut last_error = "没有可用的插件下载源".to_string();
-    for candidate in source::download_candidates(&asset.url, pack_id.is_some(), &headers).await? {
+    let mut limited = Vec::new();
+    for candidate in source::download_candidates(&asset.url, pack_id.is_some(), &headers).await.map_err(|error| error.message)? {
+        if let Some(error) = candidate.cooling_error(&headers) {
+            limited.extend(error.rate_limits);
+            continue;
+        }
         let started = std::time::Instant::now();
         let response = match fetch_candidate(&candidate, &headers, None).await {
             Ok(response) => response,
             Err(error) => {
-                candidate.forget();
-                last_error = describe_error(&error, 0);
+                candidate.observe(source::failed_state(&error.message), started.elapsed().as_millis() as u64, false);
+                limited.extend(error.rate_limits);
+                last_error = error.message;
                 continue;
             }
         };
-        if candidate.is_rate_limited(&response) {
-            candidate.observe("rateLimited", started.elapsed().as_millis() as u64, false);
-            return Err(source::GithubSettings::Plugin.rate_limit_message(
-                source::retry_deadline(response.headers(), response.status().as_u16()),
-            ));
-        }
         if response.status().as_u16() != 200 {
             last_error = format!(
                 "下载插件包失败：{}返回 HTTP {}",
@@ -535,7 +479,7 @@ pub async fn download(
                     .and_then(|result| result);
                     if let Err(error) = prepared {
                         candidate.forget();
-                        last_error = format!("加速下载的插件未通过官方签名校验：{error}");
+                        last_error = format!("加速下载的插件未通过可信签名校验：{error}");
                         continue;
                     }
                 }
@@ -544,11 +488,11 @@ pub async fn download(
             }
             Err(error) => {
                 candidate.forget();
-                last_error = describe_error(&error, 0);
+                last_error = error;
             }
         }
     }
-    Err(last_error)
+    Err(if limited.is_empty() { last_error } else { UpdateError::rate_limited(limited).message })
 }
 
 async fn read_download(

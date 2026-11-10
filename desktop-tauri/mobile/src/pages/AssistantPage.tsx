@@ -476,13 +476,7 @@ export function AssistantPage() {
   }
 
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
-      {/*
-        页头必须自己吃下安全区：其他一级页用 `.m-head`，那里带了
-        `calc(var(--m-safe-t) + …)`；这一页是手写的紧凑头（对话页要省纵向空间），
-        漏了 safe-t 就会被刘海 / 状态栏压住。离线时顶部那条通知自己占安全区，
-        这里再让一次会多出一段空白 —— 与 `.m-app[data-offline] .m-head` 同口径。
-      */}
+    <div style={{ display: 'flex', flexDirection: 'column', height: '100%', minHeight: 0 }}>
       <div
         className='m-assistant-head'
         style={{ display: 'flex', alignItems: 'center', gap: 9, flex: 'none' }}

@@ -9,12 +9,15 @@
 //! 这是整条链路上唯一无法用纯 Rust 单元测试覆盖的部分：spawn、管道、
 //! 分帧、握手、进程退出。用假实现替代就等于没测。
 //!
-//! ── 跳过条件 ────────────────────────────────────────────────
-//! 插件二进制不存在时跳过（`cargo test` 在没构建过 pack 的机器上仍要能过）。
-//! 构建方式见 `agent2api-providers/README.md`。
+//! ── 运行条件 ────────────────────────────────────────────────
+//! 这些联调用例默认标为 ignored，避免缺少插件时被误记为通过。
+//! 显式运行时由 AGENT2API_TEST_PLUGIN_EXE 指定含 demo 的插件；路径或握手失败必须报错。
 
 use std::sync::Arc;
 use std::time::Duration;
+
+#[path = "test_upstream.rs"]
+mod test_upstream;
 
 use super::*;
 use crate::server::core::providers::adapter::{ReasoningPatch, UpstreamErrorClass};
@@ -22,25 +25,24 @@ use crate::server::core::providers::adapter::ProviderAdapter;
 use crate::server::core::upstream::usage::RequestTelemetry;
 use crate::server::core::upstream::ForwardOutcome;
 
-/// 找到插件二进制（相对 workspace 根）。
-fn plugin_exe() -> Option<std::path::PathBuf> {
-    // 测试进程的 cwd 是 crate 根（`server/`），往上是 `src-tauri/`、再上是仓库根
-    let candidates = [
-        "../../../agent2api-providers/target/debug/agent2api-providers.exe",
-        "../../../agent2api-providers/target/debug/agent2api-providers",
-        "../../../agent2api-providers/target/release/agent2api-providers.exe",
-        "../../../agent2api-providers/target/release/agent2api-providers",
-    ];
-    candidates
-        .iter()
-        .map(std::path::PathBuf::from)
-        .find(|path| path.exists())
+fn plugin_exe() -> std::path::PathBuf {
+    let path = std::path::PathBuf::from(std::env::var_os("AGENT2API_TEST_PLUGIN_EXE")
+        .expect("显式运行插件联调时必须设置 AGENT2API_TEST_PLUGIN_EXE，指向包含 demo 的测试插件"));
+    assert!(path.is_file(), "测试插件不存在：{}", path.display());
+    path.canonicalize().expect("测试插件路径应可解析")
 }
 
 /// 一个最小回调实现：只为验证「插件 → 网关」这条路通。
-struct TestCallbacks;
+pub(super) struct TestCallbacks;
 
 impl GatewayCallbacks for TestCallbacks {
+    fn account_provider(&self, account: &str) -> Option<String> {
+        (!account.is_empty()).then(|| "demo".to_string())
+    }
+
+    fn provider_allowed(&self, provider: &str) -> bool {
+        provider == "demo"
+    }
     fn store_get(
         &self,
         _provider: String,
@@ -137,23 +139,22 @@ impl GatewayCallbacks for TestCallbacks {
 }
 
 /// 拉起宿主并握手。
-async fn boot() -> Option<(Arc<Host>, Vec<proto::ProviderInfo>)> {
-    let exe = plugin_exe()?;
+async fn boot() -> (tempfile::TempDir, Arc<Host>, Vec<proto::ProviderInfo>) {
+    let dir = tempfile::tempdir().expect("插件测试应使用独立目录");
     let options = HostOptions {
         init_timeout: Duration::from_secs(20),
-        ..HostOptions::new(exe)
+        data_dir: dir.path().to_string_lossy().to_string(),
+        ..HostOptions::new(plugin_exe())
     };
     let host = Arc::new(Host::new(options, Arc::new(TestCallbacks)));
-    let providers = host.ensure().await.ok()?;
-    Some((host, providers))
+    let providers = host.ensure().await.expect("插件存在时握手失败不能算测试通过");
+    (dir, host, providers)
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "需要 AGENT2API_TEST_PLUGIN_EXE 指向含 demo 的插件二进制"]
 async fn host_starts_and_lists_providers() {
-    let Some((host, providers)) = boot().await else {
-        eprintln!("跳过：插件二进制不存在（先构建 agent2api-providers）");
-        return;
-    };
+    let (_dir, host, providers) = boot().await;
     assert!(!providers.is_empty(), "握手应当返回至少一家 provider");
     let demo = providers
         .iter()
@@ -175,11 +176,9 @@ async fn host_starts_and_lists_providers() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "需要 AGENT2API_TEST_PLUGIN_EXE 指向含 demo 的插件二进制"]
 async fn build_chat_request_goes_through_rpc() {
-    let Some((host, providers)) = boot().await else {
-        eprintln!("跳过：插件二进制不存在");
-        return;
-    };
+    let (_dir, host, providers) = boot().await;
     let demo = providers.iter().find(|p| p.id.0 == "demo").expect("demo 存在");
     let adapter = RpcAdapter::new(
         "demo".into(),
@@ -217,11 +216,9 @@ async fn build_chat_request_goes_through_rpc() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "需要 AGENT2API_TEST_PLUGIN_EXE 指向含 demo 的插件二进制"]
 async fn classify_error_goes_through_rpc() {
-    let Some((host, providers)) = boot().await else {
-        eprintln!("跳过：插件二进制不存在");
-        return;
-    };
+    let (_dir, host, providers) = boot().await;
     let demo = providers.iter().find(|p| p.id.0 == "demo").expect("demo 存在");
     let adapter = RpcAdapter::new(
         "demo".into(),
@@ -250,11 +247,9 @@ async fn classify_error_goes_through_rpc() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "需要 AGENT2API_TEST_PLUGIN_EXE 指向含 demo 的插件二进制"]
 async fn reasoning_patch_goes_through_rpc() {
-    let Some((host, providers)) = boot().await else {
-        eprintln!("跳过：插件二进制不存在");
-        return;
-    };
+    let (_dir, host, providers) = boot().await;
     let demo = providers.iter().find(|p| p.id.0 == "demo").expect("demo 存在");
     let adapter = RpcAdapter::new(
         "demo".into(),
@@ -289,11 +284,9 @@ async fn reasoning_patch_goes_through_rpc() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "需要 AGENT2API_TEST_PLUGIN_EXE 指向含 demo 的插件二进制"]
 async fn refusal_markers_come_from_handshake() {
-    let Some((host, providers)) = boot().await else {
-        eprintln!("跳过：插件二进制不存在");
-        return;
-    };
+    let (_dir, host, providers) = boot().await;
     let demo = providers.iter().find(|p| p.id.0 == "demo").expect("demo 存在");
     // 握手里的标记（协议层）
     assert_eq!(demo.refusal_finishes, vec!["content_policy_violation".to_string()]);
@@ -313,11 +306,9 @@ async fn refusal_markers_come_from_handshake() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "需要 AGENT2API_TEST_PLUGIN_EXE 指向含 demo 的插件二进制"]
 async fn ensure_token_reads_the_account_through_callbacks() {
-    let Some((host, providers)) = boot().await else {
-        eprintln!("跳过：插件二进制不存在");
-        return;
-    };
+    let (_dir, host, providers) = boot().await;
     let demo = providers.iter().find(|p| p.id.0 == "demo").expect("demo 存在");
     let adapter = RpcAdapter::new(
         "demo".into(),
@@ -342,11 +333,9 @@ async fn ensure_token_reads_the_account_through_callbacks() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "需要 AGENT2API_TEST_PLUGIN_EXE 指向含 demo 的插件二进制"]
 async fn missing_account_reports_not_found() {
-    let Some((host, providers)) = boot().await else {
-        eprintln!("跳过：插件二进制不存在");
-        return;
-    };
+    let (_dir, host, providers) = boot().await;
     let demo = providers.iter().find(|p| p.id.0 == "demo").expect("demo 存在");
     let adapter = RpcAdapter::new(
         "demo".into(),
@@ -365,35 +354,30 @@ async fn missing_account_reports_not_found() {
 
 // ── 流式帧（head / chunk / credit / abort）──────────────────────
 
-/// 一个最小假上游：按请求体里的标记决定返回什么。
+/// 一个只接受本机请求的假上游。
 ///
 /// ── 为什么必须在测试里起一个真 HTTP 服务 ──────────────────────
 /// `demo` 的 `conversation` 是真的发请求（那正是要验的路径：插件自己出网、
 /// 自己推帧）。把它换成假实现就等于只测了网关自己的循环。
-async fn fake_upstream(body_marker: &'static str, payload: &'static str) -> (String, tokio::task::JoinHandle<()>) {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("绑定回环端口");
-    let port = listener.local_addr().expect("本地地址").port();
-    let handle = tokio::spawn(async move {
-        loop {
-            let Ok((mut socket, _)) = listener.accept().await else { return };
-            let marker = body_marker;
-            let payload = payload;
-            tokio::spawn(async move {
-                // 读到请求头结束即可（body 的内容不影响假上游的判定）
-                let mut buf = vec![0u8; 16 * 1024];
-                let _ = socket.read(&mut buf).await;
-                let response = format!(
-                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-                    payload.len() + marker.len() * 0,
-                    payload
-                );
-                let _ = socket.write_all(response.as_bytes()).await;
-                let _ = socket.shutdown().await;
-            });
-        }
-    });
-    (format!("http://127.0.0.1:{port}"), handle)
+struct FakeUpstream(tokio::task::JoinHandle<()>);
+
+impl Drop for FakeUpstream {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+async fn fake_upstream(payload: &'static str) -> (String, FakeUpstream) {
+    let app = axum::Router::new().route(
+        "/v1/chat/completions",
+        axum::routing::post(move |_body: axum::body::Bytes| async move {
+            ([("content-type", "text/event-stream")], payload)
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (url, FakeUpstream(task))
 }
 
 /// 建一个 demo 适配器。
@@ -402,9 +386,9 @@ async fn fake_upstream(body_marker: &'static str, payload: &'static str) -> (Str
 /// 走 `x-demo-upstream` 请求头，不走环境变量：插件的 env 在 spawn 时固定，
 /// 而一个测试进程里要起好几个假上游（各占一个随机端口），环境变量只能有
 /// 一个值。
-async fn demo_adapter() -> Option<(Arc<Host>, RpcAdapter, Arc<RequestTelemetry>)> {
-    let (host, providers) = boot().await?;
-    let demo = providers.iter().find(|p| p.id.0 == "demo")?.clone();
+async fn demo_adapter() -> (tempfile::TempDir, Arc<Host>, RpcAdapter, Arc<RequestTelemetry>) {
+    let (dir, host, providers) = boot().await;
+    let demo = providers.iter().find(|p| p.id.0 == "demo").expect("测试插件必须提供 demo").clone();
     let adapter = RpcAdapter::new(
         "demo".into(),
         crate::server::core::providers::ProviderKind::WorkBuddy,
@@ -412,7 +396,7 @@ async fn demo_adapter() -> Option<(Arc<Host>, RpcAdapter, Arc<RequestTelemetry>)
         demo,
     );
     let telemetry = Arc::new(RequestTelemetry::new());
-    Some((host, adapter, telemetry))
+    (dir, host, adapter, telemetry)
 }
 
 /// 带 `x-demo-upstream` 的入站头。
@@ -426,16 +410,13 @@ fn upstream_headers(upstream: &str) -> axum::http::HeaderMap {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "需要 AGENT2API_TEST_PLUGIN_EXE 指向含 demo 的插件二进制"]
 async fn conversation_streams_head_and_chunks() {
     let (upstream, _server) = fake_upstream(
-        "",
         "data: {\"choices\":[{\"delta\":{\"content\":\"你\"}}]}\n\ndata: [DONE]\n\n",
     )
     .await;
-    let Some((host, adapter, telemetry)) = demo_adapter().await else {
-        eprintln!("跳过：插件二进制不存在");
-        return;
-    };
+    let (_dir, host, adapter, telemetry) = demo_adapter().await;
     let (db, _guard) = crate::server::db::test_temp::TempDb::open("plugin-host-conv-stream");
     let store = crate::server::core::account_store::AccountStore::with_db(Some(db));
     let body = serde_json::json!({ "model": "demo-fast", "messages": [] });
@@ -482,16 +463,13 @@ async fn conversation_streams_head_and_chunks() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "需要 AGENT2API_TEST_PLUGIN_EXE 指向含 demo 的插件二进制"]
 async fn conversation_non_stream_aggregates_on_the_gateway() {
     let (upstream, _server) = fake_upstream(
-        "",
         "data: {\"choices\":[{\"delta\":{\"content\":\"你\"},\"index\":0}]}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"好\"},\"index\":0}]}\n\ndata: [DONE]\n\n",
     )
     .await;
-    let Some((host, adapter, telemetry)) = demo_adapter().await else {
-        eprintln!("跳过：插件二进制不存在");
-        return;
-    };
+    let (_dir, host, adapter, telemetry) = demo_adapter().await;
     let (db, _guard) = crate::server::db::test_temp::TempDb::open("plugin-host-conv-aggregate");
     let store = crate::server::core::account_store::AccountStore::with_db(Some(db));
     let body = serde_json::json!({ "model": "demo-fast", "messages": [] });
@@ -524,16 +502,13 @@ async fn conversation_non_stream_aggregates_on_the_gateway() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn conversation_upstream_error_is_classified() {
+#[ignore = "需要 AGENT2API_TEST_PLUGIN_EXE 指向含 demo 的插件二进制"]
+async fn conversation_http_200_body_is_forwarded_without_hanging() {
     let (upstream, _server) = fake_upstream(
-        "",
         "{\"error\":{\"message\":\"rate limited\",\"code\":429}}",
     )
     .await;
-    let Some((host, adapter, telemetry)) = demo_adapter().await else {
-        eprintln!("跳过：插件二进制不存在");
-        return;
-    };
+    let (_dir, host, adapter, telemetry) = demo_adapter().await;
     let (db, _guard) = crate::server::db::test_temp::TempDb::open("plugin-host-conv-error");
     let store = crate::server::core::account_store::AccountStore::with_db(Some(db));
     let body = serde_json::json!({ "model": "demo-fast", "messages": [] });
@@ -576,16 +551,12 @@ async fn conversation_upstream_error_is_classified() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "需要 AGENT2API_TEST_PLUGIN_EXE 指向含 demo 的插件二进制"]
 async fn dropping_the_stream_aborts_the_plugin_call() {
-    let (upstream, _server) = fake_upstream(
-        "",
-        "data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}]}\n\ndata: [DONE]\n\n",
-    )
-    .await;
-    let Some((host, adapter, telemetry)) = demo_adapter().await else {
-        eprintln!("跳过：插件二进制不存在");
-        return;
-    };
+    use futures::StreamExt;
+
+    let mut upstream = test_upstream::PendingUpstream::start().await;
+    let (_dir, host, adapter, telemetry) = demo_adapter().await;
     let (db, _guard) = crate::server::db::test_temp::TempDb::open("plugin-host-conv-drop");
     let store = crate::server::core::account_store::AccountStore::with_db(Some(db));
     let body = serde_json::json!({ "model": "demo-fast", "messages": [] });
@@ -595,18 +566,30 @@ async fn dropping_the_stream_aborts_the_plugin_call() {
             &store,
             "acc-1",
             &body,
-            &upstream_headers(&upstream),
+            &upstream_headers(&upstream.url),
             None,
             true,
             &telemetry,
         )
         .await
         .expect("流式转发应当成功");
-    // 立刻丢弃（模拟客户端断开）：Drop 会清登记并给插件发 abort。
-    drop(outcome);
-    // 给 abort 一点时间落到插件那边；关键断言是「宿主仍然活着」——
-    // abort 路径上 panic 会让下一次调用失败。
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    let ForwardOutcome::Stream { mut stream, .. } = outcome else {
+        panic!("应当返回未结束的流");
+    };
+    let first = tokio::time::timeout(Duration::from_secs(10), async {
+        let mut text = String::new();
+        while !text.contains("started") {
+            let chunk = stream.next().await.expect("取消之前上游不能结束").unwrap();
+            text.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        text
+    }).await.expect("应当收到首帧");
+    assert!(!first.contains("[DONE]"));
+    assert!(matches!(upstream.disconnected.try_recv(), Err(oneshot::error::TryRecvError::Empty)));
+    drop(stream);
+    tokio::time::timeout(Duration::from_secs(10), &mut upstream.disconnected)
+        .await.expect("取消后插件必须关闭仍在等待的上游连接")
+        .expect("模拟上游应当报告连接释放");
     let still_alive = adapter
         .ensure_access_token(&store, "acc-1")
         .await

@@ -1,100 +1,59 @@
-import { usePlotArea, useXAxisScale, useYAxisScale, ZIndexLayer, type PieLabelRenderProps } from 'recharts'
-import { formatPercent, formatTokens, textWidth } from '../report-charts'
-import type { CacheTrendRow, DailyTrendRow } from './chart-data'
+import type { PieLabelRenderProps } from 'recharts'
 
-type LabelBox = { left: number; right: number; top: number; bottom: number }
-type PointLabel = {
-  key: string; x: number; y: number; text: string; cls: string
-  anchor: 'start' | 'middle' | 'end'
-}
+/** 折线数据点标签之间至少要留出的横向距离。实际步长由调用方按容器宽度算，
+ *  一行读数（「97.1%」「2.8 亿」）约 34px 宽，46px 留出可辨认的间隙。 */
+export const LINE_LABEL_GAP = 46
 
-function collides(box: LabelBox, placed: LabelBox[]): boolean {
-  return placed.some(item => box.left < item.right + 3 && box.right > item.left - 3
-    && box.top < item.bottom + 2 && box.bottom > item.top - 2)
-}
+const LABEL_OFFSET = 10
 
-function Labels({ items }: { items: PointLabel[] }) {
-  return (
-    <ZIndexLayer zIndex={2000}>
-      <g pointerEvents='none'>
-        {items.map(item => (
-          <text x={item.x} y={item.y} textAnchor={item.anchor}
-            className={`chart-label ${item.cls}`} key={item.key}>{item.text}</text>
-        ))}
-      </g>
-    </ZIndexLayer>
-  )
-}
-
-export function CachePointLabels({ rows }: { rows: CacheTrendRow[] }) {
-  const plot = usePlotArea()
-  const xScale = useXAxisScale()
-  const rateScale = useYAxisScale()
-  const tokenScale = useYAxisScale('tokens')
-  if (!plot || !xScale || !rateScale) return null
-  const items: PointLabel[] = []
-  const boxes: LabelBox[] = []
-  const add = (row: CacheTrendRow, index: number, cls: 'tokens' | 'rate') => {
-    if (cls === 'rate' ? !row.used : row.totalTokens <= 0) return
-    const x = xScale(row.hour)
-    const pointY = cls === 'rate' ? rateScale(row.rate) : tokenScale?.(row.totalTokens)
-    if (x == null || pointY == null) return
-    const text = cls === 'rate' ? formatPercent(row.rate) : formatTokens(row.totalTokens)
-    const width = textWidth(text)
-    const anchor = x - width / 2 < plot.x ? 'start' : x + width / 2 > plot.x + plot.width ? 'end' : 'middle'
-    const left = anchor === 'start' ? x : anchor === 'end' ? x - width : x - width / 2
-    let y = cls === 'rate' ? pointY + 17 : pointY - 10
-    if (y > plot.y + plot.height) y = pointY - 8
-    if (y - 11 < plot.y - 18) y = pointY + 17
-    const box = { left, right: left + width, top: y - 11, bottom: y + 2 }
-    if (collides(box, boxes)) return
-    boxes.push(box)
-    items.push({ key: `${cls}-${index}`, x, y, text, cls, anchor })
-  }
-  rows.forEach((row, index) => add(row, index, 'tokens'))
-  rows.forEach((row, index) => add(row, index, 'rate'))
-  return <Labels items={items} />
-}
-
-export function DailyPointLabels({ rows, formatValue = formatTokens }: {
-  rows: DailyTrendRow[]; formatValue?: (value: number) => string
-}) {
-  const plot = usePlotArea()
-  const xScale = useXAxisScale()
-  const yScale = useYAxisScale()
-  if (!plot || !xScale || !yScale || !rows.length) return null
-  const ranked = rows.map((row, index) => ({ row, index })).filter(({ row }) => row.total > 0)
-  const step = plot.width / rows.length
-  const allFit = ranked.every(({ row }) => textWidth(formatValue(row.total)) + 6 <= step)
-  if (!allFit) ranked.sort((left, right) => right.row.total - left.row.total)
-  const items: PointLabel[] = []
-  const boxes: LabelBox[] = []
-  for (const { row, index } of ranked) {
-    if (!allFit && items.length >= 8) break
-    const x = xScale(row.date)
-    const pointY = yScale(row.total)
-    if (x == null || pointY == null) continue
-    const text = formatValue(row.total)
-    const width = textWidth(text)
-    const anchor = x - width / 2 < plot.x ? 'start' : x + width / 2 > plot.x + plot.width ? 'end' : 'middle'
-    const left = anchor === 'start' ? x : anchor === 'end' ? x - width : x - width / 2
-    const y = pointY - 8
-    const box = { left, right: left + width, top: y - 11, bottom: y + 2 }
-    if (collides(box, boxes)) continue
-    boxes.push(box)
-    items.push({ key: `day-${index}`, x, y, text, cls: 'total', anchor })
-  }
-  return <Labels items={items} />
-}
-
-export function renderDonutLabel({ cx, cy, midAngle, innerRadius, outerRadius, percent }: PieLabelRenderProps) {
+export function renderDonutLabel({ cx, cy, midAngle, innerRadius, outerRadius, percent, fill }: PieLabelRenderProps) {
   if (percent == null || percent < 0.03 || midAngle == null) return null
-  const radius = innerRadius + (outerRadius - innerRadius) * 0.6
+  const radius = innerRadius + (outerRadius - innerRadius) / 2
   const angle = -midAngle * Math.PI / 180
-  return (
-    <text x={cx + radius * Math.cos(angle)} y={cy + radius * Math.sin(angle)}
-      className='donut-label' textAnchor='middle' dominantBaseline='central'>
-      {`${Math.round(percent * 100)}%`}
-    </text>
-  )
+  return <text x={cx + radius * Math.cos(angle)} y={cy + radius * Math.sin(angle)}
+    className='donut-label' data-other={fill === 'var(--chart-other)' ? '' : undefined}
+    textAnchor='middle' dominantBaseline='central'>
+    {`${Math.round(percent * 100)}%`}
+  </text>
+}
+
+/** 折线点上的读数标签（口径与 OmniProxy 的报表一致）：
+ *  · 命中率标在点下方、Token 标在点上方，两条线的读数分开摆放，不叠在一起；
+ *  · 首末两个点向内锚定，末点标签不会探进右侧纵轴的刻度区；
+ *  · 文字带描边（描边取卡片底色），压到折线上时把线「挖开」，密集处也读得清。
+ *
+ *  `stride` 是抽稀步长：一屏 24 个小时点，窄窗口逐点标注会连成一片数字，
+ *  所以按容器宽度取步长，只有首末两个有数据的点无论如何都标。
+ *  `flipUnder` 是「贴底改标上方」的阈值：命中率掉到 0 时点贴在绘图区底边，
+ *  标签画在下方会落进横轴刻度带里，这时改标到点上方。
+ */
+export function renderPointLabel(props: PointLabelProps, options: PointLabelOptions) {
+  const index = props.index ?? 0
+  const value = props.value
+  if (value == null || !(index === options.first || index === options.last || index % options.stride === 0)) return null
+  const box = (props.viewBox ?? {}) as { x?: unknown; y?: unknown }
+  const x = Number(box.x ?? props.x)
+  const y = Number(box.y ?? props.y)
+  const numeric = Number(value)
+  if (!Number.isFinite(numeric) || !Number.isFinite(x) || !Number.isFinite(y)) return null
+  const above = options.place === 'above' || (options.flipUnder != null && numeric <= options.flipUnder)
+  return <text x={x} y={above ? y - LABEL_OFFSET : y + LABEL_OFFSET}
+    className='report-line-label' style={{ fill: options.fill }}
+    textAnchor={index === options.first ? 'start' : index === options.last ? 'end' : 'middle'}
+    dominantBaseline={above ? 'auto' : 'hanging'}>
+    {options.format(numeric)}
+  </text>
+}
+
+/** recharts 的 LabelList 逐点回调入参：viewBox 与根上的 x/y 都是这个点的坐标。 */
+type PointLabelProps = { viewBox?: unknown; x?: unknown; y?: unknown; value?: unknown; index?: number }
+
+type PointLabelOptions = {
+  first: number
+  last: number
+  stride: number
+  fill: string
+  place: 'above' | 'below'
+  flipUnder?: number
+  format: (value: number) => string
 }

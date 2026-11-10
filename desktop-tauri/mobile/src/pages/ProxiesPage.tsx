@@ -137,6 +137,7 @@ export function ProxiesPage() {
       <Card className='m-card m-card-pad'>
         <div className='flex items-center gap-3'><GlyphLogo name='globe' /><div className='min-w-0 flex-1'>
           <strong className='text-sm'>{item.name || t('未命名')}</strong>
+          {item.nonDirect ? <p className='mt-1 text-[10px] text-subtle'>{t('非直连')} · {t('先经过系统代理，再连接到此代理')}</p> : null}
           {item.source === 'clash' ? <p className='mt-1 text-[10px] text-subtle'>Clash Verge · {t('只读：在 Clash Verge 里改')}</p> : null}
           <div className='mt-1 flex items-center gap-1.5'>
             <span className='break-all font-mono text-[11px] text-subtle'>{addressOf(item)}</span>
@@ -175,7 +176,7 @@ export function ProxiesPage() {
       <DialogContent className='max-w-[440px]'><DialogHeader><DialogTitle>{t('删除代理')}</DialogTitle></DialogHeader>
         <DialogBody>
           <p className='text-sm'>{t('确定删除「{name}」？', { name: deleting?.name || '' })}</p>
-          {deleting?.usedBy?.length ? <p className='text-xs text-subtle'>{t('有 {n} 个账号正在使用它，删除后这些账号会回退直连。', { n: deleting.usedBy.length })}</p> : null}
+          {deleting?.usedBy?.length ? <p className='text-xs text-subtle'>{t('有 {n} 个账号正在使用它，删除后需重新设置这些账号的代理，不会自动直连。', { n: deleting.usedBy.length })}</p> : null}
           {deleting && proxyServiceLabels(deleting, t).length ? <p className='text-xs text-destructive'>{t('此代理用于软件 / 插件更新；删除后这些线路将不可用，不会自动回退直连。')}</p> : null}
         </DialogBody><DialogFooter><Button variant='outline' disabled={Boolean(busy)} onClick={() => setDeleting(null)}>{t('取消')}</Button>
           <Button variant='destructive' disabled={Boolean(busy)} onClick={() => void remove()}>{t('删除')}</Button></DialogFooter>

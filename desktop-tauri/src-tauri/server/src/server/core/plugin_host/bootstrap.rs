@@ -39,17 +39,21 @@ use super::{registry, GatewayCallbacks, Host};
 pub struct StoreCallbacks {
     store: AccountStore,
     // 只由网关安装清单赋予，不接受插件回调参数中的 provider/owner 作为范围。
-    allowed_providers: std::collections::HashSet<String>,
+    allowed_providers: std::sync::RwLock<std::collections::HashSet<String>>,
 }
 
 impl StoreCallbacks {
     /// 未绑定插件包的回调默认没有账号/设置权限；真实宿主由 for_providers 授权。
     pub fn new(store: AccountStore) -> Self {
-        Self { store, allowed_providers: std::collections::HashSet::new() }
+        Self { store, allowed_providers: std::sync::RwLock::new(std::collections::HashSet::new()) }
     }
 
-    fn for_providers(store: AccountStore, providers: Vec<String>) -> Self {
-        Self { store, allowed_providers: providers.into_iter().collect() }
+    pub(super) fn for_providers(store: AccountStore, providers: Vec<String>) -> Self {
+        Self { store, allowed_providers: std::sync::RwLock::new(providers.into_iter().collect()) }
+    }
+
+    pub(super) fn authorize_providers(&self, providers: Vec<String>) {
+        *self.allowed_providers.write().unwrap_or_else(|error| error.into_inner()) = providers.into_iter().collect();
     }
 
     fn check_provider(&self, provider: &str) -> Result<(), proto::WireError> {
@@ -90,7 +94,7 @@ impl GatewayCallbacks for StoreCallbacks {
     }
 
     fn provider_allowed(&self, provider: &str) -> bool {
-        self.allowed_providers.contains(provider)
+        self.allowed_providers.read().is_ok_and(|providers| providers.contains(provider))
     }
 
     fn store_get(
@@ -307,7 +311,9 @@ impl GatewayCallbacks for StoreCallbacks {
                 }
                 _ => {}
             }
-            let path = plugin_settings_key(&provider, &key);
+            let owner = super::provider_settings::storage_provider(&provider, &key);
+            self.check_provider(&owner)?;
+            let path = plugin_settings_key(&owner, &key);
             let value = crate::server::config::with_raw(|raw| raw.get(&path).cloned())
                 .flatten()
                 .unwrap_or(serde_json::Value::Null);
@@ -378,7 +384,10 @@ pub async fn start(store: AccountStore) -> Option<Arc<Host>> {
         }
         super::schedules::wake();
     }
-    first
+    if let Err(error) = super::script::start(store).await {
+        logging::log("[Plugin]", &format!("脚本插件启动失败：{error}"));
+    }
+    first.or_else(super::script::host)
 }
 
 pub(super) async fn start_pack(
@@ -386,25 +395,39 @@ pub(super) async fn start_pack(
     pack: &install::InstalledPack,
     owners: &std::collections::BTreeMap<String, String>,
 ) -> Option<Arc<Host>> {
+    super::startup::configure_packs(&PackRegistry::load());
+    let loading = super::startup::begin(vec![pack.id.clone()], super::startup::Phase::Starting);
+    match start_pack_inner(store, pack, owners, &loading.attempt).await {
+        Ok(host) => { loading.finish(); Some(host) }
+        Err(error) => { loading.fail(&error); None }
+    }
+}
+
+async fn start_pack_inner(
+    store: AccountStore,
+    pack: &install::InstalledPack,
+    owners: &std::collections::BTreeMap<String, String>,
+    attempt: &super::startup::Attempt,
+) -> Result<Arc<Host>, String> {
     // 入口路径与清单都在版本目录里。清单读不出来不致命 —— 入口路径注册表里
     // 也有一份（`InstalledPack::entry`），但**必须**复核协议版本，否则一个
     // 旧版插件会在握手时被当成新版用。
-    if let Some(reason) = super::compatibility::version_error(&pack.id, &pack.version) {
+    if let Some(reason) = super::compatibility::installed_error(pack) {
         logging::log("[Plugin]", &reason);
-        return None;
+        return Err(reason);
     }
     let dir = install::plugins_dir().join(&pack.id).join(&pack.version);
     let manifest = match install::read_manifest(&dir) {
         Ok(manifest) => {
             if let Err(reason) = install::validate_manifest(&manifest, proto::PROTOCOL_VERSION) {
                 logging::log("Plugin", &format!("插件包「{}」不可用：{reason}", pack.id));
-                return None;
+                return Err(reason);
             }
             Some(manifest)
         }
         Err(reason) => {
             logging::log("Plugin", &format!("插件包「{}」清单读不出来：{reason}", pack.id));
-            return None;
+            return Err(reason);
         }
     };
 
@@ -418,21 +441,31 @@ pub(super) async fn start_pack(
         .unwrap_or_else(|| pack.entry.clone());
     let exe = dir.join(&entry);
     if !exe.exists() {
-        logging::log(
-            "Plugin",
-            &format!("插件入口不存在（{}），跳过", exe.display()),
-        );
-        return None;
+        return Err(format!("插件入口不存在（{}）", exe.display()));
     }
-    if let Err(reason) = super::packages::ensure_entry_executable(&exe) {
-        logging::log("Plugin", &format!("插件包「{}」不可用：{reason}", pack.id));
-        return None;
+    let wasm = match manifest.as_ref().map(|manifest| super::wasm::manifest::read(&dir, manifest)).transpose() {
+        Ok(wasm) => wasm.flatten(),
+        Err(reason) => { logging::log("Plugin", &format!("插件包「{}」不可用：{reason}", pack.id)); return Err(reason); }
+    };
+    if let Some(manifest) = &manifest {
+        let (signature, problem) = install::verify_signature(&dir, manifest, &super::host_target());
+        if signature == install::SignatureState::Invalid || pack.signed && !signature.is_signed() {
+            return Err(format!("插件包「{}」完整性复核失败：{}", pack.id, problem.unwrap_or_default()));
+        }
+    }
+    if wasm.is_none() {
+        if let Err(reason) = super::packages::ensure_entry_executable(&exe) {
+            logging::log("Plugin", &format!("插件包「{}」不可用：{reason}", pack.id));
+            return Err(reason);
+        }
     }
 
     let options = HostOptions {
+        wasm,
         cwd: exe.parent().map(std::path::Path::to_path_buf),
         data_dir: install::plugins_dir().join(&pack.id).display().to_string(),
         init_timeout: Duration::from_secs(30),
+        startup: Some(attempt.clone()),
         loopback_port: loopback_port(),
         ..HostOptions::new(exe)
     };
@@ -444,9 +477,11 @@ pub(super) async fn start_pack(
         .collect();
     let callbacks = Arc::new(StoreCallbacks::for_providers(store, allowed));
     let host = Arc::new(Host::new(options, callbacks));
+    attempt.attach(&host);
     super::runtime::install_pack(&pack.id, super::ownership::category(&dir), host.clone());
     match host.ensure().await {
         Ok(providers) => {
+            attempt.phase(super::startup::Phase::Registering);
             let enabled_ids: Vec<String> = providers.iter().map(|info| info.id.0.clone())
                 .filter(|id| !crate::server::core::providers::availability::is_suspended(id)
                     && owners.get(id).map(String::as_str) == Some(pack.id.as_str())
@@ -470,6 +505,12 @@ pub(super) async fn start_pack(
                     logging::log("Plugin", &format!("提供商 {id} 已被用户停用，跳过"));
                     continue;
                 }
+                if super::wasm::has_capability(&id, "tasks.v1") {
+                    if let Err(error) = super::wasm::tasks::load(&host, &id).await {
+                        logging::log("Plugin", &format!("{id} 任务声明无效：{error}"));
+                        return Err(format!("{id} 任务声明无效：{error}"));
+                    }
+                }
                 if !info.admin_panels.is_empty() {
                     super::schedules::load(&host, &id).await;
                 }
@@ -477,16 +518,17 @@ pub(super) async fn start_pack(
                 if let Some((models, at)) = super::rpc_cache::set_defaults(&id, info.default_models.clone()) {
                     restored.push(format!("{id}（{models} 个，{}）", crate::server::core::providers::catalog_cache::age_text(at)));
                 }
+                if super::wasm::catalog::enabled(&id) { super::wasm::catalog::rebuild(&id); }
                 let mut adapter = RpcAdapter::new(id.clone(), kind, host.clone(), info);
-                adapter.load_image_capability().await;
+                adapter.load_capabilities().await;
                 adapters.push((id.clone(), Arc::new(adapter)));
                 loaded.push(id);
             }
-            if !host.ready() { return None; }
+            if !host.ready() { return Err("插件在完成登记前已退出".into()); }
             registry::stage_all(adapters);
             let count = loaded.len();
             super::runtime::set_providers(&pack.id, loaded);
-            logging::log(
+            logging::console_line(
                 "Plugin",
                 &format!("插件包「{}」v{} 已加载，{} 家提供商可用", pack.id, pack.version, count),
             );
@@ -496,11 +538,11 @@ pub(super) async fn start_pack(
                     restored.len(), restored.join("、"),
                 ));
             }
-            Some(host)
+            Ok(host)
         }
         Err(reason) => {
             logging::log("Plugin", &format!("插件包「{}」启动失败：{reason}", pack.id));
-            None
+            Err(reason)
         }
     }
 }
@@ -514,6 +556,7 @@ pub async fn reload(store: AccountStore) -> Option<Arc<Host>> {
     ids.sort();
     ids.dedup();
     for id in ids {
+        if id == super::script::HOST_ID { continue; }
         let scope = super::switching::ChangeScope::between(&registry, &registry, &id, None);
         let Some(switch) = scope.begin() else {
             logging::log("[Plugin]", &format!("插件包「{id}」仍有任务，未执行重载"));
@@ -545,7 +588,7 @@ pub fn set_loopback_port(port: u16) {
 }
 
 /// 取网关监听端口（未写入时为 `0`，插件据此走「拿不到回调地址」分支）。
-fn loopback_port() -> u16 {
+pub(crate) fn loopback_port() -> u16 {
     LOOPBACK_PORT.get().copied().unwrap_or(0)
 }
 
@@ -571,9 +614,12 @@ fn plugin_kind(id: &str) -> ProviderKind {
 /// 而它后面还有一串「日志库初始化」之类的启动动作 —— 让它们等一个可选
 /// 组件是没道理的。
 pub fn spawn(store: AccountStore) {
+    super::startup::initialize();
     crate::spawn_task(async move {
         let _guard = super::operations::mutation_guard().await;
-        let _ = start(store).await;
+        let _ = start(store.clone()).await;
+        super::startup::finish_boot();
+        super::wasm::tasks::spawn(store);
         super::catalog::spawn();
     });
 }

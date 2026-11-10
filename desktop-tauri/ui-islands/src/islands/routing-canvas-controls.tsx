@@ -1,7 +1,7 @@
 import * as React from 'react'
 import { Button, Checkbox, Popover, PopoverContent, PopoverTrigger, Switch, cn } from '@ui'
 import { t } from '../i18n'
-import { PROVIDER_ICONS } from './add-provider-pick'
+import { useProviderIcon } from './provider-icon'
 import { displayNameOf, providerOf } from './accounts-domain'
 import type { AccountRecord, AccountSorting } from './accounts-shared'
 import { RoutingCreditExpiry } from './routing-account-order'
@@ -25,7 +25,8 @@ export function RoutingActions({ label, actions, disabled }: { label: string; ac
 }
 
 export function RoutingProviderMark({ id, label }: { id: string; label: string }) {
-  return PROVIDER_ICONS[id] ? <img className='routing-provider-mark' src={PROVIDER_ICONS[id]} alt='' />
+  const { src, onError } = useProviderIcon(id)
+  return src ? <img className='routing-provider-mark' src={src} alt='' onError={onError} />
     : <span className='routing-provider-mark routing-letter'>{label.slice(0, 1).toUpperCase()}</span>
 }
 
@@ -37,16 +38,17 @@ export function routingOrderKey(event: React.KeyboardEvent, move: (direction: nu
 }
 
 export function RoutingAccountRow({ id, account, rank, joined, state, stateText, note, locked, orderLocked, orderHint, first, last,
-  picked, dragging, drop, globalAccounts = false, sorting, now, settingsDisabled = false, onDrag, onMove, onToggle, onAccount }: {
+  picked, dragging, drop, globalAccounts = false, sorting, now, settingsDisabled = false, running = false, onDrag, onMove, onToggle, onAccount }: {
   id: string; account?: AccountRecord; rank: number; joined: boolean; state: string; stateText?: string; note: string
   locked: boolean; orderLocked: boolean; orderHint?: string; first: boolean; last: boolean
   picked?: boolean; dragging?: boolean; drop?: 'before' | 'after'; globalAccounts?: boolean
-  sorting?: AccountSorting | null; now?: number; settingsDisabled?: boolean
+  sorting?: AccountSorting | null; now?: number; settingsDisabled?: boolean; running?: boolean
   onDrag(event: React.PointerEvent): void; onMove(direction: number): void; onToggle(): void; onAccount?: () => void
 }) {
   const name = account ? displayNameOf(account) : t('账号已移除')
-  return <div data-route-sort={joined ? id : undefined} className={cn('routing-config-account', !joined && 'is-excluded', picked && 'is-picked',
-    dragging && 'is-dragging', drop && `drop-${drop}`)}>
+  return <div data-route-sort={joined ? id : undefined} data-route-account={id} data-route-connected={joined ? '' : undefined}
+    data-route-running={running ? '' : undefined} className={cn('routing-config-account', !joined && 'is-excluded', picked && 'is-picked',
+      dragging && 'is-dragging', drop && `drop-${drop}`)}>
     <Button variant='ghost' size='icon-sm' className='routing-grip' disabled={orderLocked || !joined}
       title={orderHint || t('拖动或按 Alt + 方向键调整顺序')} aria-label={t('拖动调整账号顺序')}
       onPointerDown={onDrag} onKeyDown={event => routingOrderKey(event, onMove)}><RouteIcon name='gripVertical' size={14} /></Button>

@@ -45,12 +45,13 @@ pub async fn account_files(state: &ServerState, body: &Bytes) -> Response {
     }
 }
 
-pub fn import_account_file(
+pub async fn import_account_file(
     state: &ServerState,
     provider: &str,
     payload: &Value,
     name: Option<&str>,
 ) -> Option<Response> {
+    let selected_proxy = payload.get("proxy");
     let file = payload
         .get("authFileContent")
         .and_then(Value::as_str)
@@ -74,6 +75,9 @@ pub fn import_account_file(
         return Some(management_error(400, "账号导出文件缺少 id"));
     }
     let mut account = payload.clone();
+    if let Some(proxy) = selected_proxy {
+        account["proxy"] = proxy.clone();
+    }
     if let Some(name) = name.filter(|name| !name.trim().is_empty()) {
         account["name"] = Value::String(name.trim().to_string());
         account["nameCustom"] = Value::Bool(true);
@@ -105,14 +109,13 @@ pub fn import_account_file(
         .and_then(|ids| ids.first())
         .and_then(Value::as_str)
         .unwrap_or(id);
-    let record = state
-        .store()
-        .plugin_account(imported_id)
-        .map(|record| record["public"].clone())
-        .unwrap_or(Value::Null);
-    Some(ok_json(json!({
-        "account": record,
+    let mut response = json!({
         "created": result.get("added").and_then(Value::as_u64).unwrap_or(0) > 0,
-        "list": state.store().list_visible_accounts(),
-    })))
+    });
+    super::account_import_setup::complete(state, &[imported_id.to_string()], &mut response).await;
+    response["account"] = state.store().plugin_account(imported_id)
+        .and_then(|record| record.get("public").cloned())
+        .unwrap_or(Value::Null);
+    response["list"] = state.store().list_visible_accounts();
+    Some(ok_json(response))
 }

@@ -1,20 +1,12 @@
 /* ─────────────────────────────────────────────
    签到中心页（page-checkin.css）
 
-   页内四个标签页：签到中心、定时签到、定时补签、签到记录。
+   页内功能共用一条分段导航。
    定时签到与定时补签的页面布局在 page-checkin-schedule.css 中维护。
    页面骨架类名全部以 .ck- 前缀自持；控件（Badge / Button / Checkbox / Input /
    Progress / SegmentedControl / Select / Spinner / Switch / Pager）来自组件库，
    不在这里画。
    ───────────────────────────────────────────── */
-
-/* ── Tab 条：左档位 + 右总开关徽标 ── */
-.ck-tabs {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  margin-bottom: 14px;
-}
 
 /* ── 总览卡条 ── */
 .ck-stats {
@@ -89,21 +81,6 @@
   .ck-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
 
-/* ── 行内三段文字（定时条目行在用）──
-   `.ck-row-*` 与 `.ck-prov-*` 是同一套形态的两个名字：前者给「可展开的行」
-   （每日签到 / 新手福利），后者给「开关 + 三段文字 + 右侧操作」（定时条目）。
-   行外壳 `.ck-row` / `.ck-row-main` 见文件末尾的页面骨架那一段。 */
-.ck-prov-info { flex: 1; min-width: 0; }
-.ck-prov-name {
-  font-weight: 600;
-  font-size: 13.5px;
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  flex-wrap: wrap;
-}
-.ck-prov-desc { font-size: 12px; color: var(--text-3); margin-top: 2px; }
-.ck-prov-right { display: flex; align-items: center; gap: 10px; flex: none; }
 /* 范围外账号的折叠说明（每日签到卡底部） */
 .ck-fold-note {
   padding: 9px 16px;
@@ -114,70 +91,11 @@
   line-height: 1.7;
 }
 
-/* ── 账号明细表（展开区里的小表，非整页大表）── */
-.ck-table {
-  width: 100%;
-  border-collapse: collapse;
-  font-size: 12.5px;
-  background: var(--surface-inset);
-  border-radius: var(--r-xs);
-  overflow: hidden;
-}
-.ck-table th {
-  text-align: left;
-  font-weight: 500;
-  color: var(--text-3);
-  padding: 7px 12px;
-  border-bottom: 1px solid var(--border);
-  font-size: 11.5px;
-  white-space: nowrap;
-}
-.ck-table td {
-  padding: 7px 12px;
-  border-bottom: 1px solid var(--hairline);
-  font-variant-numeric: tabular-nums;
-}
-.ck-table tr:last-child td { border-bottom: 0; }
-
-/* ── 任务行（新手任务清单 / KukuAI 每日子任务共用）── */
-.ck-task-line { display: flex; align-items: center; gap: 8px; padding: 5px 0; font-size: 13px; }
-.ck-task-tick {
-  width: 16px;
-  height: 16px;
-  border-radius: 50%;
-  flex: none;
-  display: grid;
-  place-items: center;
-  font-size: 10px;
-}
-.ck-task-tick.done { background: var(--ok-soft); color: var(--ok); border: 1px solid var(--ok-bd); }
-.ck-task-tick.todo { border: 1.5px dashed var(--border-strong); color: transparent; }
-.ck-task-pts { font-size: 12px; color: var(--text-3); font-variant-numeric: tabular-nums; }
-.ck-task-st { margin-left: auto; }
-.ck-task-st .ck-task-btn { margin-left: 8px; }
-.ck-group-label { margin: 10px 0 4px; font-size: 12px; color: var(--text-3); }
-
-/* ── 活动福利行（CodeArts / ZCode）── */
-.ck-welfare-row {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  padding: 12px 16px;
-  border-bottom: 1px solid var(--hairline);
-}
-.ck-welfare-row:last-child { border-bottom: 0; }
-
-/* 成长任务展开区底部的三个动作（开学季 / 抽奖 / 猫猫旅行）：
-   它们不属于任务树，所以不从 `ck-task-line` 拼，单独给一行 */
-.ck-grow-extra {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  flex-wrap: wrap;
-  margin-top: 10px;
-  padding-top: 10px;
-  border-top: 1px dashed var(--hairline);
-}
+/* ── 任务行与活动福利行的样式已随改版移除 ──
+   新手福利 / 成长任务的任务清单、活动福利的行，现在都用组件库的行形态
+   （`.ck-` 前缀的这几组类没有了对应 DOM）：明细在 `checkin-center-tab.tsx`
+   的 `DetailLine` 里，活动福利在 `checkin-plans-section.tsx` 里。
+   这边只保留仍然在用的：说明条、设置行、模型链、排程与记录页的类。 */
 
 /* ── 自动签到设置卡 ── */
 .ck-set-line {
@@ -362,6 +280,24 @@ body.ck-chain-dragging { cursor: grabbing; user-select: none; }
 .ck-range-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .ck-mini-warn { margin-top: 6px; font-size: 11.5px; color: var(--warn); }
 
+/* 签到中心：整页固定高度，只有右栏列表内部滚动（与记录页同一取向） */
+.page.active[data-page="checkin"]:has(.ck-center) {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  padding-bottom: var(--pad);
+}
+.ck-page > .ck-center { flex: 1; min-height: 0; }
+/* 页面容器撑满剩余高度，统计与导航固定，列表内部滚动。 */
+.ck-page:has(> .ck-center) {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+}
+.ck-page:has(> .ck-center) > .ck-task-row,
+.ck-page:has(> .ck-center) > .ck-page-error { flex: none; }
+
 /* ── 签到记录：明细表 ── */
 .page.active[data-page="checkin"]:has(.ck-page-records) {
   display: flex;
@@ -378,7 +314,8 @@ body.ck-chain-dragging { cursor: grabbing; user-select: none; }
   min-height: 0;
   min-width: 0;
 }
-.ck-page-records > .ck-tabs,
+.ck-page-records > .ck-task-row,
+.ck-page-records > .ck-page-error,
 .ck-records-panel > .panel-head,
 .ck-records-panel > .ck-filters,
 .ck-records-panel > .ck-fold-note,
@@ -403,6 +340,209 @@ body.ck-chain-dragging { cursor: grabbing; user-select: none; }
 .ck-record-source { font-variant-numeric: tabular-nums; }
 .ck-record-reason { margin-left: 6px; color: var(--text-3); font-size: 11.5px; }
 .ck-record-detail-fail { color: var(--danger); }
+
+/* ── 总览指标：紧凑横条（原四张大卡，占掉近三分之一屏高）── */
+.ck-metrics {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 1px;
+  margin-bottom: 12px;
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-md);
+  background: var(--hairline);
+  overflow: hidden;
+  flex: none;
+}
+.ck-metric {
+  display: flex;
+  align-items: baseline;
+  align-content: center;
+  flex-wrap: wrap;
+  gap: 4px 8px;
+  min-width: 0;
+  padding: 12px 16px;
+  border: 0;
+  border-radius: 0;
+  background: var(--surface);
+  color: inherit;
+  text-align: left;
+  font: inherit;
+}
+.ck-metric-link { cursor: pointer; transition: background-color .14s ease; }
+.ck-metric-link:hover { background: var(--row-hover); }
+.ck-metric-link:focus-visible { outline: 2px solid var(--primary); outline-offset: -2px; }
+.ck-metric-label { font-size: 11px; color: var(--text-2); }
+.ck-metric-value {
+  font-size: 16px;
+  font-weight: 600;
+  line-height: 1.25;
+  font-variant-numeric: tabular-nums;
+}
+.ck-metric-value small {
+  margin-left: 2px;
+  font-size: 11px;
+  font-weight: 400;
+  color: var(--text-3);
+}
+.ck-metric-foot {
+  flex-basis: 100%;
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--text-3);
+}
+
+/* ── 功能导航：任务、排程与记录共用一行 ── */
+.ck-task-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  margin-bottom: 12px;
+  flex: none;
+}
+.ck-task-nav {
+  display: flex;
+  flex: 1;
+  min-width: 0;
+  overflow-x: auto;
+  scrollbar-width: thin;
+}
+.ck-task-actions { display: flex; align-items: center; gap: 10px; flex: none; }
+
+/* ── 三层骨架：任务 → 提供商（左栏）→ 账号（右栏）──
+   整页不滚动：只有右栏的账号列表滚（`.ck-task-scroll`）。 */
+.ck-center {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+  min-width: 0;
+}
+.ck-split {
+  display: grid;
+  grid-template-columns: 238px minmax(0, 1fr);
+  gap: 16px;
+  flex: 1;
+  min-height: 0;
+  align-items: stretch;
+}
+
+/* ── 提供商分类栏 ── */
+.ck-provider-rail {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  padding-right: 14px;
+  border-right: 1px solid var(--border);
+}
+.ck-provider-rail-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 2px 8px 8px;
+}
+.ck-provider-rail-head h3 { font-size: 12.5px; font-weight: 600; }
+.ck-provider-rail-head span { font-size: 10.5px; color: var(--text-3); }
+.ck-provider-nav { flex: 1; overflow-y: auto; min-height: 0; }
+.ck-provider-nav [data-slot='nav-item'] { padding: 6px 8px; font-size: 12px; }
+.ck-provider-all-icon {
+  display: inline-flex;
+  width: 24px;
+  height: 24px;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  border-radius: 7px;
+  background: var(--control);
+  color: var(--text-2);
+}
+.ck-provider-count {
+  flex: none;
+  font-size: 10.5px;
+  color: var(--text-3);
+  font-variant-numeric: tabular-nums;
+}
+.ck-provider-count.pending { color: var(--warn); font-weight: 600; }
+.ck-provider-nav [data-slot='nav-item'][data-active] .ck-provider-count { color: inherit; }
+.ck-provider-note {
+  margin: 10px 8px 0;
+  font-size: 10.5px;
+  line-height: 1.55;
+  color: var(--text-3);
+}
+
+/* ── 右栏卡片：标题与脚注固定，只有中间的账号列表滚 ── */
+.ck-task-panel {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  min-width: 0;
+  margin-bottom: 0;
+}
+.ck-task-head { flex: none; }
+.ck-task-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 2px 0;
+}
+.ck-task-foot { flex: none; }
+.ck-provider-note-row {
+  flex: none;
+  padding: 8px 14px;
+  border-bottom: 1px solid var(--hairline);
+  background: var(--surface-2);
+  font-size: 11.5px;
+  line-height: 1.6;
+  color: var(--text-3);
+}
+.ck-provider-note-row p { margin: 0; }
+
+/* 每日签到的账号列表：左栏选「全部」时按家分组 */
+.ck-account-list { display: flex; flex-direction: column; }
+.ck-account-group {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 14px;
+  border-bottom: 1px solid var(--hairline);
+  background: var(--surface-2);
+  font-size: 11.5px;
+}
+.ck-account-group > span:first-of-type { font-weight: 550; }
+.ck-account-list [data-slot='item'],
+.ck-account-list > .flex { padding-inline: 14px; }
+.ck-account-list > div:not(.ck-account-group) { border-bottom: 1px solid var(--hairline); }
+.ck-account-list > div:not(.ck-account-group):last-child { border-bottom: 0; }
+.ck-account-list > div:not(.ck-account-group):hover { background: var(--row-hover); }
+.ck-list-empty {
+  padding: 24px 16px;
+  font-size: 12.5px;
+  color: var(--text-3);
+}
+.ck-plans-embedded { display: flex; flex-direction: column; }
+
+/* 窄窗口：左栏收窄，指标两列 */
+@media (max-width: 1180px) {
+  .ck-split { grid-template-columns: 200px minmax(0, 1fr); }
+  .ck-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .ck-metric { padding: 8px 12px; }
+}
+
+/* 手机 / 极窄：左栏改成横向滚动条，不占纵向空间 */
+@media (max-width: 767px) {
+  .ck-split { display: flex; flex-direction: column; }
+  .ck-provider-rail {
+    flex: none;
+    padding: 0 0 8px;
+    border-right: 0;
+    border-bottom: 1px solid var(--border);
+  }
+  .ck-provider-nav { flex: none; flex-direction: row; overflow-x: auto; overflow-y: hidden; }
+  .ck-provider-nav [data-slot='nav-item'] { width: auto; flex: none; }
+  .ck-provider-note { display: none; }
+}
 
 /* ── 空态 / 加载态（整页级与卡内共用）── */
 .ck-empty {
@@ -447,7 +587,6 @@ body.ck-chain-dragging { cursor: grabbing; user-select: none; }
 .ck-main > .panel { margin-bottom: 0; }
 .ck-main > .panel + .panel { margin-top: 14px; }
 
-.ck-tabs-spacer { flex: 1; }
 /* 顶栏刷新：与其它页顶栏的文字按钮同一档（不高过 SegmentedControl 的 24px 太多） */
 .ck-refresh {
   padding: 0 8px;
@@ -474,41 +613,10 @@ body.ck-chain-dragging { cursor: grabbing; user-select: none; }
   cursor: pointer;
 }
 
-/* ── 可展开的行 ── */
-.ck-row { border-bottom: 1px solid var(--hairline); }
-.ck-row:last-child { border-bottom: 0; }
-.ck-row-header { display: flex; align-items: center; }
-.ck-row.open > .ck-row-header { background: var(--row-hover); }
-.ck-row-main { flex: 1; min-width: 0; }
-.ck-row-actions {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  flex: none;
-  padding-right: 16px;
-}
-.ck-row-info { flex: 1; min-width: 0; }
-.ck-row-name {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  flex-wrap: wrap;
-  font-size: 13.5px;
-  font-weight: 600;
-}
-.ck-row-desc { margin-top: 2px; font-size: 12px; color: var(--text-3); }
-.ck-row-right { display: flex; align-items: center; gap: 10px; flex: none; }
-.ck-row-count { font-size: 12.5px; color: var(--text-2); font-variant-numeric: tabular-nums; }
-.ck-row-detail { padding: 2px 16px 12px 58px; }
-
-/* 展开箭头：展开时转 90°（与账号页同一观感） */
-.ck-chev {
-  display: inline-flex;
-  flex: none;
-  color: var(--text-3);
-  transition: transform .15s;
-}
-.ck-chev.open { transform: rotate(90deg); }
+/* ── 可展开的行 ──
+   行外壳（`.ck-row` / `.ck-row-main` / `.ck-chev` 一族）已随改版移除：现在由
+   组件库的 Item 与 Tailwind 类在 `checkin-row.tsx` 里拼成，展开态与箭头旋转
+   都在组件内部（`.ck-fold-note` 仍给排程页的说明条用）。 */
 /* ── 设置行（标签 + 内容）── */
 .ck-sub { font-size: 11.5px; color: var(--text-3); }
 .ck-inline { display: inline-flex; align-items: center; gap: 2px; }
@@ -572,20 +680,6 @@ body.ck-chain-dragging { cursor: grabbing; user-select: none; }
 .ck-task-title { flex: 1; min-width: 0; }
 .ck-task-pts { font-size: 12px; color: var(--text-3); font-variant-numeric: tabular-nums; }
 
-@media (max-width: 767px) {
-  .ck-tabs { flex-wrap: wrap; gap: 8px; }
-  .ck-row-header { flex-wrap: wrap; }
-  .ck-row-actions { flex-wrap: wrap; justify-content: flex-end; width: 100%; padding: 0 16px 10px 58px; }
-  .ck-row-right { flex-direction: column; align-items: flex-end; gap: 4px; }
-  .ck-row-detail { padding-left: 16px; overflow-x: auto; }
-  .ck-task-line { flex-wrap: wrap; }
-  .ck-welfare-row { flex-wrap: wrap; }
-}
-
 @media (max-width: 420px) {
   .ck-stats { grid-template-columns: minmax(0, 1fr); }
-}
-
-@media (prefers-reduced-motion: reduce) {
-  .ck-chev { transition: none; }
 }

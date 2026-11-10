@@ -1,3 +1,4 @@
+import { invalidateUsageTasks } from './accounts-usage-tasks'
 import {
   errorMessage, POOL_VALUE_PREFIX, shared, toast,
   type AccountRecord,
@@ -260,10 +261,12 @@ export async function clearLimits(id: string, model?: string): Promise<void> {
  * 视图层已经把禁用条目置灰（`disabled`），但下拉的选项来自缓存，极端情况下
  * （缓存刚被别处刷新、弹层已经展开）仍可能点到一条已禁用的。后端
  * `normalize_account_proxy` 有意**不**校验池的当下状态（保存账号不依赖池的
- * 读库结果），所以这里不挡的话会「保存成功 → 解析失败 → 回退直连」，用户只
- * 看到一句「代理已禁用」。挡在这里，提示与视图上的置灰是同一个事实。
+ * 读库结果），所以这里不挡的话会保存成功但出网失败。挡在这里，提示与视图上的
+ * 置灰是同一个事实。
  */
-export async function applyProxyPick(id: string, value: string, fallback: string): Promise<void> {
+export async function applyProxyPick(id: string, value: string | null, fallback: string): Promise<void> {
+  // 下拉选项重建时可能产生 null，它不代表用户选择了「直连」。
+  if (typeof value !== 'string') return
   if (value === PROXY_CUSTOM_EDIT) {
     // 动作项：开弹窗（下拉的原值由调用方在渲染层恢复 —— 它是受控的，重绘即回原值）
     openSettingsDialog(id)
@@ -272,8 +275,11 @@ export async function applyProxyPick(id: string, value: string, fallback: string
   // 当前自定义配置的显示项：选它自己不是一次修改
   if (value === PROXY_CUSTOM_CURRENT) return
   if (value === fallback) return
-  if (value.startsWith(POOL_VALUE_PREFIX)) {
-    const poolId = value.slice(POOL_VALUE_PREFIX.length)
+  const poolId = value.startsWith(POOL_VALUE_PREFIX)
+    ? value.slice(POOL_VALUE_PREFIX.length).trim()
+    : ''
+  if (value !== '' && !poolId) return
+  if (poolId) {
     const item = (proxyPoolSnapshot() || []).find(entry => entry.id === poolId)
     if (item && item.enabled === false) {
       toast(t('「{name}」已在「网络代理」页禁用，请先启用它或换一条', {
@@ -283,9 +289,7 @@ export async function applyProxyPick(id: string, value: string, fallback: string
     }
   }
   try {
-    const proxy = value === ''
-      ? null
-      : { source: 'pool', proxyId: value.slice(POOL_VALUE_PREFIX.length) }
+    const proxy = poolId ? { source: 'pool', proxyId: poolId } : null
     await updateAccountConfirmed(id, { proxy })
     toast(`✅ ${t('代理已更新')}`)
   } catch (error) {
@@ -343,6 +347,7 @@ export type AccountsViewApi = {
   render(): void
   refreshList: typeof refreshList
   refreshCaches(validIds: Set<string>): void
+  invalidateUsageTasks(ids: string[]): void
   syncConnections(): Promise<boolean>
   /**
    * 强制重读「网络代理」页的代理池（切回本页时调）。
@@ -464,6 +469,7 @@ export function installAccountsApi(): void {
     render: () => { syncAccountSorting(); bump() },
     refreshList,
     refreshCaches,
+    invalidateUsageTasks,
     syncConnections,
     refreshProxyPool,
     applyBalances,

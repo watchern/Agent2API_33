@@ -31,6 +31,10 @@ mod sql_import;
 mod stream;
 mod temp;
 
+#[cfg(test)]
+#[path = "backup/tests.rs"]
+mod tests;
+
 pub use archive::{BACKUP_EXTENSION, MAX_BACKUP_BYTES};
 pub use temp::transfer_file;
 use temp::TempRestoreDb;
@@ -664,8 +668,12 @@ fn table_row_counts(conn: &Connection, skip: &[&str]) -> Vec<Value> {
         "account_usage_records",
         "account_limiter_events",
         "checkin_records",
+        "maintenance_runs",
+        "maintenance_items",
         "assistant_sessions",
         "assistant_images",
+        "tool_image_jobs",
+        "tool_image_files",
     ];
     known
         .iter()

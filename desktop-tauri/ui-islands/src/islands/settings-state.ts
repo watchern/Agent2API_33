@@ -31,6 +31,7 @@
  */
 
 import * as React from 'react'
+import { accountImportNotice } from '../../../ui-shared/account-import-result'
 import {
   CATEGORIES,
   CAPTCHA_POOL_FIELDS,
@@ -56,7 +57,6 @@ import {
   shared,
   toast,
   type AppSettings,
-  type CaptchaSetting,
   type ClineHeadersData,
   type GatewayBlocks,
   type ModelsDevState,
@@ -92,11 +92,10 @@ export type BusyScope =
   | 'debug'
   | 'sanitize'
   | 'developerRoleCompat'
+  | 'reasoningCollapse'
   | 'clineHeaders'
-  | 'zcodeVersion'
   | 'cors'
   | 'prompt'
-  | 'captcha'
   | 'modelsDev'
   | 'modelsDevRefresh'
   | 'export'
@@ -161,6 +160,9 @@ export type DebugState = {
 /** 开发者角色兼容开关 */
 export type DeveloperRoleCompatState = { status: LoadStatus; on: boolean }
 
+/** 第三方模型回答完自动折叠过程开关 */
+export type ReasoningCollapseState = { status: LoadStatus; on: boolean }
+
 /**
  * 会话图片压缩：一个开关 + 三项参数。`values` 为 null（loading / unavailable）
  * 时三个输入框保持禁用；`enabled` 在读到之前按关显示（与 developerRoleCompat
@@ -182,20 +184,6 @@ export type ClineHeadersState = {
 
 /** 网关面（/v1/*）跨域访问开关 */
 export type CorsState = { status: LoadStatus; on: boolean }
-
-/**
- * ZCode 客户端版本号（`/api/zcode/version`）。
- *
- * `version` 是**设置里存的值**，空串 = 用插件内置默认值。
- * `envOverride` 非空时说明环境变量 `ZCODE_APP_VERSION` 正压着它 ——
- * 界面要如实说出「这里填的值此刻不生效」，否则用户会对着一个改了没反应的
- * 输入框反复重试。
- */
-export type ZcodeVersionState = {
-  status: LoadStatus
-  version: string
-  envOverride: string
-}
 
 /**
  * models.dev 模型元数据：开关 + 「这份数据是什么时候的、有多少条」。
@@ -306,19 +294,11 @@ export type SettingsSnapshot = {
   debug: DebugState
   sanitize: SanitizeState
   developerRoleCompat: DeveloperRoleCompatState
+  reasoningCollapse: ReasoningCollapseState
   clineHeaders: ClineHeadersState
-  zcodeVersion: ZcodeVersionState
   cors: CorsState
   prompt: PromptState
   storage: StorageState
-  /**
-   * 机器人校验（ALTCHA）：两端各一个开关，`localPanel` 标出本进程是哪一端
-   * （桌面壳 true / 网页端 false），界面据此把「正在用的这一端」标出来。
-   *
-   * `available = false` 表示读不到后端状态（端点不可用），两张开关都置灰 ——
-   * 与 retention / cors 的降级口径一致。
-   */
-  captcha: { available: boolean; desktop: boolean; web: boolean; localPanel: boolean }
   /**
    * 面板账户（设置页「账户」分类）。
    *
@@ -444,8 +424,8 @@ const INITIAL: SettingsSnapshot = {
   debug: { status: 'loading', on: false, count: null, limit: null },
   sanitize: INITIAL_SANITIZE,
   developerRoleCompat: { status: 'loading', on: false },
+  reasoningCollapse: { status: 'loading', on: false },
   clineHeaders: { status: 'loading', defaults: {}, overrides: {}, effective: {} },
-  zcodeVersion: { status: 'loading', version: '', envOverride: '' },
   cors: { status: 'loading', on: false },
   prompt: {
     status: 'loading',
@@ -474,7 +454,6 @@ const INITIAL: SettingsSnapshot = {
     downstreamRaw: null,
     upstreamRaw: null,
   },
-  captcha: { available: true, desktop: false, web: false, localPanel: false },
   account: { status: 'loading', registered: false, username: '', password: null },
   modelsDev: { status: 'loading', enabled: true, source: '', updatedAt: 0, count: 0 },
   ioFailure: null,
@@ -675,7 +654,7 @@ export async function saveToggle(kind: 'tray' | 'autostart' | 'lightweight', nex
   const patch: AppSettings = {
     closeToTray: kind === 'tray' ? next : previous.closeToTray,
     autostart: kind === 'autostart' ? next : previous.autostart,
-    // 局域网访问归「局域网访问」面板管（它有自己的确认与重启流程），
+    // 网络访问归「网关 → 网络访问」面板管（它有自己的确认与重启流程），
     // 全量覆盖的 patch 里原样带上磁盘现值，避免把它悄悄抹掉
     lanAccess: previous.lanAccess,
     lanPanel: previous.lanPanel,
@@ -740,7 +719,7 @@ export function resolveLanConfirm(accepted: boolean): void {
  */
 async function proceedEnable(): Promise<void> {
   const api = shared().workbuddyDesktop
-  if (!api?.panelAdminStatus) { toast(t('当前环境不支持局域网访问设置'), 'err'); return }
+  if (!api?.panelAdminStatus) { toast(t('当前环境不支持网络访问设置'), 'err'); return }
   beginBusy('lan')
   let registered: boolean
   try {
@@ -804,7 +783,7 @@ export function cancelLanRegister(): void {
 async function applyLan(enabled: boolean, panel: boolean): Promise<void> {
   if (busyScope) return
   const api = shared().workbuddyDesktop
-  if (!api?.changeLanAccess) { toast(t('当前环境不支持局域网访问设置'), 'err'); return }
+  if (!api?.changeLanAccess) { toast(t('当前环境不支持网络访问设置'), 'err'); return }
   beginBusy('lan')
   publishApp({ lanAccess: enabled, lanPanel: panel })
   try {
@@ -875,8 +854,12 @@ export async function importAccounts(): Promise<void> {
       added, updated, suffix, note: providerNote,
     })
 
+    const notice = accountImportNotice(result)
+    const message = failed || notice?.warning
+      ? t('导入完成：{summary}', { summary })
+      : t('✅ 导入完成：{summary}', { summary })
+    toast(notice ? `${message}\n${t(notice.text)}` : message, failed ? 'err' : notice?.warning ? 'warn' : 'ok')
     if (failed) {
-      toast(t('导入完成：{summary}', { summary }), 'err')
       // 失败明细只列前 3 条，与账号页批量操作的展示密度保持一致；
       // 定义警告（customProvider 标记）没有账号语义，展示时注明归属
       const detail = errors.slice(0, 3)
@@ -889,8 +872,6 @@ export async function importAccounts(): Promise<void> {
         })
         .join(t('；'))
       publish({ ioFailure: { failed, detail, more: errors.length > 3 } })
-    } else {
-      toast(t('✅ 导入完成：{summary}', { summary }))
     }
 
     // 账号被改动（新增/更新）后让主界面立刻反映：账号列表、导航计数等；
@@ -1740,46 +1721,64 @@ export async function saveTimeoutField(field: NumberField, raw: string): Promise
 
 /* ─── 调试模式 / 指纹脱敏 ── */
 
+let debugRevision = 0
+
 export function renderDebug(data?: unknown): void {
   if (data === undefined) return
-  if (!data || typeof data !== 'object') {
-    publish({ debug: { status: 'unavailable', on: false, count: null, limit: null } })
+  const record = data && typeof data === 'object' && !Array.isArray(data)
+    ? data as Record<string, unknown> : null
+  if (!record || typeof record.debugMode !== 'boolean') {
+    publish({ debug: { ...snapshot.debug, status: 'unavailable' } })
     return
   }
-  const record = data as Record<string, unknown>
   const count = Number(record.count)
   const limit = Number(record.limit)
   publish({
     debug: {
       status: 'ready',
-      on: record.debugMode === true,
+      on: record.debugMode,
       count: Number.isInteger(count) ? count : null,
       limit: Number.isInteger(limit) ? limit : null,
     },
   })
 }
 
-async function loadDebug(): Promise<void> {
+async function readDebug(): Promise<void> {
+  const revision = ++debugRevision
   try {
-    renderDebug(await shared().workbuddyDesktop?.getDebug())
+    const data = await shared().workbuddyDesktop?.getDebug()
+    if (revision === debugRevision) renderDebug(data ?? null)
   } catch (error) {
+    if (revision !== debugRevision) return
     console.warn('读取调试模式设置失败:', errorMessage(error))
     renderDebug(null)
   }
 }
 
+export async function loadDebug(): Promise<void> {
+  if (busyScope !== 'debug') await readDebug()
+}
+
 export async function saveDebug(next: boolean): Promise<void> {
-  // 忙碌中早退：受控开关的 checked 来自快照，不写快照即等于「还原这一下拨动」
-  if (busyScope) { repaint(); return }
+  if (busyScope || snapshot.debug.status !== 'ready') { repaint(); return }
+  // 保存开始后，先前的读取结果不能覆盖新状态。
+  const previous = snapshot.debug
+  debugRevision += 1
   beginBusy('debug')
-  publish({ debug: { ...snapshot.debug, on: next } })
+  publish({ debug: { ...previous, on: next } })
   try {
-    const saved = await shared().workbuddyDesktop?.saveDebug(next)
-    renderDebug(saved)
+    const bridge = shared().workbuddyDesktop
+    if (!bridge?.saveDebug) throw new Error(t('主进程桥不可用'))
+    const saved = await bridge.saveDebug(next)
+    renderDebug(saved ?? null)
+    if (snapshot.debug.status !== 'ready' || snapshot.debug.on !== next) {
+      throw new Error(t('未能读取调试模式设置，请稍后重试'))
+    }
     toast(next ? t('✅ 调试模式已开启') : t('✅ 调试模式已关闭'))
   } catch (error) {
     toast(t('保存失败：{message}', { message: errorMessage(error) }), 'err')
-    await loadDebug() // 回滚到后端的真实值
+    publish({ debug: previous })
+    await readDebug()
   } finally {
     endBusy()
   }
@@ -1868,6 +1867,43 @@ export async function saveDeveloperRoleCompat(next: boolean): Promise<void> {
   }
 }
 
+/* ─── 第三方模型回答完自动折叠过程（给 Responses 助手消息补阶段标记）── */
+
+export function renderReasoningCollapse(data?: unknown): void {
+  if (data === undefined) return
+  if (!data || typeof data !== 'object') {
+    publish({ reasoningCollapse: { status: 'unavailable', on: false } })
+    return
+  }
+  const record = data as Record<string, unknown>
+  publish({ reasoningCollapse: { status: 'ready', on: record.thirdPartyReasoningCollapse === true } })
+}
+
+async function loadReasoningCollapse(): Promise<void> {
+  try {
+    renderReasoningCollapse(await shared().workbuddyDesktop?.getReasoningCollapse())
+  } catch (error) {
+    console.warn('读取第三方模型回答完自动折叠过程设置失败:', errorMessage(error))
+    renderReasoningCollapse(null)
+  }
+}
+
+export async function saveReasoningCollapse(next: boolean): Promise<void> {
+  if (busyScope) { repaint(); return }
+  beginBusy('reasoningCollapse')
+  publish({ reasoningCollapse: { status: 'ready', on: next } })
+  try {
+    const saved = await shared().workbuddyDesktop?.saveReasoningCollapse(next)
+    renderReasoningCollapse(saved)
+    toast(next ? t('✅ 第三方模型回答完自动折叠过程已开启') : t('已关闭第三方模型回答完自动折叠过程'))
+  } catch (error) {
+    toast(t('保存失败：{message}', { message: errorMessage(error) }), 'err')
+    await loadReasoningCollapse() // 回滚到后端的真实值
+  } finally {
+    endBusy()
+  }
+}
+
 /* ─── Cline 伪装头（转发头的逐键覆盖）── */
 
 /** 非字符串值一律丢弃（后端只会给字符串，这里是给「形状不对的响应」兜底） */
@@ -1931,61 +1967,6 @@ export async function saveClineHeaders(overrides: Record<string, string>): Promi
   }
 }
 
-/* ─── ZCode 客户端版本号（上游按它决定活动套餐下不下发）── */
-
-export function renderZcodeVersion(data?: unknown): void {
-  if (data === undefined) return
-  if (!data || typeof data !== 'object') {
-    publish({ zcodeVersion: { status: 'unavailable', version: '', envOverride: '' } })
-    return
-  }
-  const source = data as { version?: unknown; envOverride?: unknown }
-  publish({
-    zcodeVersion: {
-      status: 'ready',
-      version: typeof source.version === 'string' ? source.version : '',
-      // null / 缺失统一成空串：视图层只需判「非空 = 环境变量压着」
-      envOverride: typeof source.envOverride === 'string' ? source.envOverride : '',
-    },
-  })
-}
-
-async function loadZcodeVersion(): Promise<void> {
-  try {
-    renderZcodeVersion(await shared().workbuddyDesktop?.getZcodeVersion())
-  } catch (error) {
-    console.warn('读取 ZCode 客户端版本号失败:', errorMessage(error))
-    renderZcodeVersion(null)
-  }
-}
-
-export async function refreshZcodeVersion(): Promise<void> {
-  await loadZcodeVersion()
-  toast(t('ZCode 版本号已刷新'))
-}
-
-/**
- * 保存版本号（空串 = 清空覆盖、回落插件内置默认值）。
- *
- * 后端只校验长度与字符集，**不校验「这个版本存在」** —— 上游的版本号对我们
- * 是黑盒。填错的表现是「还是探不到套餐」，所以保存后如实回读后端值，
- * 让用户看到落库的到底是什么。
- */
-export async function saveZcodeVersion(version: string): Promise<void> {
-  if (busyScope) { repaint(); return }
-  beginBusy('zcodeVersion')
-  try {
-    const saved = await shared().workbuddyDesktop?.saveZcodeVersion(version)
-    renderZcodeVersion(saved)
-    toast(version.trim() ? t('✅ ZCode 版本号已保存') : t('已清空，回落插件内置默认值'))
-  } catch (error) {
-    toast(t('保存失败：{message}', { message: errorMessage(error) }), 'err')
-    await loadZcodeVersion() // 回滚到后端的真实值
-  } finally {
-    endBusy()
-  }
-}
-
 /* ─── 网关面跨域访问（/v1/* 的 CORS，默认关）── */
 
 export function renderCors(data?: unknown): void {
@@ -2018,53 +1999,6 @@ export async function saveCors(next: boolean): Promise<void> {
   } catch (error) {
     toast(t('保存失败：{message}', { message: errorMessage(error) }), 'err')
     await loadCors() // 回滚到后端的真实值
-  } finally {
-    endBusy()
-  }
-}
-
-/* ─── 机器人校验（面板登录 / 注册的 ALTCHA 开关，分两端）── */
-
-/** 把 `/api/captcha` 的响应折成快照（读与写后的回读共用一份解析） */
-function captchaState(state: CaptchaSetting | null | undefined): SettingsSnapshot['captcha'] {
-  if (!state || typeof state !== 'object') {
-    return { available: false, desktop: false, web: false, localPanel: false }
-  }
-  return {
-    available: true,
-    desktop: state.captchaDesktop === true,
-    web: state.captchaWeb === true,
-    localPanel: state.localPanel === true,
-  }
-}
-
-async function loadCaptcha(): Promise<void> {
-  try {
-    const state = await shared().workbuddyDesktop?.getCaptchaSetting()
-    publish({ captcha: captchaState(state) })
-  } catch (error) {
-    // 读失败降级禁用开关（照 retention 的模式）
-    publish({ captcha: captchaState(null) })
-    console.warn('读取机器人校验设置失败:', errorMessage(error))
-  }
-}
-
-/** 拨动某一端的开关（`side` 决定写哪个字段，另一端原样不动） */
-export async function saveCaptcha(side: 'desktop' | 'web', next: boolean): Promise<void> {
-  if (busyScope) { repaint(); return }
-  beginBusy('captcha')
-  // 乐观更新：只改拨动的那一端
-  publish({ captcha: { ...snapshot.captcha, [side]: next } })
-  const label = side === 'desktop' ? t('桌面端') : t('网页端')
-  try {
-    const state = await shared().workbuddyDesktop?.saveCaptchaSetting(
-      side === 'desktop' ? { captchaDesktop: next } : { captchaWeb: next },
-    )
-    publish({ captcha: captchaState(state) })
-    toast(next ? t('✅ 已开启「{label}」的机器人校验', { label }) : t('⚠️ 已关闭「{label}」的机器人校验', { label }))
-  } catch (error) {
-    toast(t('保存失败：{message}', { message: errorMessage(error) }), 'err')
-    await loadCaptcha()
   } finally {
     endBusy()
   }
@@ -2706,8 +2640,9 @@ export async function panelLogout(): Promise<boolean> {
  * 设置页数据入口（app.js 切入该页时调用，upgrade-panel 迁移完成后也调）。
  * 九个取数并行，各自失败各自降级 —— 一个接口挂了不该把整页拖成空白。
  */
-export async function load(): Promise<void> {
-  restoreCategory()
+export async function load({ checkUpdate = false }: { checkUpdate?: boolean } = {}): Promise<void> {
+  if (checkUpdate) showCategory('about')
+  else restoreCategory()
   renderUnits()
   publish({ panelLogin: readPanelLogin() })
   window.dispatchEvent(new Event('wb:settings-load'))
@@ -2723,17 +2658,16 @@ export async function load(): Promise<void> {
     loadDebug(),
     loadSanitize(),
     loadDeveloperRoleCompat(),
+    loadReasoningCollapse(),
     loadClineHeaders(),
-    loadZcodeVersion(),
     loadCors(),
     loadPrompt(),
     loadStorage(),
-    loadCaptcha(),
     loadAccount(),
     loadModelsDev(),
     reconnectDbRestore(),
-    // 软件更新面板是另一个岛（update-panel.tsx），切进设置页时让它自己刷新一次
-    shared().wbUpdatePanel?.load?.(),
+    // 托盘只检查版本，不能恢复下载任务后顺带启动已完成的安装包。
+    checkUpdate ? shared().wbUpdatePanel?.check?.() : shared().wbUpdatePanel?.load?.(),
     // 「版本信息」也是独立岛（system-info-pane.tsx）：同样在切进设置页时重拉 ——
     // 版本 / 运行时长 / 在途请求这些读数会随时间变，缓存一份旧的没有意义
     shared().wbSystemInfoPane?.load?.(),
@@ -2790,6 +2724,11 @@ export async function refreshSanitize(): Promise<void> {
 export async function refreshDeveloperRoleCompat(): Promise<void> {
   await loadDeveloperRoleCompat()
   toast(t('开发者角色兼容设置已刷新'))
+}
+
+export async function refreshReasoningCollapse(): Promise<void> {
+  await loadReasoningCollapse()
+  toast(t('第三方模型回答完自动折叠过程设置已刷新'))
 }
 
 export async function refreshCors(): Promise<void> {

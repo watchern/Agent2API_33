@@ -1,30 +1,6 @@
-//! 对话链路的另外两条协议入口（对照 `/v1/chat/completions` 实现）。
-//!
-//!   POST /v1/responses   Responses API（OpenAI 新协议；Codex 等客户端在用）
-//!   POST /v1/messages    Anthropic Messages API（Claude Code 等客户端在用）
-//!
-//! ── 这两个入口做什么 ────────────────────────────────────────
-//! 两者都是**薄壳**：把下游协议的请求翻译成 Chat Completions，交给与
-//! `/v1/chat/completions` **完全相同**的转发链路（模型解析、账号选路、轮换、
-//! 脱敏、记账都不重写），再把回程翻译回下游协议。翻译规则在
-//! `core::protocol` 里，公共管道在 `api::pipeline` 里 —— 本文件只负责
-//! 「HTTP 层」：取 body、调管道、按协议形态写响应。
-//!
-//! ── 为什么不做成「每家适配器各支持两套协议」──────────────────
-//! 见 `core::protocol` 模块头的完整论证。一句话：本项目所有上游经适配器层
-//! 已归一为 Chat，所以在出入口转换一次（2 套）远优于在 6 家适配器里各写
-//! （12 套），且新增上游时不必再补转换。
-//!
-//! ── 非流式请求为什么也让上游走流式 ──────────────────────────
-//! 各家上游的流式接口才是完整能力（非流式在部分上游上是「聚合后再返回」的
-//! 兼容层）。所以即使下游要非流式，我们也以 `stream:true` 请求上游，
-//! 收完后聚合成本协议的 JSON —— 与 `/v1/chat/completions` 的非流式路径同一做法。
-//! 为此，送给转发层的 body 里 `stream` 恒为 true，而「下游要不要流式」
-//! 由各 handler 自己记住（`ForwardRequest.stream` 传的仍是下游的意愿，
-//! 因为它还决定上游聚合/透传的分支，见 `provider_loop` 的 `ctx.stream`）。
-//!
-//! ── 硬约束 ──────────────────────────────────────────────────
-//! release 是 `panic=abort`：零 unwrap/expect/panic。
+//! Responses 与 Anthropic 入口共用选路、鉴权和记账。
+//! 原生请求与 Chat 路由投影分开保存：自定义上游协议相同时双向原生转发，
+//! 其余上游沿用 Chat 转换链。只有转换链统一请求流式并在本地聚合。
 
 use std::sync::Arc;
 
@@ -35,12 +11,16 @@ use axum::response::Response;
 use serde_json::{json, Value};
 
 use crate::server::core::compact_routing::{self, RequestFormat};
+use crate::server::core::title_routing;
 use crate::server::core::key_scope::KeyScope;
-use crate::server::core::protocol::{anthropic, responses};
+use crate::server::core::protocol::{anthropic, responses, native::{NativeRequest, WireProtocol}};
+
+pub(super) mod native_response;
 use crate::server::core::upstream::cancellation;
 use crate::server::core::upstream::continuation::{self, Continuation};
 use crate::server::core::upstream::usage::RequestTelemetry;
 use crate::server::core::upstream::{ForwardOutcome, ForwardRequest};
+use crate::server::config;
 use crate::server::errors::GatewayError;
 use crate::server::logging;
 use crate::server::ServerState;
@@ -85,6 +65,7 @@ fn parse_object(
 async fn forward_chat(
     state: &ServerState,
     payload: Value,
+    native: NativeRequest,
     client_headers: &HeaderMap,
     stream: bool,
     dedupe_key: String,
@@ -107,7 +88,7 @@ async fn forward_chat(
     });
     let outcome = state
         .upstream()
-        .forward(ForwardRequest {
+        .forward_native(ForwardRequest {
             body: payload,
             stream,
             dedupe_key,
@@ -120,12 +101,16 @@ async fn forward_chat(
             // 是模型测试的直达跳，见 `ForwardRequest` 的说明）
             ignore_model_gate: false,
             proxy_override: None,
-        })
+        }, native)
         .await;
     // 续写包装：流式在下游状态机接手之前把整条流换掉（终止帧必须在
     // `ResponsesStream` / `AnthropicStream` 看到它之前就压住，否则机器会提前
     // 收尾、后续轮的内容整段被丢）；非流式则在这里把聚合体问完整。
     match (continuation, outcome) {
+        (Some(context), Ok(ForwardOutcome::Native(response))) => {
+            context.telemetry.note_attempt_notice("同协议原生转发不自动拼接续写，保留上游原始结束原因与签名");
+            Ok(ForwardOutcome::Native(response))
+        }
         (Some(context), Ok(ForwardOutcome::Stream { status, stream })) => {
             Ok(ForwardOutcome::Stream { status, stream: context.stream(stream) })
         }
@@ -153,6 +138,9 @@ pub async fn responses_endpoint(
     let started_at = logging::now_ms();
     // 请求来源客户端（UA 识别，见 `core::client`）：早失败路径与收尾记账共用
     let source = pipeline::request_source(&headers, key_identity);
+    // 协议兼容只看严格客户端识别，不跟随报表规则或来源声明。
+    let reasoning_collapse = source.behavior_client == crate::server::core::client::CLIENT_CODEX
+        && config::third_party_reasoning_collapse();
     let path = "/v1/responses";
     let raw = match parse_object(&state, started_at, path, &body, &source) {
         Ok(value) => value,
@@ -160,6 +148,13 @@ pub async fn responses_endpoint(
     };
     // 协议翻译前识别，保留原始文本块边界。
     let compact_client = compact_routing::client_for_request(&source.behavior_client, &raw, RequestFormat::Responses);
+    // 标题请求在原始体上判（Responses 的 input 数组形态），且只在不命中压缩时判。
+    let special = if compact_client.is_some() {
+        super::request_prepare::SpecialRoute::compact(compact_client)
+    } else {
+        super::request_prepare::SpecialRoute::title(title_routing::client_for_request(
+            &source.behavior_client, &headers, &raw, true))
+    };
     // 原始请求体留一份：回程要用它回显请求侧字段（instructions / tools / …），
     // 而下面会把 payload 改写成 Chat 形态
     let original = raw.clone();
@@ -169,8 +164,8 @@ pub async fn responses_endpoint(
     let client_reasoning = pipeline::client_reasoning_of(&raw);
     let stream = raw.get("stream").and_then(Value::as_bool).unwrap_or(false);
 
-    // 协议翻译（有状态字段在这里被拒）
-    let mut chat_body = match responses::chat_from_responses(&raw) {
+    // Chat 投影服务选路与跨协议出口，原生请求另行保留。
+    let (native, mut chat_body) = match NativeRequest::prepare(WireProtocol::Responses, raw.clone()) {
         Ok(body) => body,
         Err(message) => {
             let error = GatewayError::bad_request(message);
@@ -190,7 +185,7 @@ pub async fn responses_endpoint(
 
     // 模型解析走公共管道（默认模型回落 / 别名映射 / 目录校验）。
     // 第三参是这把 Key 的可用模型白名单（None = 不限制），同 /v1/chat/completions
-    let requested_model = match super::request_prepare::resolve_client_model(&state, &mut chat_body, scope.as_ref(), compact_client).await {
+    let requested_model = match super::request_prepare::resolve_client_model(&state, &mut chat_body, scope.as_ref(), special).await {
         Ok(model) => model,
         Err(error) => {
             record_early_failure(&state, started_at, &pipeline::model_field_text(&raw), &client_reasoning, &source, &error);
@@ -207,6 +202,9 @@ pub async fn responses_endpoint(
         ),
     );
     pipeline::write_debug_files(&body, "POST", path, &user_agent);
+    let dedupe_key = pipeline::sha256_hex(&body);
+    let raw_request = pipeline::capture_raw_body(&body);
+    drop(body);
 
     // 上游恒走流式（理由见模块头）
     // scope 的**提供商**那一半进转发层（选路时按承载家过滤）；
@@ -241,13 +239,14 @@ pub async fn responses_endpoint(
     if let Some(token) = cancellation::register(&telemetry_id) {
         telemetry.set_cancel_token(token);
     }
-    let mut guard = DisconnectGuard::new(state.request_stats(), telemetry_id.clone());
+    let mut guard = DisconnectGuard::new(state.request_stats(), telemetry.clone(), started_at);
     let outcome = forward_chat(
         &state,
         chat_body,
+        native,
         &headers,
         stream,
-        pipeline::sha256_hex(&body),
+        dedupe_key,
         scope,
         telemetry.clone(),
     )
@@ -264,7 +263,7 @@ pub async fn responses_endpoint(
         // 下游原始请求体：客户端发来的那一份（协议翻译前）——仅调试模式
         // 开启时采集（`capture_raw_body`）。响应侧非流式在聚合完成后补，
         // 流式由 RecordingStream 在流结束时定稿
-        raw_request: pipeline::capture_raw_body(&body),
+        raw_request,
         raw_response: None,
         // 真实流量：不是模型测试（见 `RecordContext::is_test`）
         is_test: false,
@@ -273,6 +272,7 @@ pub async fn responses_endpoint(
     };
 
     match outcome {
+        Ok(ForwardOutcome::Native(response)) => native_response::respond(response, context, &mut guard),
         Ok(ForwardOutcome::Stream { status, stream: source }) => {
             let status = StatusCode::from_u16(status).unwrap_or(StatusCode::OK);
             let model = requested_model.clone();
@@ -280,7 +280,8 @@ pub async fn responses_endpoint(
             // 状态码进记账上下文（明细里记的必须是客户端实际看到的那个码）
             let context = RecordContext { status: i64::from(status.as_u16()), ..context };
             if stream {
-                let mut machine = responses::ResponsesStream::new(&model, &request);
+                let mut machine =
+                    responses::ResponsesStream::new(&model, &request, reasoning_collapse);
                 let transformed = pipeline::transformed_stream(
                     source,
                     context,
@@ -293,9 +294,9 @@ pub async fn responses_endpoint(
             }
             // 下游要非流式：内部收流，聚合成本协议的 JSON
             let mut collector = responses::ResponsesCollector::new();
-            collect_stream(source, &mut |chunk| collector.push(chunk)).await;
+            let received = collect_stream(source, &mut |chunk| collector.push(chunk)).await;
             collector.finish();
-            let body = collector.into_response(&model, &request);
+            let body = collector.into_response(&model, &request, reasoning_collapse && received);
             // 响应正文在记账前定稿（完整 JSON 文本；序列化失败或调试模式
             // 关着给 None，见 `capture_raw_json`）
             let context = RecordContext {
@@ -310,7 +311,12 @@ pub async fn responses_endpoint(
         Ok(ForwardOutcome::Completion { body: chat }) => {
             // 上游走了聚合路径（本不该发生：我们恒要流式，但 CatPaw 等
             // 有状态适配器可能直接给 Completion）。照样翻译，不丢请求。
-            let response = responses::responses_from_chat(&chat, &requested_model, &original);
+            let response = responses::responses_from_chat(
+                &chat,
+                &requested_model,
+                &original,
+                reasoning_collapse,
+            );
             let context = RecordContext {
                 raw_response: pipeline::capture_raw_json(&response),
                 ..context
@@ -326,6 +332,7 @@ pub async fn responses_endpoint(
             // （见 `api::chat` 同名分支的说明）。
             logging::console_line("[Model]", &format!("❌ {message}"));
             let response = error_response(context, &error, |status, error| {
+                if let Some(response) = native_response::error_response(WireProtocol::Responses, status, error) { return response; }
                 let code = anthropic::responses_error_code(status);
                 GatewayError::with_status(i32::from(status), error.message.clone())
                     .with_code(code)
@@ -361,8 +368,15 @@ pub async fn messages_endpoint(
     let stream = raw.get("stream").and_then(Value::as_bool).unwrap_or(false);
 
     let compact_client = compact_routing::client_for_request(&source.behavior_client, &raw, RequestFormat::Anthropic);
+    // 标题请求在原始体上判（Anthropic 的 content 块形态），只在不命中压缩时判。
+    let special = if compact_client.is_some() {
+        super::request_prepare::SpecialRoute::compact(compact_client)
+    } else {
+        super::request_prepare::SpecialRoute::title(title_routing::client_for_request(
+            &source.behavior_client, &headers, &raw, false))
+    };
     // 协议翻译
-    let mut chat_body = match anthropic::chat_from_anthropic(&raw) {
+    let (native, mut chat_body) = match NativeRequest::prepare(WireProtocol::Anthropic, raw.clone()) {
         Ok(body) => body,
         Err(message) => {
             let error = GatewayError::bad_request(message);
@@ -374,7 +388,7 @@ pub async fn messages_endpoint(
     // 下游等级从**翻译后的 chat 体**读：Anthropic 的 thinking/output_config →
     // reasoning_effort 是网关自己的映射（anthropic_effort），比通用并集链更准
     let client_reasoning = pipeline::client_reasoning_of(&chat_body);
-    let requested_model = match super::request_prepare::resolve_client_model(&state, &mut chat_body, scope.as_ref(), compact_client).await {
+    let requested_model = match super::request_prepare::resolve_client_model(&state, &mut chat_body, scope.as_ref(), special).await {
         Ok(model) => model,
         Err(error) => {
             record_early_failure(&state, started_at, &pipeline::model_field_text(&raw), &client_reasoning, &source, &error);
@@ -391,6 +405,9 @@ pub async fn messages_endpoint(
         ),
     );
     pipeline::write_debug_files(&body, "POST", path, &user_agent);
+    let dedupe_key = pipeline::sha256_hex(&body);
+    let raw_request = pipeline::capture_raw_body(&body);
+    drop(body);
 
     // scope 的**提供商**那一半进转发层（选路时按承载家过滤）；
     // 模型那一半已在上面判过（分工见 forward_chat 的说明）。
@@ -428,13 +445,14 @@ pub async fn messages_endpoint(
     if let Some(token) = cancellation::register(&telemetry_id) {
         telemetry.set_cancel_token(token);
     }
-    let mut guard = DisconnectGuard::new(state.request_stats(), telemetry_id.clone());
+    let mut guard = DisconnectGuard::new(state.request_stats(), telemetry.clone(), started_at);
     let outcome = forward_chat(
         &state,
         chat_body,
+        native,
         &headers,
         stream,
-        pipeline::sha256_hex(&body),
+        dedupe_key,
         scope,
         telemetry.clone(),
     )
@@ -451,7 +469,7 @@ pub async fn messages_endpoint(
         // 下游原始请求体：客户端发来的那一份（协议翻译前）——仅调试模式
         // 开启时采集（`capture_raw_body`）。响应侧非流式在聚合完成后补，
         // 流式由 RecordingStream 在流结束时定稿
-        raw_request: pipeline::capture_raw_body(&body),
+        raw_request,
         raw_response: None,
         // 真实流量：不是模型测试（见 `RecordContext::is_test`）
         is_test: false,
@@ -460,6 +478,7 @@ pub async fn messages_endpoint(
     };
 
     match outcome {
+        Ok(ForwardOutcome::Native(response)) => native_response::respond(response, context, &mut guard),
         Ok(ForwardOutcome::Stream { status, stream: source }) => {
             let status = StatusCode::from_u16(status).unwrap_or(StatusCode::OK);
             let model = requested_model.clone();
@@ -508,6 +527,7 @@ pub async fn messages_endpoint(
             // （见 `api::chat` 同名分支的说明）。
             logging::console_line("[Model]", &format!("❌ {message}"));
             let response = error_response(context, &error, |status, error| {
+                if let Some(response) = native_response::error_response(WireProtocol::Anthropic, status, error) { return response; }
                 anthropic_error_response_with_status(status, &error.message)
             });
             // 记账已完成（含手动终止的 408）：解除兜底并注销令牌
@@ -523,19 +543,19 @@ pub async fn messages_endpoint(
 async fn collect_stream(
     mut source: Box<dyn futures::Stream<Item = Result<Bytes, std::io::Error>> + Send + Unpin>,
     sink: &mut impl FnMut(&[u8]),
-) {
+) -> bool {
     use futures::StreamExt;
     while let Some(item) = source.next().await {
         match item {
             Ok(chunk) => sink(&chunk),
-            // 上游中断：已收的内容保留（聚合层会把已有的部分成形），
-            // 与流式路径「不丢用户已经看到的部分」同一取向
+            // 部分内容保留，但接收失败不能用于推断最终回答阶段。
             Err(error) => {
                 logging::verbose("[Model]", &format!("聚合时上游中断: {error}"));
-                break;
+                return false;
             }
         }
     }
+    true
 }
 
 /// Anthropic 形态的错误响应（`{type:"error", error:{type, message}}`）

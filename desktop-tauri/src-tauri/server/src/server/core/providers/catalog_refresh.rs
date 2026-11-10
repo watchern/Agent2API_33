@@ -144,7 +144,9 @@ pub async fn refresh(
                 continue;
             }
         };
+        let started = std::time::Instant::now();
         let outcome = adapter.refresh_models(store, requested, manual).await;
+        item["durationMs"] = json!(started.elapsed().as_millis().min(i64::MAX as u128) as i64);
         if outcome.refreshed {
             item["status"] = json!("refreshed");
             item["count"] = json!(outcome.count);
@@ -184,6 +186,9 @@ pub async fn refresh(
             "providerLabel": label,
             "refreshedAt": catalog::refresh_meta_for_provider(&id).1,
         });
+        if adapter.refresh_uses_account() && !requested.is_empty() {
+            item["accountId"] = json!(requested);
+        }
         if !adapter.supports_model_refresh() {
             item["status"] = json!("skipped");
             item["fixed"] = json!(true);
@@ -193,7 +198,9 @@ pub async fn refresh(
         }
         // 需要账号时只从该 provider 的启用凭证账号里选；点名错误不回落队首。
         // 不读 secret，也不把空账号发给 builtin / 插件执行体。
-        let account_id = if adapter.refresh_uses_account() {
+        let account_id = if crate::server::core::plugin_host::wasm::catalog::enabled(&id) && requested.is_empty() {
+            String::new()
+        } else if adapter.refresh_uses_account() {
             let available = store.accounts_for_provider(&id);
             let selected = available.iter().filter_map(|account| account.get("id").and_then(Value::as_str))
                 .find(|account_id| requested.is_empty() || *account_id == requested);
@@ -236,7 +243,9 @@ pub async fn refresh(
                 }
             }
         };
+        let started = std::time::Instant::now();
         let outcome = adapter.refresh_models(store, &account_id, manual).await;
+        item["durationMs"] = json!(started.elapsed().as_millis().min(i64::MAX as u128) as i64);
         item["status"] = json!(if outcome.refreshed {
             "refreshed"
         } else if outcome.message.is_some() {
