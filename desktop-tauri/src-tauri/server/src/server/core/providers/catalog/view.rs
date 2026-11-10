@@ -78,8 +78,38 @@ fn public_builtin_items(active: &[(String, Vec<Value>)]) -> Vec<(String, Value)>
 }
 
 pub fn models_response(store: &AccountStore, scope: Option<&KeyScope>) -> Value {
+    // 无 scope 的聚合目录走**版本号缓存**（2026-11-11）。
+    //
+    // /api/session 首屏与 /v1/models 都在这条热路径上：完整建一次目录要遍历
+    // 全部提供商清单 + 应用规则 + 自定义家 + 路由组，这台机器的 211MB 库上
+    // 单次就是几十秒的纯 CPU（实测 session_models 段 53s）。缓存的失效键与
+    // 选路快照完全一致 —— 账号 revision（可用家变化）+ 目录 generation
+    // （清单 / 规则 / 自定义家 / 路由组变化），任一推进即失效重建，语义与
+    // 不缓存时逐字相同，只是把「每请求重算」变成「每版本重算」。
+    // 带 scope 的调用（受限 Key 过滤）走原路径，不进缓存。
+    if scope.is_none() {
+        if let Some(db) = store.database() {
+            let revision = db.account_revision();
+            let metadata = super::generation();
+            if let Some(cached) = MODELS_CACHE.read().ok().and_then(|guard| guard.clone()) {
+                if cached.0 == revision && cached.1 == metadata {
+                    return (*cached.2).clone();
+                }
+            }
+            let built = models_response_with_active(store, scope, active_manifests(store));
+            if let Ok(mut guard) = MODELS_CACHE.write() {
+                *guard = Some((revision, metadata, std::sync::Arc::new(built.clone())));
+            }
+            return built;
+        }
+    }
     models_response_with_active(store, scope, active_manifests(store))
 }
+
+/// 无 scope 聚合目录的版本号缓存：`(account_revision, catalog_generation, Value)`。
+static MODELS_CACHE: std::sync::RwLock<
+    Option<(u64, u64, std::sync::Arc<Value>)>,
+> = std::sync::RwLock::new(None);
 
 pub(super) fn models_response_with_active(
     store: &AccountStore,
@@ -136,22 +166,6 @@ pub fn session_models(store: &AccountStore) -> Vec<Value> {
         }).collect()
 }
 
-pub fn session_models_with_active(
-    store: &AccountStore,
-    active: Vec<(String, Vec<Value>)>,
-) -> Vec<Value> {
-    models_response_with_active(store, None, active).get("data").and_then(Value::as_array)
-        .cloned().unwrap_or_default().into_iter().map(|mut item| {
-            let provider = item.get("owned_by").and_then(Value::as_str).unwrap_or("").to_string();
-            let is_default = item.get("is_default").cloned().unwrap_or(Value::Bool(false));
-            if let Some(object) = item.as_object_mut() {
-                object.insert("providerLabel".to_string(), Value::String(super::super::label_of(&provider)));
-                object.insert("provider".to_string(), Value::String(provider));
-                object.insert("isDefault".to_string(), is_default);
-            }
-            item
-        }).collect()
-}
 
 pub fn models_by_provider(store: &AccountStore) -> Value {
     let mut map = Map::new();

@@ -192,7 +192,9 @@ impl AccountStore {
         &self.inner.validation
     }
 
-    pub(super) fn database(&self) -> Option<&Db> {
+    /// 库句柄（`None` = 未打开）。`pub(crate)`：聚合目录的版本号缓存
+    /// （`providers::catalog::view` 的 MODELS_CACHE）读它拿账号 revision。
+    pub(crate) fn database(&self) -> Option<&Db> {
         self.inner.db.as_ref()
     }
 
