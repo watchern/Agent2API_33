@@ -222,6 +222,17 @@ pub fn console_line(tag: &str, text: &str) {
     write_file_line(&line);
 }
 
+/// 只走双控制台通道（stderr + 日志文件），**绝不落库**。
+///
+/// 专用场景：调用点**已经握着数据库连接互斥锁**（典型是 `Db::with` 内部的
+/// 慢等待告警）。logging 的落库共用同一把连接锁，`std::sync::Mutex` 不可
+/// 重入 —— 那种位置上调用 [`log`] / [`log_with_level`] 会对同一把锁二次
+/// 加锁，当场自死锁并永久握住连接（2026-11-11 冻结根因，见 db::warn_slow_wait
+/// 的说明）。stderr 与文件通道都不经过库，持锁期间调用是安全的。
+pub fn console(tag: &str, text: &str) {
+    console_line(tag, text);
+}
+
 /// 双通道日志（对应 Node 版 log()）。
 ///
 /// 入库前会做与 Node 版相同的处理：把各段参数用空格连接后 trim，

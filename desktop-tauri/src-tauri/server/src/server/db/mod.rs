@@ -98,37 +98,112 @@ use rusqlite::Connection;
 /// 这条日志就是定位「列表为什么慢」的第一现场（2026-11-09 排障所加）。
 const SLOW_DB_WAIT: Duration = Duration::from_millis(500);
 
-thread_local! {
-    /// 慢等待告警的重入守卫：logging 本身也走这张库（logs 表），不打这条守卫，
-    /// 「写日志 → 等待超时 → 再写日志」会在连接拥堵时自我递归。同一线程上
-    /// 已在告警时静默跳过 —— 丢一条提醒没关系，别把队列堵成死循环。
-    static SLOW_WAIT_WARN_INSIDE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
+/// 慢等待告警：**只走控制台，绝不写日志库**（2026-11-11 冻结根因修复）。
+///
+/// 调用点在 `with` / `with_mut` 里 —— 那一刻**当前线程已经握着连接互斥锁**
+/// （`outcome` 的 guard 还没消费）。logging 的落库写同一张库、共用同一把
+/// `Db` 句柄：`std::sync::Mutex` 不可重入，这条线程会对同一把锁二次加锁
+/// **当场自死锁**，并且永远握着连接不放 —— 全网关的库读写随之永久排队。
+/// 2026-11-09 引入本告警后的每次「网关启动中卡死」都是它：控制台那行
+/// 总能打出来（`console_line` 在落库之前），随后线程死在 append 里。
+/// 控制台输出本就进 stderr 日志文件（trace 重定向），诊断信息没有损失。
 fn warn_slow_wait(waited: Duration) {
-    SLOW_WAIT_WARN_INSIDE.with(|inside| {
-        if inside.get() {
-            return;
-        }
-        inside.set(true);
-        crate::server::logging::log_with_level(
-            "[Storage]",
-            &format!(
-                "数据库连接等待 {} ms —— 被其它库操作占住（单连接互斥，全网关的库读写都排这一把锁）",
-                waited.as_millis()
-            ),
-            "warn",
-        );
-        inside.set(false);
-    });
+    crate::server::logging::console(
+        "[Storage]",
+        &format!(
+            "数据库连接等待 {} ms —— 被其它库操作占住（单连接互斥，全网关的库读写都排这一把锁）",
+            waited.as_millis()
+        ),
+    );
 }
 
 /// 数据库文件名。放配置目录（`~/.agent2api`）里，与 config.json / 日志并排 ——
 /// 用户在设置页看到的「配置目录」就是这一个位置，备份与排障只需要它。
-/// 路径由 `config::config_dir()` 派生，本模块不自己去查 home 目录。
+/// 路径由 `config::config_dir()` 派生，调用方只是拿去看看或拼串，不需要所有权。
 /// （接入本库的五个 store —— 账号、事件日志、请求统计、调试报文、脱敏词表 ——
 /// 改造后都不再有自己的文件名，它们的数据都在本库的各张表里。）
 pub const FILE_NAME: &str = "agent2api.db";
+
+// ─── 连接持有者追踪（2026-11-11 排障插桩）─────────────────────
+//
+// 背景：网关在启动期整体冻结（所有触库端点 120 秒壳侧超时、/health 也排队、
+// CPU 空转、WAL 十几分钟零写入）—— 症状指向「某个线程拿着连接等另一把锁，
+// 其它线程全在排队」。此时 DB 背后的日志库也死了（logging 写同一张库），
+// warn_slow_wait 永远打不出来 —— 唯一能穿过冻结的出口是 stderr。
+//
+// 本插桩因此只做两件事：
+//   1. `with` / `with_mut` 拿到连接时记下「谁在持有」（线程 + `#[track_caller]`
+//      的调用点），Guard 析构时清掉；
+//   2. 一个**普通 std 线程**（不走 tokio、不碰库）每 10 秒看一眼：连接被同一
+//      次持有超过 30 秒就直接 eprintln —— 持有点的 文件:行 会当场出现在
+//      stderr 日志里，第一现场不再依赖推理。
+
+/// 当前连接的持有者信息。`None` = 没人持有。
+struct HoldInfo {
+    thread: std::thread::ThreadId,
+    site: &'static std::panic::Location<'static>,
+    since: Instant,
+}
+
+static DB_HOLD: Mutex<Option<HoldInfo>> = Mutex::new(None);
+
+/// 持有期间登记 / 离开时注销。Drop 保证异常路径也不留悬挂记录。
+struct HoldGuard {
+    site: &'static std::panic::Location<'static>,
+}
+
+impl HoldGuard {
+    fn acquire(site: &'static std::panic::Location<'static>) -> Self {
+        if let Ok(mut slot) = DB_HOLD.lock() {
+            *slot = Some(HoldInfo {
+                thread: std::thread::current().id(),
+                site,
+                since: Instant::now(),
+            });
+        }
+        Self { site }
+    }
+}
+
+impl Drop for HoldGuard {
+    fn drop(&mut self) {
+        if let Ok(mut slot) = DB_HOLD.lock() {
+            // 只清自己这一笔（防止嵌套/重入时误清外层）
+            let matches = slot.as_ref().is_some_and(|info| info.site == self.site);
+            if matches {
+                *slot = None;
+            }
+        }
+    }
+}
+
+/// 连接被**同一次**持有超过这个值就视为冻结现场，开始周期性告警。
+const HOLD_WARN_AFTER: Duration = Duration::from_secs(30);
+/// 告警周期。
+const HOLD_WARN_EVERY: Duration = Duration::from_secs(10);
+
+/// 起动持有者看门狗（`Db::open` 调一次；普通线程，绝不触碰库与 tokio）。
+fn spawn_hold_watchdog() {
+    std::thread::Builder::new()
+        .name("db-hold-watchdog".to_string())
+        .spawn(|| loop {
+            std::thread::sleep(HOLD_WARN_EVERY);
+            let Ok(slot) = DB_HOLD.lock() else { continue };
+            let Some(info) = slot.as_ref() else { continue };
+            let held = info.since.elapsed();
+            if held < HOLD_WARN_AFTER {
+                continue;
+            }
+            eprintln!(
+                "[DB-watchdog] 连接已被占用 {}s：{}（线程 {:?}）—— 超过 {HOLD_WARN_AFTER:?} 的单次持有即冻结现场，所有触库操作都在排队",
+                held.as_secs(),
+                info.site,
+                info.thread,
+            );
+        })
+        .map_err(|error| format!("数据库持有者看门狗起动失败: {error}"))
+        .ok();
+}
 
 /// SQLite 连接句柄。`Clone` 共享**同一个**连接（内部 `Arc`）。
 ///
@@ -188,6 +263,7 @@ impl Db {
         schema::migrate(&conn).map_err(|error| format!("建表/升级 schema 失败: {error}"))?;
         let accounts = Arc::new(revisions::AccountRevisions::default());
         install_cloud_sync_hook(&conn, accounts.clone());
+        spawn_hold_watchdog();
         Ok(Db {
             inner: Arc::new(DbInner {
                 conn: Mutex::new(conn),
@@ -218,6 +294,7 @@ impl Db {
     /// 它们保护的是「一次读改写周期」这个调度点，锁内没有需要保持一致的数据
     /// （真正的数据在库里）。两处判据不同正是因为**保护对象不同**：这里持的是
     /// 连接本身（状态可能停在事务中间），那里持的是空标记。
+    #[track_caller]
     pub fn with<T>(&self, f: impl FnOnce(&Connection) -> T) -> Option<T> {
         let started = Instant::now();
         let outcome = self.inner.conn.lock();
@@ -226,7 +303,10 @@ impl Db {
             warn_slow_wait(waited);
         }
         match outcome {
-            Ok(conn) => Some(f(&conn)),
+            Ok(conn) => {
+                let _release = HoldGuard::acquire(std::panic::Location::caller());
+                Some(f(&conn))
+            }
             Err(_) => None,
         }
     }
@@ -247,6 +327,7 @@ impl Db {
     ///
     /// 调用点：`AccountStore::with_conn_mut`（账号层的批量写与整份状态差异写 ——
     /// 批量改/删、`migrate_startup`、三家旧数据导入、导入合并）。
+    #[track_caller]
     pub fn with_mut<T>(&self, f: impl FnOnce(&mut Connection) -> T) -> Option<T> {
         let started = Instant::now();
         let outcome = self.inner.conn.lock();
@@ -255,7 +336,10 @@ impl Db {
             warn_slow_wait(waited);
         }
         match outcome {
-            Ok(mut conn) => Some(f(&mut conn)),
+            Ok(mut conn) => {
+                let _release = HoldGuard::acquire(std::panic::Location::caller());
+                Some(f(&mut conn))
+            }
             Err(_) => None,
         }
     }
