@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Map, Value};
 
@@ -12,6 +12,13 @@ pub(super) struct SnapshotCache {
     build: Mutex<()>,
     state: RwLock<Option<CachedSnapshot>>,
 }
+
+/// 构建期版本漂移的限频日志（console-only；见 build_routing_snapshot 收尾说明）。
+thread_local! {
+    static SNAPSHOT_DRIFT_LOG: std::cell::RefCell<Option<Instant>> = const { std::cell::RefCell::new(None) };
+}
+/// 漂移日志的最小间隔：构建本身高频，逐次打会把 stderr 刷爆。
+const DRIFT_LOG_MIN_GAP: Duration = Duration::from_secs(10);
 
 struct CachedSnapshot {
     revision: u64,
@@ -73,10 +80,19 @@ impl AccountStore {
             if let Some(snapshot) = fresh(cache, revision, metadata) { return snapshot; }
             crate::server::core::blocking::in_place(|| self.build_routing_snapshot(db, revision, metadata))
         } else {
-            // 等待者：不补偿线程，在当前线程上 yield 轮询直到缓存可用
+            // 等待者：不补偿线程，在当前线程上轮询直到缓存可用。
+            // 纯 yield_now 在建者（秒级构建）期间会把 worker 烧成 100%——
+            // 2026-11-11 实测五线程 2900+ 秒 CPU 的主力之一。每 64 次 yield
+            // 让出 1ms：对同核线程友好，延迟感知不变（构建本来就秒级）。
+            let mut spins: u32 = 0;
             loop {
                 if let Some(snapshot) = fresh(cache, revision, metadata) { return snapshot; }
-                std::thread::yield_now();
+                spins = spins.wrapping_add(1);
+                if spins % 64 == 0 {
+                    std::thread::sleep(Duration::from_millis(1));
+                } else {
+                    std::thread::yield_now();
+                }
             }
         }
     }
@@ -140,12 +156,43 @@ impl AccountStore {
             super::sql::warn_load_failure("读取选路账号", &format!("{failed} 条账号记录解密或解析失败，已跳过；原始数据未修改"));
         }
         let snapshot = Arc::new(RoutingSnapshot::from_rows(&rows));
-        if db.account_revision() == revision && crate::server::core::providers::catalog::generation() == metadata {
-            if let Ok(mut state) = cache.state.write() {
-                *state = Some(CachedSnapshot { revision, metadata, data_version,
-                    checked_at: Instant::now(), rows: Arc::new(rows),
-                    decoded: Arc::new(decoded), priority_scope, snapshot: snapshot.clone() });
-            }
+        // 缓存**无条件写入**（2026-11-11 活锁修复）。
+        //
+        // 旧实现只在「构建期间版本号没再变」时入缓存，变了就整份丢弃 ——
+        // 但构建本身要几秒（大库全量解码），启动期账号写入与目录刷新持续
+        // 推进 revision / generation，于是每一轮构建收尾都判定「过期」而
+        // 丢弃：下一个等待者从头再建，再被丢弃 —— 无限重建 + 等待者自旋，
+        // 五个 worker 全部烧满（实测 CPU 2900+ 秒），运行时饿死。
+        //
+        // 现在以**构建收尾时刻**的 revision / generation 入缓存：即使构建
+        // 期间有变更被本轮漏掉，下一轮构建也会以这份缓存为底、按行级增量
+        // 补齐（`previous` 复用 + `account_changes(since)`），一两个增量循环
+        // 内必然收敛 —— 慢，但有限，且等待者只自旋一轮。
+        //
+        // 漂移观测（console-only，不落库）：构建前后版本号不一致时留一行
+        // 痕迹 —— 若某写方以极高频率推版本号，这里会连续刷屏，第一现场直指。
+        let final_revision = db.account_revision();
+        let final_metadata = crate::server::core::providers::catalog::generation();
+        if final_revision != revision || final_metadata != metadata {
+            SNAPSHOT_DRIFT_LOG.with(|slot| {
+                let now = Instant::now();
+                let last = slot.borrow();
+                if last.map(|at| at.elapsed() >= DRIFT_LOG_MIN_GAP).unwrap_or(true) {
+                    crate::server::logging::console(
+                        "[Storage]",
+                        &format!(
+                            "路由快照构建期间版本漂移：revision {} → {}，generation {} → {}（本轮结果按收尾值入缓存，下轮增量补齐）",
+                            revision, final_revision, metadata, final_metadata,
+                        ),
+                    );
+                    *slot.borrow_mut() = Some(now);
+                }
+            });
+        }
+        if let Ok(mut state) = cache.state.write() {
+            *state = Some(CachedSnapshot { revision: final_revision, metadata: final_metadata,
+                data_version, checked_at: Instant::now(), rows: Arc::new(rows),
+                decoded: Arc::new(decoded), priority_scope, snapshot: snapshot.clone() });
         }
         snapshot
     }
