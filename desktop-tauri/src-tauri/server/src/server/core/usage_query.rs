@@ -235,7 +235,13 @@ async fn query_usage_inner(
             if error.status_code != 401 || !adapter.supports_refresh() || store.needs_relogin(id) {
                 return Err(UsageFailure::Request(error.message, error.code, error.status_code));
             }
-            if let Err(refresh_error) = adapter.refresh_access_token(store, id).await {
+            // 刷新走带核验的那条入口（与凭证自动维护同一判据）：适配器报 Ok
+            // 只代表「这次调用没报错」，上游原样回旧值时凭据一个字节没动 ——
+            // 不核验的话，刷新「成功」后的重试还是拿旧 token 撞同一面 401 墙，
+            // 而记录上看不出刷新是假的（2026-11-07/08 AutoClaw 误报的同源问题）。
+            if let Err(refresh_error) =
+                crate::server::core::credential_maintenance::refresh_checked(store, adapter.as_ref(), id).await
+            {
                 // 刷新失败时**原始错误不能丢**：401 的两种含义（token 临期 /
                 // 登录态已被上游作废）在界面上是两件不同的事，只留刷新接口那句
                 // 上游术语（小浣熊是 `authorization_verify_error`）用户既看不懂、
@@ -392,8 +398,22 @@ fn enforce_token_disable(store: &AccountStore, accounts: &[Value], now: i64) {
 /// 记录表的小查询里）。
 pub const SWEEP_TICK_MS: u64 = 10_000;
 
+/// 相邻两次自动查询的**全局间隔**：10 分钟（2026-11-11 用户指定的节奏）。
+///
+/// 自动轮询是**串行**的：查完一个账号，至少隔这么久才轮到下一个 ——
+/// 余额读数本来就是分钟级的数据，逐个查与并发查信息量相同，但上游从
+/// 「N 个账号每分钟齐发一轮」变成「每 10 分钟一个请求」。账号多时每个
+/// 账号的读数按 N×10 分钟轮转更新；单账号时它每 10 分钟刷新一次。
+/// 手动查询（工具栏按钮 / 单行按钮）不受这道闸：那是用户显式发起的。
+pub const SWEEP_GAP_MS: u64 = 10 * 60 * 1000;
+
+/// 上一次自动查询的启动时刻（毫秒；0 = 进程启动后还没轮询过）。
+/// 全局只有 sweeper 一个写者，读写在 AtomicI64 上完成，无需持锁。
+static LAST_SWEEP_START: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
 /// 起动每账号自动查询的心跳循环（`ServerState::bootstrap` 调一次，进程内
-/// 只有这一个循环）。循环体：扫到期账号 → 占位 → 并发查询 → 落记录 → 钩子。
+/// 只有这一个循环）。循环体：扫到期账号 → 按 [`SWEEP_GAP_MS`] 的节奏**逐个**
+/// 启动 → 落记录 → 钩子。
 pub fn spawn_sweeper(store: AccountStore) {
     crate::spawn_task(async move {
         loop {
@@ -403,13 +423,19 @@ pub fn spawn_sweeper(store: AccountStore) {
     });
 }
 
-/// 一轮清扫：查一遍「配置了自动查询且到期」的账号。
+/// 一轮清扫：从「配置了自动查询且到期」的账号里挑**一个**启动。
 ///
 /// 到期判定（`usage_records::query_interval_of` + 记录的 `last_attempt_at`）
 /// 是「记录 + 配置」的纯函数，见模块头 —— 这里没有任何内存排期可丢。
 /// 批量查询排除 `supports_usage == false` 的家（避免一整片 501，与手动批量
 /// 同口径）；没凭证的账号**不排除**：那是本地就能给出的失败结论，写进记录
 /// 让界面如实显示「没有可用凭证」，与手动批量同一行为。
+///
+/// ── 串行节奏（2026-11-11 改造）────────────────────────────────
+/// 每轮最多启动**一个**账号，且两次启动之间至少隔 [`SWEEP_GAP_MS`]：
+/// 挑 `last_attempt_at` 最旧的那个（最久没查过的最优先），其余到期账号
+/// 留给后面的轮次。旧实现是「到期的全部并发启动」—— 默认间隔 60 秒时
+/// N 个账号每分钟同时打一轮上游，风控与日志都吃不消。
 ///
 /// ── Token 限制器的两件事也在这一轮做（先于「没有到期账号」的早退）──
 ///   ① **全量刷新窗口事实**（`limiter::refresh_token_facts`）：按启用中的全部
@@ -435,7 +461,12 @@ async fn sweep_due(store: &AccountStore) {
         limiter::refresh_token_facts(&kinds);
         enforce_token_disable(store, &all_accounts, now);
     }
-    let due: Vec<(Value, i64)> = match resolve_batch_targets(store, None, None) {
+    // 距上次自动查询不足一个间隔：这一轮只做 Token 记账，不发起查询
+    let last = LAST_SWEEP_START.load(std::sync::atomic::Ordering::Relaxed);
+    if last > 0 && now.saturating_sub(last) < SWEEP_GAP_MS as i64 {
+        return;
+    }
+    let mut due: Vec<(Value, i64)> = match resolve_batch_targets(store, None, None) {
         Ok((targets, _skipped)) => targets,
         Err(_) => return, // 目标集合解析失败（库不可用等）：这一轮什么都不做
     }
@@ -446,15 +477,17 @@ async fn sweep_due(store: &AccountStore) {
         let interval = usage_records::query_interval_of(&account)?;
         let id = account.get("id").and_then(Value::as_str)?;
         let due_at = usage_records::load(id).last_attempt_at + interval * 1000;
-        (due_at <= now).then_some((account, interval))
+        (due_at <= now).then_some((account, due_at))
     })
     .collect();
     if due.is_empty() {
         return;
     }
-    for (account, _) in &due {
-        run::start(store, account, false);
-    }
+    // 最久没查过的先轮到；平局（刚导入的一批）按目标集合原顺序稳定排序
+    due.sort_by_key(|(account, due_at)| (*due_at, account.get("id").and_then(Value::as_str).unwrap_or("").to_string()));
+    let (account, _) = &due[0];
+    LAST_SWEEP_START.store(now, std::sync::atomic::Ordering::Relaxed);
+    run::start(store, account, false);
 }
 
 // ─── 快照（前端 20 秒轮询的读点）─────────────────────────────

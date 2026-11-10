@@ -1,7 +1,7 @@
 import {
   errorMessage, shared, toast, type AccountRecord, type TokenReading,
 } from './accounts-shared'
-import { supportsCreditDetail, supportsUsage } from './accounts-domain'
+import { supportsUsage } from './accounts-domain'
 import { allAccounts, bump, findAccount, getStore } from './accounts-store'
 import { adoptLimiterSnapshot } from './accounts-limiter-model'
 import { adoptAccountSorting, refreshAccountSorting } from './accounts-sort'
@@ -16,7 +16,6 @@ export { NOT_CONFIGURED_CODE, pruneUsageCache, usageEntries, usageEntryOf, usage
 
 const tokenUsageMap = new Map<string, TokenReading[]>()
 let lastTokenAt = 0
-let shapeRepairStarted = false
 let snapshotPending: Promise<boolean> | undefined
 installUsageTaskSync(syncBalancesSnapshot)
 
@@ -85,24 +84,6 @@ export function applyBalances(
   return applied
 }
 
-function detailMissing(account: AccountRecord): boolean {
-  if (!supportsCreditDetail(account) || account.needsRelogin) return false
-  const entry = usageEntryOf(account)
-  if (!entry || typeof entry !== 'object' || Array.isArray(entry) || usageFailureOf(entry)) return false
-  return !Array.isArray(entry.credits)
-}
-
-/** 每个会话只补一次旧版读数的明细；查询失败也必须保留失败状态。 */
-async function repairStaleDetail(): Promise<void> {
-  if (shapeRepairStarted) return
-  shapeRepairStarted = true
-  for (const account of allAccounts().filter(detailMissing)) {
-    try {
-      await queryUsageFor(account.id, false)
-    } catch { /* 明细补查不覆盖已有的余额结论。 */ }
-  }
-}
-
 export function syncBalancesSnapshot(): Promise<boolean> {
   if (!snapshotPending) snapshotPending = readBalancesSnapshot().finally(() => { snapshotPending = undefined })
   return snapshotPending
@@ -123,9 +104,7 @@ async function readBalancesSnapshot(): Promise<boolean> {
     }
     const applied = applyBalances(data)
     applyUsageTasks(data?.queries)
-    if (!applied) return tokenApplied
-    void repairStaleDetail()
-    return true
+    return applied || tokenApplied
   } catch {
     // 快照读取失败不代表上游余额查询失败，保留当前结果等待下次轮询。
     return false
