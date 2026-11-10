@@ -175,9 +175,14 @@ impl AccountStore {
         let final_metadata = crate::server::core::providers::catalog::generation();
         if final_revision != revision || final_metadata != metadata {
             SNAPSHOT_DRIFT_LOG.with(|slot| {
-                let now = Instant::now();
-                let last = slot.borrow();
-                if last.map(|at| at.elapsed() >= DRIFT_LOG_MIN_GAP).unwrap_or(true) {
+                let due = {
+                    let last = slot.borrow();
+                    last.map(|at| at.elapsed() >= DRIFT_LOG_MIN_GAP).unwrap_or(true)
+                };
+                // borrow 的守卫先析构，再取 borrow_mut —— 同一 RefCell 嵌套
+                // 借用会 panic（release 是 panic=abort，一次就带走整个进程，
+                // 2026-11-11 实测 beta.5 首次触发即崩）。
+                if due {
                     crate::server::logging::console(
                         "[Storage]",
                         &format!(
@@ -185,7 +190,7 @@ impl AccountStore {
                             revision, final_revision, metadata, final_metadata,
                         ),
                     );
-                    *slot.borrow_mut() = Some(now);
+                    *slot.borrow_mut() = Some(Instant::now());
                 }
             });
         }
