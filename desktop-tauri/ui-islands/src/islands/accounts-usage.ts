@@ -104,7 +104,7 @@ async function readBalancesSnapshot(): Promise<boolean> {
     }
     const applied = applyBalances(data)
     applyUsageTasks(data?.queries)
-    return applied || tokenApplied
+    return applied > 0 || tokenApplied
   } catch {
     // 快照读取失败不代表上游余额查询失败，保留当前结果等待下次轮询。
     return false
