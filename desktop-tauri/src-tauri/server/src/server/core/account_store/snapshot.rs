@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use serde_json::{json, Map, Value};
 
@@ -54,19 +54,37 @@ impl RoutingSnapshot {
 }
 
 impl AccountStore {
+    /// 路由快照：**双检锁**，避免 block_in_place 补偿线程雪崩。
+    ///
+    /// 第一检：无锁读 `fresh()`（版本号 + metadata 命中即返回）。
+    /// 未命中时取 `build.lock`（建者锁），锁内第二检（leader 可能已建好）。
+    /// 只有**持锁的建者**调 `block_in_place`；等待者在锁外 `yield_now` 轮询，
+    /// 不补偿线程 —— 2026-11-09 冻结根因：旧实现 N 个并发请求各自 block_in_place
+    /// → N 个补偿线程争 build.lock → 进程堆锁雪崩。
     pub(crate) fn routing_snapshot(&self) -> Arc<RoutingSnapshot> {
         let Some(db) = self.database() else { return empty() };
         let cache = self.snapshot_cache();
+        let revision = db.account_revision();
         let metadata = crate::server::core::providers::catalog::generation();
-        if let Some(snapshot) = fresh(cache, db.account_revision(), metadata) { return snapshot; }
-        crate::server::core::blocking::in_place(|| self.build_routing_snapshot(db))
+        if let Some(snapshot) = fresh(cache, revision, metadata) { return snapshot; }
+        // 只有一个请求能拿到 build.lock（建者），其余在锁外轮询
+        if let Ok(_guard) = cache.build.try_lock() {
+            // 锁内第二检：可能已被前一个建者建好
+            if let Some(snapshot) = fresh(cache, revision, metadata) { return snapshot; }
+            crate::server::core::blocking::in_place(|| self.build_routing_snapshot(db, revision, metadata))
+        } else {
+            // 等待者：不补偿线程，在当前线程上 yield 轮询直到缓存可用
+            loop {
+                if let Some(snapshot) = fresh(cache, revision, metadata) { return snapshot; }
+                std::thread::yield_now();
+            }
+        }
     }
 
-    fn build_routing_snapshot(&self, db: &crate::server::db::Db) -> Arc<RoutingSnapshot> {
+    fn build_routing_snapshot(&self, db: &crate::server::db::Db, revision: u64, metadata: u64) -> Arc<RoutingSnapshot> {
         let cache = self.snapshot_cache();
-        let _build = cache.build.lock().unwrap_or_else(|error| error.into_inner());
-        let metadata = crate::server::core::providers::catalog::generation();
-        if let Some(snapshot) = fresh(cache, db.account_revision(), metadata) { return snapshot; }
+        // build.lock 已由调用方（routing_snapshot）持有 try_lock，这里不再重复取。
+        // 锁内第二检也已在调用方完成，这里直接开始构建。
         let previous = cache.state.read().ok().and_then(|state| state.as_ref().map(|cached| {
             (cached.revision, cached.metadata, cached.data_version, cached.rows.clone(), cached.decoded.clone())
         }));
@@ -172,8 +190,15 @@ impl AccountStore {
 fn fresh(cache: &SnapshotCache, revision: u64, metadata: u64) -> Option<Arc<RoutingSnapshot>> {
     let state = cache.state.read().ok()?;
     let cached = state.as_ref()?;
-    (cached.revision == revision && cached.metadata == metadata
-        && cached.checked_at.elapsed() < Duration::from_secs(1)).then(|| cached.snapshot.clone())
+    // **无 TTL**：版本号 + 目录 generation 不变即有效。写路径推进 account_revision
+    // 或目录 generation 时自然失效，不需要时间兜底。
+    //
+    // 旧实现用 `checked_at.elapsed() < 1s` —— 每秒过期一次，过期后的首个请求
+    // 走 block_in_place 重建，而同一秒内并发的 N 个请求各自都走 block_in_place
+    // （补偿线程）。账号页首屏的 N 个读同时撞上「缓存刚过期」的瞬间，就会
+    // 生成 N 个补偿线程争 build.lock —— 2026-11-09 实测冻结实例的 44 个
+    // tokio worker（默认 4 + 40 补偿）就是这么来的。
+    (cached.revision == revision && cached.metadata == metadata).then(|| cached.snapshot.clone())
 }
 
 fn empty() -> Arc<RoutingSnapshot> {

@@ -136,6 +136,23 @@ pub fn session_models(store: &AccountStore) -> Vec<Value> {
         }).collect()
 }
 
+pub fn session_models_with_active(
+    store: &AccountStore,
+    active: Vec<(String, Vec<Value>)>,
+) -> Vec<Value> {
+    models_response_with_active(store, None, active).get("data").and_then(Value::as_array)
+        .cloned().unwrap_or_default().into_iter().map(|mut item| {
+            let provider = item.get("owned_by").and_then(Value::as_str).unwrap_or("").to_string();
+            let is_default = item.get("is_default").cloned().unwrap_or(Value::Bool(false));
+            if let Some(object) = item.as_object_mut() {
+                object.insert("providerLabel".to_string(), Value::String(super::super::label_of(&provider)));
+                object.insert("provider".to_string(), Value::String(provider));
+                object.insert("isDefault".to_string(), is_default);
+            }
+            item
+        }).collect()
+}
+
 pub fn models_by_provider(store: &AccountStore) -> Value {
     let mut map = Map::new();
     for (provider, manifest) in active_manifests(store) {

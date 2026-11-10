@@ -27,7 +27,7 @@
 //!   models          ← 模型目录（切片 4 起为真实清单，含远程刷新结果）
 //!   sanitizeBlacklistFingerprints ← 出站指纹脱敏开关（与 GET /api/sanitize 同源）
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::body::Bytes;
 use axum::extract::{Json, OriginalUri, Query, State};
@@ -87,7 +87,13 @@ pub async fn get_session(State(state): State<ServerState>) -> Response {
         crate::server::logging::log("[Session]", "→ 阶段：会话状态（get_status）");
         let session_status = state.auth().get_status();
         crate::server::logging::log("[Session]", "→ 阶段：模型聚合目录（session_models）");
+        let models_started = Instant::now();
         let models = crate::server::core::providers::catalog::session_models(state.store());
+        crate::server::logging::log_with_level(
+            "[Session]",
+            &format!("→ 模型聚合目录耗时 {} ms", models_started.elapsed().as_millis()),
+            "warn",
+        );
         crate::server::logging::log("[Session]", "→ 阶段：代理摘要（proxies_summary）");
         let proxies = proxies_summary();
         crate::server::logging::log("[Session]", "→ 阶段：插件账号能力（account_features）");

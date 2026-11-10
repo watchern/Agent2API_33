@@ -30,7 +30,7 @@ pub const DEFAULT_PORT: u16 = 3065;
 ///
 /// release 构建（唯一的发布形态）行为不变，仍用 [`DEFAULT_PORT`]。
 pub const DEV_PORT: u16 = 3066;
-pub const REQUEST_TIMEOUT_MS: u64 = 60_000;
+pub const REQUEST_TIMEOUT_MS: u64 = 120_000;
 
 /// 本次运行实际使用的端口。
 ///
