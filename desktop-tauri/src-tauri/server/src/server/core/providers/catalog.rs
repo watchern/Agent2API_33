@@ -41,7 +41,40 @@ pub(crate) fn upstream_manifests() -> Vec<(String, Vec<Value>)> {
 
 /// 原始能力清单不应用绑定开关；关闭原始 ID 后，别名仍需解析到这条上游记录。
 /// 用户自建模型、models.dev 补齐与能力覆盖都在这一处应用，插件与内置身份共用。
+///
+/// ── 按家缓存（2026-11-12 剖析结论）─────────────────────────
+/// 本函数是全仓**最热的清单构建点**：10 个调用点里有选路预演、转发名解析
+/// （`wire_target_for_provider`，每条转发请求都走）、聚合目录、路由组投影，
+/// 而单次构建 = `adapter.list_models()`（插件走 rpc_cache）+ models.dev
+/// 元数据逐模型应用 + 能力覆写——本机实测每家 ~3 秒、一轮聚合目录两次
+/// 全量构建合计 ~50 秒（见 view.rs 的分段插桩）。按 (provider, generation)
+/// 缓存：目录刷新（rpc_cache::set_remote/set_defaults）、models.dev 快照
+/// 替换（model_meta::replace）、规则/自定义家变更（config_changed）都会
+/// `catalog::invalidate()` 推 generation —— 推了缓存自然失效，语义与直构
+/// 逐字相同。账号台账写不推 generation，不再打掉缓存。
+///
+/// 返回 clone：调用方全部只读（逐点核对过），clone 一次几微秒。
 pub(crate) fn manifest_for_provider(provider: &str) -> Vec<Value> {
+    let metadata = generation();
+    {
+        let Ok(cache) = manifest_cache().lock() else {
+            return build_manifest_for_provider(provider);
+        };
+        if let Some((cached_generation, manifest)) = cache.get(provider) {
+            if *cached_generation == metadata {
+                return manifest.as_ref().clone();
+            }
+        }
+    }
+    let built = build_manifest_for_provider(provider);
+    if let Ok(mut cache) = manifest_cache().lock() {
+        // 家数有限（内置 + 已装插件），不设淘汰；generation 变化靠键比对失效。
+        cache.insert(provider.to_string(), (metadata, std::sync::Arc::new(built.clone())));
+    }
+    built
+}
+
+fn build_manifest_for_provider(provider: &str) -> Vec<Value> {
     let Some(adapter) = adapter_by_id(provider) else {
         return Vec::new();
     };
@@ -61,6 +94,13 @@ pub(crate) fn manifest_for_provider(provider: &str) -> Vec<Value> {
     }
     model_rules::apply_capability_overrides(provider, &mut models);
     models
+}
+
+/// 每家清单缓存：`(provider, (generation, manifest))`。
+fn manifest_cache() -> &'static std::sync::Mutex<std::collections::HashMap<String, (u64, std::sync::Arc<Vec<Value>>)>> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, (u64, std::sync::Arc<Vec<Value>>)>>>
+        = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
 /// 编译期身份的调用方仍按 kind 查询，执行体优先取已安装的插件。
