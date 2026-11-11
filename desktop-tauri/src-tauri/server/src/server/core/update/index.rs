@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::server::core::{plugin_host, task_state};
-use super::{client, version::{compare_versions, DEFAULT_REPO}};
+use super::{client, jsdelivr, version::{compare_versions, DEFAULT_REPO}};
 
 const TRUSTED_KEY: &str = "updateIndexTrustedApp";
 
@@ -55,7 +55,7 @@ pub fn cached() -> AppIndex {
 
 pub async fn resolve() -> AppIndex {
     let previous = cached();
-    let url = format!("https://raw.githubusercontent.com/{}/main/app.json", plugin_host::update::INDEX_REPO);
+    let url = jsdelivr::gh(plugin_host::update::INDEX_REPO, "main", "app.json");
     let response = match client::fetch_official(&url, &[], Some(20_000)).await {
         Ok(response) if response.status().is_success() => response,
         _ => return previous,

@@ -6,8 +6,8 @@ use serde_json::Value;
 use super::{cache, download, formats};
 use super::super::storage::Package;
 
-const MARKET: &str = "https://raw.githubusercontent.com/magpie-community/plugins/main/registry.json";
-const DISTRIBUTION: &str = "https://raw.githubusercontent.com/magpie-community/plugins/dist/index.json";
+const MARKET: &str = "https://cdn.jsdelivr.net/gh/magpie-community/plugins@main/registry.json";
+const DISTRIBUTION: &str = "https://cdn.jsdelivr.net/gh/magpie-community/plugins@dist/index.json";
 const REFRESH_MS: i64 = 86_400_000;
 const MAX_DOCUMENT: usize = 16 * 1024 * 1024;
 
@@ -128,12 +128,13 @@ impl Sources {
         if let Some(repository) = card.source.strip_prefix("github:") {
             if let Ok(super::super::source::InstallSource::Github { repository, reference }) =
                 super::super::source::InstallSource::parse(&format!("github:{repository}"), &card.selector) {
-                if let Ok(mut url) = url::Url::parse("https://raw.githubusercontent.com/") {
-                    if let Ok(mut path) = url.path_segments_mut() {
-                        path.extend(repository.split('/')).push(if reference.is_empty() { "HEAD" } else { &reference }).push("package.json");
-                    }
-                    return self.document(url.as_str(), "package", force).await.entries.get(&format!("package:{}", card.name)).cloned().unwrap_or_default();
-                }
+                // 与 catalog::github::raw_url 同一口径：HEAD / 空引用落到 main，
+                // jsDelivr 不认 HEAD 这个 ref。
+                let reference = if reference.is_empty() || reference == "HEAD" { "main" } else { &reference };
+                let url = format!(
+                    "https://cdn.jsdelivr.net/gh/{repository}@{reference}/package.json"
+                );
+                return self.document(&url, "package", force).await.entries.get(&format!("package:{}", card.name)).cloned().unwrap_or_default();
             }
             return Vec::new();
         }

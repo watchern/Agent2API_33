@@ -52,19 +52,26 @@ pub(super) fn apply_repository(entry: &mut Entry, row: &Value) {
     entry.pushed_at = types::text(&row["pushed_at"], 64);
 }
 
+/// 仓库文件 URL 改用 jsDelivr 的 `/gh/{repo}@{ref}/{path}` 形态。
+///
+/// 路径段的校验口径不变（拒绝 `..`、反斜杠、查询串等）；`HEAD` / 空引用
+/// 落到 `main`，因为 jsDelivr 不认 `HEAD` 这个 ref。
 pub(super) fn raw_url(repository: &str, reference: &str, path: &str) -> Result<String, Failure> {
-    let mut url = url::Url::parse(&format!("https://raw.githubusercontent.com/{repository}/"))
-        .map_err(|error| Failure::from(error.to_string()))?;
-    let mut segments = url.path_segments_mut().map_err(|_| Failure::from("插件仓库路径无效".to_string()))?;
-    segments.pop_if_empty().push(reference);
+    let mut segments = Vec::new();
     for part in path.strip_prefix("./").unwrap_or(path).split('/') {
         if part.is_empty() || part == "." || part == ".." || part.contains(['\\', '?', '#', ':', '%']) {
             return Err("插件入口路径无效".to_string().into());
         }
         segments.push(part);
     }
-    drop(segments);
-    Ok(url.to_string())
+    if segments.is_empty() {
+        return Err("插件入口路径无效".to_string().into());
+    }
+    Ok(crate::server::core::update::jsdelivr::gh(
+        repository,
+        reference,
+        &segments.join("/"),
+    ))
 }
 
 fn pick_entry(value: &Value) -> Option<String> {

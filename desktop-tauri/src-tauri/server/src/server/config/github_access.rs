@@ -91,8 +91,8 @@ fn normalize_mirror(value: &str) -> Result<String, String> {
     if matches!(
         url.host_str(),
         Some("github.com" | "api.github.com" | "raw.githubusercontent.com")
-    ) {
-        return Err("GitHub 加速前缀应填写加速站地址，而不是 GitHub 官方地址".to_string());
+    ) || url.host_str().is_some_and(|host| host.ends_with(".jsdelivr.net")) {
+        return Err("加速前缀应填写加速站地址，而不是 GitHub / jsDelivr 官方地址".to_string());
     }
     let path = format!("{}/", url.path().trim_end_matches('/'));
     url.set_path(&path);

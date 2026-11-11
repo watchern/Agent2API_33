@@ -8,7 +8,7 @@ pub(crate) use super::packages::MAX_PACK_BYTES;
 use crate::server::core::update::client::{
     fetch_candidate, fetch_json, fetch_public, github_headers,
 };
-use crate::server::core::update::{compare_versions, is_prerelease_version, source, UpdateError};
+use crate::server::core::update::{compare_versions, is_prerelease_version, jsdelivr, source, UpdateError};
 
 pub const INDEX_REPO: &str = "Agent2plugin/Agent2plugin";
 pub const FALLBACK_REPO: &str = "Agent2Builder/agent2api-providers-releases";
@@ -99,7 +99,7 @@ async fn fetch(url: &str) -> Result<reqwest::Response, String> {
 }
 
 pub async fn read_index_result() -> Result<Vec<IndexEntry>, UpdateError> {
-    let url = format!("https://raw.githubusercontent.com/{INDEX_REPO}/main/index.json");
+    let url = jsdelivr::gh(INDEX_REPO, "main", "index.json");
     let response = fetch_json(&url, &github_headers(), QUERY_TIMEOUT_MS, |value| {
         value.get("plugins").and_then(Value::as_array).is_some()
     })
@@ -157,9 +157,7 @@ fn index_path(path: &str) -> Option<String> {
     {
         return None;
     }
-    Some(format!(
-        "https://raw.githubusercontent.com/{INDEX_REPO}/main/{path}"
-    ))
+    Some(jsdelivr::gh(INDEX_REPO, "main", path))
 }
 
 pub async fn read_detail(path: &str) -> Option<PluginDetail> {

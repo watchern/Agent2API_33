@@ -23,7 +23,7 @@ pub(super) fn market(value: &str) -> Vec<String> {
         return Vec::new();
     }
     ["svg", "png"].into_iter().map(|ext| format!(
-        "https://raw.githubusercontent.com/yetone/magpie/main/internal/gui/assets/icons/{name}.{ext}"
+        "https://cdn.jsdelivr.net/gh/yetone/magpie@main/internal/gui/assets/icons/{name}.{ext}"
     )).collect()
 }
 

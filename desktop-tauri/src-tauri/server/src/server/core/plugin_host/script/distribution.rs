@@ -2,7 +2,7 @@ use serde_json::Value;
 
 use super::storage::{Package, PackageSource};
 
-const BASE: &str = "https://raw.githubusercontent.com/magpie-community/plugins/dist/";
+const BASE: &str = "https://cdn.jsdelivr.net/gh/magpie-community/plugins@dist/";
 const INDEX_LIMIT: usize = 16 * 1024 * 1024;
 
 /// 官方分发索引（`dist` 分支的 `index.json`）：下载与「检查更新」共用一份读法。

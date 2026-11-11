@@ -32,8 +32,11 @@ async fn fetch(tag: &str, token: Option<&str>, repository: Option<&str>) -> Resu
     let repository = match repository.filter(|value| !value.trim().is_empty()) {
         Some(value) => value.trim().to_string(),
         _ => {
-            let index_url = format!("https://raw.githubusercontent.com/{}/main/app.json",
-                crate::server::core::plugin_host::update::INDEX_REPO);
+            let index_url = crate::server::core::update::jsdelivr::gh(
+                crate::server::core::plugin_host::update::INDEX_REPO,
+                "main",
+                "app.json",
+            );
             let index: Value = serde_json::from_slice(&get(&client, &index_url, None, 64 * 1024).await?)
                 .map_err(|_| UpdateError::new("官方更新索引格式异常"))?;
             if index["schema"] != 1 { return Err(UpdateError::new("官方更新索引版本不受支持")); }

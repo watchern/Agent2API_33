@@ -8,7 +8,7 @@ use tokio::sync::Notify;
 
 use super::{settings, update};
 use crate::server::core::task_state::{self, Claim, ManualBackoff};
-use crate::server::core::update::{rate_limit, UpdateError};
+use crate::server::core::update::{jsdelivr, rate_limit, UpdateError};
 use crate::server::logging;
 
 fn key() -> String {
@@ -91,7 +91,7 @@ fn snapshot_for(channels: crate::server::config::UpdateChannels) -> Value {
     result["current"] = json!(super::host_target());
     result["reason"] = json!(state.last_error);
     if state.last_error.is_some() {
-        let url = format!("https://raw.githubusercontent.com/{}/main/index.json", update::INDEX_REPO);
+        let url = jsdelivr::gh(update::INDEX_REPO, "main", "index.json");
         rate_limit::decorate_cached(&mut result, &url);
     }
     result["error"] = json!(state.last_error.is_some());

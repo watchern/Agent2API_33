@@ -111,6 +111,10 @@ pub async fn fetch_json(
     timeout_ms: u64,
     validate: impl Fn(&Value) -> bool + Sync,
 ) -> Result<JsonResponse, UpdateError> {
+    // jsDelivr 请求前确保线路已测速（缓存命中时是零成本的原子读）。
+    if super::jsdelivr::is(url) {
+        super::jsdelivr::ensure(false).await;
+    }
     super::selection::fetch_json(url, headers, timeout_ms, &validate).await
 }
 
@@ -128,6 +132,9 @@ async fn fetch_github(
     timeout_ms: Option<u64>,
     allow_mirror: bool,
 ) -> Result<reqwest::Response, UpdateError> {
+    if super::jsdelivr::is(url) {
+        super::jsdelivr::ensure(false).await;
+    }
     let mut candidates = source::candidates(url, allow_mirror);
     source::ensure_available(&candidates, headers)?;
     if allow_mirror && candidates.len() > 1 && config::github_access().mode == config::GithubAccessMode::Auto {

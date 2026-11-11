@@ -2,6 +2,8 @@
 
 mod check;
 mod download;
+/// jsDelivr 三线路路由与测速：宿主/插件的仓库文件读取统一走它。
+pub mod jsdelivr;
 pub mod capabilities;
 pub mod systemd;
 pub mod windows_service;

@@ -73,6 +73,10 @@ pub fn request_key(value: &str, context: &str) -> String {
 pub fn resource(value: &str) -> &'static str {
     if super::source::is_official_api(value) {
         "api"
+    } else if super::jsdelivr::is(value) {
+        // 索引类文件（app.json / index.json / registry.json / *.json）与
+        // 发行包 / 图标 / 插件压缩包分开记账，限流状态才不会串档。
+        if url::Url::parse(value).is_ok_and(|url| url.path().ends_with(".json")) { "index" } else { "download" }
     } else if url::Url::parse(value).is_ok_and(|url| url.host_str() == Some("raw.githubusercontent.com")) {
         "index"
     } else {
@@ -187,7 +191,7 @@ pub fn snapshot() -> Vec<Observation> {
     }
     let urls = [
         "https://api.github.com/repos/Agent2plugin/Agent2plugin/releases",
-        "https://raw.githubusercontent.com/Agent2plugin/Agent2plugin/main/index.json",
+        "https://cdn.jsdelivr.net/gh/Agent2plugin/Agent2plugin@main/index.json",
         "https://github.com/Agent2plugin/Agent2plugin/releases/download/current/package.zip",
     ];
     for url in urls {

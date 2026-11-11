@@ -1983,6 +1983,9 @@ pub fn shim_js() -> &'static str {
     setUpdateProxy: function (payload) { return call('POST', '/api/update/proxy', payload); },
     getGithubAccess: function () { return call('GET', '/api/update/github'); },
     setGithubAccess: function (payload) { return call('POST', '/api/update/github', payload); },
+    // 进入插件 / 更新页时先并发测速 jsDelivr 三条线路（与桌面 bridge 成对）
+    probeJsdelivr: function () { return call('POST', '/api/update/jsdelivr/probe'); },
+    getJsdelivrStatus: function () { return call('GET', '/api/update/jsdelivr'); },
     // GitHub 令牌：读只报 {filled, origin}，写传 {token: '…' | null}
     getUpdateToken: function () { return call('GET', '/api/update/token'); },
     setUpdateToken: function (payload) { return call('POST', '/api/update/token', payload); },

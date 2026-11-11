@@ -598,6 +598,10 @@ function showPage(name, { persist = true, checkUpdate = false } = {}) {
     window.wbTasksPanel?.load?.();
   }
   if (page === 'settings') {
+    // 进入「更新设置 / 插件」这类页面前先测速 jsDelivr 三条线路：并发探测
+    // 取最快的一条，后面本页所有索引/图标/包请求都走它。60 秒内重复切页
+    // 由后端限频，不会反复打 CDN。失败不阻塞页面（后端保留上次选择）。
+    void api.probeJsdelivr?.().catch(() => {});
     void window.wbSettingsPanel?.load?.({ checkUpdate });
   }
   // 切到签到中心时重拉一次快照：用户可能刚在账号页加/删了账号，或者刚在
@@ -609,6 +613,9 @@ function showPage(name, { persist = true, checkUpdate = false } = {}) {
   // 提供商插件页自持包列表与宿主状态，切进去时拉一次最新（用户可能刚在
   // 另一个窗口里手工换过包，或者宿主崩溃重启过）
   if (page === 'plugins') {
+    // 插件页的清单、图标、包下载全走 jsDelivr：切进来先测速选最快线路，
+    // 再让页面拉数据（探测与 load 并发，失败时后端会用上次选择兜底）。
+    void api.probeJsdelivr?.().catch(() => {});
     void window.wbPluginsPage?.load?.();
   }
   // 切到模型管理页时整页刷新一次：内置清单可能被上游刷新过，自定义家可能刚在

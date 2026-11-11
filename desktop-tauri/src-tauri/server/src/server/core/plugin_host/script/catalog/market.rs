@@ -4,8 +4,8 @@ use serde_json::Value;
 use super::network::{self, Failure};
 use super::types::{self, Entry};
 
-pub(super) const MARKET_URL: &str = "https://raw.githubusercontent.com/magpie-community/plugins/main/registry.json";
-const DISTRIBUTION_URL: &str = "https://raw.githubusercontent.com/magpie-community/plugins/dist/index.json";
+pub(super) const MARKET_URL: &str = "https://cdn.jsdelivr.net/gh/magpie-community/plugins@main/registry.json";
+const DISTRIBUTION_URL: &str = "https://cdn.jsdelivr.net/gh/magpie-community/plugins@dist/index.json";
 
 pub(super) fn project(value: &Value) -> Result<Vec<Entry>, Failure> {
     if value["version"] != 1 { return Err("Magpie 官方名单版本暂不兼容".to_string().into()); }

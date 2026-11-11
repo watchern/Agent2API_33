@@ -690,6 +690,10 @@ const BRIDGE_JS: &str = r#"
     setUpdateProxy: payload => call('POST', '/api/update/proxy', payload),
     getGithubAccess: () => call('GET', '/api/update/github'),
     setGithubAccess: payload => call('POST', '/api/update/github', payload),
+    // 进入插件 / 更新页时先并发测速 jsDelivr 三条线路，后续请求走最快的一条。
+    // 与 web_shim 的同名方法必须成对存在。
+    probeJsdelivr: () => call('POST', '/api/update/jsdelivr/probe'),
+    getJsdelivrStatus: () => call('GET', '/api/update/jsdelivr'),
     // 「软件更新」的 GitHub 令牌：读只报 {filled, origin}（后端永不回显本体），
     // 写传 {token: '…' | null}（null = 清除）。加密落库在后端做
     getUpdateToken: () => call('GET', '/api/update/token'),

@@ -138,9 +138,19 @@ async fn dispatch(
         return ok_json(state.update().last_check());
     }
 
+    // 进入插件 / 更新设置页时前端先打这条：并发测速三条 jsDelivr 线路并选用
+    // 最快的一条。GET 只读当前结论（不触发网络），POST 强制复测（60 秒限频）。
+    if method == Method::GET && full_path == "/api/update/jsdelivr" {
+        return ok_json(crate::server::core::update::jsdelivr::status());
+    }
+    if method == Method::POST && full_path == "/api/update/jsdelivr/probe" {
+        return ok_json(crate::server::core::update::jsdelivr::ensure(true).await);
+    }
+
     if method == Method::GET && full_path == "/api/update/github" {
         let mut value = json!(config::github_access());
         value["observations"] = crate::server::core::update::source::status();
+        value["jsdelivr"] = crate::server::core::update::jsdelivr::status();
         value["serverTime"] = json!(logging::now_ms());
         return ok_json(value);
     }

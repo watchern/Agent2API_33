@@ -32,6 +32,10 @@ pub(super) async fn fetch_json(
     timeout_ms: u64,
     validate: &(impl Fn(&Value) -> bool + Sync),
 ) -> Result<JsonResponse, UpdateError> {
+    // 直接调用本模块的路径也保证线路已选（fetch_json 公共入口之外还有内部调用）。
+    if super::jsdelivr::is(url) {
+        super::jsdelivr::ensure(false).await;
+    }
     let mut candidates = source::candidates(url, true);
     let context = candidates[0].context.clone();
     let cache_key = format!("{:x}", Sha256::digest(serde_json::to_vec(&(url, headers, &context)).unwrap_or_default()));

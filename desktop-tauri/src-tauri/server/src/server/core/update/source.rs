@@ -116,6 +116,8 @@ pub fn is_resource(value: &str) -> bool {
         "api.github.com" => url.path().starts_with("/repos/"),
         "raw.githubusercontent.com" | "codeload.github.com" => true,
         "github.com" | "www.github.com" => url.path().contains("/releases/download/"),
+        // jsDelivr 仓库文件：三条线路同形，路径固定 /gh/{owner}/{repo}@{ref}/…
+        _ if super::jsdelivr::is(value) => true,
         host => host.ends_with(".githubusercontent.com"),
     }
 }
@@ -134,6 +136,25 @@ pub(super) fn configured_candidates(value: &str, allow_mirror: bool) -> Vec<Cand
     let key = source_state::request_key(value, &context);
     let proxy = config::update_proxy();
     let egress = super::rate_limit::egress_key();
+    // jsDelivr 已经是 CDN：不再套「GitHub 加速前缀」（那类镜像只认 GitHub
+    // 域名，拼上 jsdelivr 前缀反而 404）。规范域在发请求前由 jsdelivr::route
+    // 换成测速选中的线路；这里把替换后的地址同时写进 original，保证重定向
+    // 白名单与限流观察都按真实主机记账。
+    if super::jsdelivr::is(value) {
+        let routed = super::jsdelivr::route(value);
+        return vec![Candidate {
+            url: routed.clone(),
+            original: routed,
+            source: Source::Official,
+            id: "official".to_string(),
+            key,
+            context,
+            proxy,
+            egress,
+            mode: settings.mode,
+            mirror_origin: None,
+        }];
+    }
     let official = Candidate {
         url: value.to_string(),
         original: value.to_string(),
