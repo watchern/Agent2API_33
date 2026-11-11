@@ -50,20 +50,20 @@ use crate::server::ServerState;
 /// 或响应卡在传输层 —— 而不是 handler 慢。每段耗时落在哪一格，痕迹里一眼可辨。
 pub async fn get_session(State(state): State<ServerState>) -> Response {
     let started = std::time::Instant::now();
-    crate::server::logging::log("[Session]", "→ 进入 handler（入口即日志：入口出现而出口不出现 = 卡在某个阶段内部）");
+    crate::server::logging::console("[Session]", "→ 进入 handler（入口即日志：入口出现而出口不出现 = 卡在某个阶段内部）");
     let mut stages: Vec<(&'static str, std::time::Duration)> = Vec::new();
     let snapshot = config::current();
     let plugin_startup = crate::server::core::plugin_host::startup::snapshot();
     // 可见账号与路由页预演共用同一份快照，插件未就绪的账号不参与。
     let accounts = {
-        crate::server::logging::log("[Session]", "→ 阶段：列表");
+        crate::server::logging::console("[Session]", "→ 阶段：列表");
         let stage = std::time::Instant::now();
         let value = state.store().list_visible_accounts();
         stages.push(("列表", stage.elapsed()));
         value
     };
     let routed = {
-        crate::server::logging::log("[Session]", "→ 阶段：路由预演");
+        crate::server::logging::console("[Session]", "→ 阶段：路由预演");
         let stage = std::time::Instant::now();
         let value = super::routing_api::queue_for_accounts(
             &state, snapshot.last_request_model().map(str::to_string), &crate::server::core::routing::accounts_of(&accounts),
@@ -74,7 +74,7 @@ pub async fn get_session(State(state): State<ServerState>) -> Response {
         value
     };
     let summary = {
-        crate::server::logging::log("[Session]", "→ 阶段：认证摘要");
+        crate::server::logging::console("[Session]", "→ 阶段：认证摘要");
         let stage = std::time::Instant::now();
         let value = state.auth().get_config_summary();
         stages.push(("认证摘要", stage.elapsed()));
@@ -85,19 +85,15 @@ pub async fn get_session(State(state): State<ServerState>) -> Response {
         .and_then(Value::as_bool)
         .unwrap_or(false);
     let payload = {
-        crate::server::logging::log("[Session]", "→ 阶段：会话状态（get_status）");
+        crate::server::logging::console("[Session]", "→ 阶段：会话状态（get_status）");
         let session_status = state.auth().get_status();
-        crate::server::logging::log("[Session]", "→ 阶段：模型聚合目录（session_models）");
+        crate::server::logging::console("[Session]", "→ 阶段：模型聚合目录（session_models）");
         let models_started = Instant::now();
         let models = crate::server::core::providers::catalog::session_models(state.store());
-        crate::server::logging::log_with_level(
-            "[Session]",
-            &format!("→ 模型聚合目录耗时 {} ms", models_started.elapsed().as_millis()),
-            "warn",
-        );
-        crate::server::logging::log("[Session]", "→ 阶段：代理摘要（proxies_summary）");
+        crate::server::logging::console("[Session]", &format!("→ 模型聚合目录耗时 {} ms", models_started.elapsed().as_millis()));
+        crate::server::logging::console("[Session]", "→ 阶段：代理摘要（proxies_summary）");
         let proxies = proxies_summary();
-        crate::server::logging::log("[Session]", "→ 阶段：插件账号能力（account_features）");
+        crate::server::logging::console("[Session]", "→ 阶段：插件账号能力（account_features）");
         let features = account_features();
         json!({
         "health": {
@@ -157,11 +153,7 @@ pub async fn get_session(State(state): State<ServerState>) -> Response {
             .map(|(name, elapsed)| format!("{name} {}ms", elapsed.as_millis()))
             .collect::<Vec<_>>()
             .join(" / ");
-        crate::server::logging::log_with_level(
-            "[Session]",
-            &format!("GET /api/session 总耗时 {} ms（{detail}）—— 超过 200ms 属异常，正常毫秒级", total.as_millis()),
-            "warn",
-        );
+        crate::server::logging::console("[Session]", &format!("GET /api/session 总耗时 {} ms（{detail}）—— 超过 200ms 属异常，正常毫秒级", total.as_millis()));
     }
     ok_json(payload)
 }

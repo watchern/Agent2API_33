@@ -457,9 +457,18 @@ async fn sweep_due(store: &AccountStore) {
     limiter::refresh(&all_accounts);
     limiter::enforce_disable(store, &all_accounts);
     let kinds = limiter::enabled_token_kinds(&all_accounts);
+    // Token 窗口事实的全量聚合要走 requests 大表（索引 GROUP BY，本机单轮
+    // 秒级），每 10 秒一轮会把唯一的 DB 连接反复占成秒级窗口 —— 任何触库
+    // 请求（含 /api/session 的阶段日志写）都在它后面排队。窗口读数本来就是
+    // 分钟级数据：降到 60 秒一轮，读数粒度无感知差异。
     if !kinds.is_empty() {
-        limiter::refresh_token_facts(&kinds);
-        enforce_token_disable(store, &all_accounts, now);
+        static LAST_TOKEN_FACTS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+        let last_facts = LAST_TOKEN_FACTS.load(std::sync::atomic::Ordering::Relaxed);
+        if now.saturating_sub(last_facts) >= 60_000 {
+            LAST_TOKEN_FACTS.store(now, std::sync::atomic::Ordering::Relaxed);
+            limiter::refresh_token_facts(&kinds);
+            enforce_token_disable(store, &all_accounts, now);
+        }
     }
     // 距上次自动查询不足一个间隔：这一轮只做 Token 记账，不发起查询
     let last = LAST_SWEEP_START.load(std::sync::atomic::Ordering::Relaxed);
