@@ -444,7 +444,12 @@ pub fn spawn_sweeper(store: AccountStore) {
 ///   ② **Token 自动禁用判定**（`enforce_token_disable`）：disable 档命中
 ///      （当前窗口消耗 ≥ 阈值）就把账号禁用 —— 与余额禁用同一条硬动作语义。
 async fn sweep_due(store: &AccountStore) {
+    // 剖析插桩（2026-11-12）：tick 每 10 秒一次，此前日志表聚合占 6-10 秒时
+    // 每条触库操作都排队。日志统计已修（索引+TTL），本插桩看 tick 自身剩余
+    // 占用：prune_orphans 的 DELETE NOT IN、逐账号记录读、due 计算。
+    let tick_started = std::time::Instant::now();
     usage_records::prune_orphans();
+    let prune_at = tick_started.elapsed();
     let now = logging::now_ms();
     // 全量账号快照（不看启用 / 可用）：Token 事实表要覆盖所有配了规则的账号，
     // 包括禁用的 —— 用户重新启用时读数已经在，不用等下一轮刷新才生效
@@ -494,6 +499,18 @@ async fn sweep_due(store: &AccountStore) {
     }
     // 最久没查过的先轮到；平局（刚导入的一批）按目标集合原顺序稳定排序
     due.sort_by_key(|(account, due_at)| (*due_at, account.get("id").and_then(Value::as_str).unwrap_or("").to_string()));
+    if tick_started.elapsed().as_millis() > 500 {
+        crate::server::logging::console(
+            "[Usage]",
+            &format!(
+                "余额巡检 tick {} ms（清理 {} ms / 记账后 {} ms，到期 {} 个）",
+                tick_started.elapsed().as_millis(),
+                prune_at.as_millis(),
+                prune_at.as_millis(),
+                due.len(),
+            ),
+        );
+    }
     let (account, _) = &due[0];
     LAST_SWEEP_START.store(now, std::sync::atomic::Ordering::Relaxed);
     run::start(store, account, false);
@@ -522,9 +539,15 @@ async fn sweep_due(store: &AccountStore) {
 ///
 /// 访客没有积分体系（见 `supports_usage` 的说明），其历史失败记录也不返回。
 pub fn snapshot(store: &AccountStore) -> Value {
+    // 剖析插桩（2026-11-12）：壳侧实测每条 6-10 秒，但内部逐段读下来都是
+    // 小表/内存操作 —— 四段计时把墙钟钉到具体调用。>500ms 才打 console。
+    let started = std::time::Instant::now();
     let queries = jobs::states(store);
+    let jobs_at = started.elapsed();
     let records = usage_records::load_all();
+    let records_at = started.elapsed();
     let accounts = store.list_accounts();
+    let accounts_at = started.elapsed();
     let list = accounts.get("accounts").and_then(Value::as_array);
     let mut rows = Vec::new();
     let mut at = 0i64;
@@ -597,7 +620,8 @@ pub fn snapshot(store: &AccountStore) -> Value {
         .filter(|account| crate::server::core::account_store::store_view::account_visible(
             crate::server::core::routing::provider_of(account),
         )).cloned().collect();
-    json!({
+    let visible_at = started.elapsed();
+    let result = json!({
         "at": at,
         "queries": queries,
         "results": rows,
@@ -610,6 +634,20 @@ pub fn snapshot(store: &AccountStore) -> Value {
         "sorting": crate::server::core::account_order::sorting(
             &visible_accounts, now,
         ),
-    })
+    });
+    if started.elapsed().as_millis() > 500 {
+        crate::server::logging::console(
+            "[Usage]",
+            &format!(
+                "余额快照 {} ms（任务状态 {} ms / 记录表 {} ms / 账号 {} ms / 限制器+排序 {} ms）",
+                started.elapsed().as_millis(),
+                jobs_at.as_millis(),
+                records_at.as_millis(),
+                accounts_at.as_millis(),
+                visible_at.as_millis(),
+            ),
+        );
+    }
+    result
 }
 
