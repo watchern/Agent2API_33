@@ -75,10 +75,15 @@ pub(crate) fn manifest_for_provider(provider: &str) -> Vec<Value> {
 }
 
 fn build_manifest_for_provider(provider: &str) -> Vec<Value> {
+    // 剖析插桩（2026-11-12）：单家构建实测 ~3 秒，但三段读下来都应是微秒级。
+    // 把「list_models（插件 rpc_cache / wasm aggregate）」「custom+meta」「能力
+    // 覆写」分开计时，超过 500ms 打 console——3 秒到底花在哪一段，一轮部署钉死。
+    let started = std::time::Instant::now();
     let Some(adapter) = adapter_by_id(provider) else {
         return Vec::new();
     };
     let mut models = adapter.list_models();
+    let list_at = started.elapsed();
     for item in model_rules::custom_models_for(provider) {
         let id = model_id(&item);
         if !id.is_empty()
@@ -92,7 +97,21 @@ fn build_manifest_for_provider(provider: &str) -> Vec<Value> {
     for item in models.iter_mut() {
         model_meta::apply(item);
     }
+    let meta_at = started.elapsed();
     model_rules::apply_capability_overrides(provider, &mut models);
+    if started.elapsed().as_millis() > 500 {
+        crate::server::logging::console(
+            "[Models]",
+            &format!(
+                "清单构建 {}（list_models {} ms / 元数据+自定义 {} ms / 能力覆写 {} ms，{} 个模型）",
+                provider,
+                list_at.as_millis(),
+                meta_at.as_millis(),
+                started.elapsed().as_millis(),
+                models.len(),
+            ),
+        );
+    }
     models
 }
 
