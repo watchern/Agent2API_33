@@ -64,8 +64,16 @@ pub fn request_key(value: &str, context: &str) -> String {
     let host = url.as_ref().and_then(|url| url.host_str()).unwrap_or("");
     let parts: Vec<_> = url.as_ref().map(|url| url.path().split('/').filter(|part| !part.is_empty()).collect())
         .unwrap_or_default();
-    let skip = usize::from(host == "api.github.com");
-    let repo = parts.iter().skip(skip).take(2).copied().collect::<Vec<_>>().join("/");
+    let repo = if super::jsdelivr::is(value) {
+        // /gh/{owner}/{repo}@{ref}/… —— 第二段带 @ref，去掉后才是仓库名。
+        // 三条线路共用同一个限流键：换线路不该把「这个仓库在冷却」这件事抹掉。
+        parts.get(1).map(|part| part.split('@').next().unwrap_or(part))
+            .map(|repo| format!("{}/{}", parts.first().copied().unwrap_or(""), repo))
+            .unwrap_or_default()
+    } else {
+        let skip = usize::from(host == "api.github.com");
+        parts.iter().skip(skip).take(2).copied().collect::<Vec<_>>().join("/")
+    };
     let bytes = serde_json::to_vec(&(context, host, repo, resource(value))).unwrap_or_default();
     format!("{:x}", Sha256::digest(bytes))
 }

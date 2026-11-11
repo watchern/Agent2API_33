@@ -37,6 +37,9 @@ async fn fetch(tag: &str, token: Option<&str>, repository: Option<&str>) -> Resu
                 "main",
                 "app.json",
             );
+            // 独立升级进程不走网关的 client::fetch_*：这里手动把规范域换成
+            // 当前测速选中的线路（进程刚启动时通常还没测过，用默认 fastly）。
+            let index_url = crate::server::core::update::jsdelivr::route(&index_url);
             let index: Value = serde_json::from_slice(&get(&client, &index_url, None, 64 * 1024).await?)
                 .map_err(|_| UpdateError::new("官方更新索引格式异常"))?;
             if index["schema"] != 1 { return Err(UpdateError::new("官方更新索引版本不受支持")); }
