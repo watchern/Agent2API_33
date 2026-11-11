@@ -1,0 +1,11 @@
+-- v30：日志表补 (level, id) 索引。
+--
+-- 为什么：管理面板每 20 秒拉一次「最新一条 error 日志」（未读失败角标的
+-- 水位查询：WHERE level='error' ORDER BY id DESC LIMIT 1），日志表在长期
+-- 运行的实例上是百万行级，无索引时每次都是全表扫描（实测单次 ~5 秒），
+-- 且扫描期间单连接互斥会把其它一切触库操作（余额查询、账号列表、阶段
+-- 日志写）排到 6-10 秒之后——账号页的余额查询因此批量超时。
+-- (level, id DESC) 让水位查询变成索引点查（毫秒级）。
+--
+-- 顺带服务按级别的筛选分页（同列序）。幂等：IF NOT EXISTS。
+CREATE INDEX IF NOT EXISTS idx_logs_level_id ON logs(level, id DESC);

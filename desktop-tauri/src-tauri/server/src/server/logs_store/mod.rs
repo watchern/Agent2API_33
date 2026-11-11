@@ -225,7 +225,7 @@ pub struct LogStore {
     query_cache: Mutex<VecDeque<CachedQuery>>,
     /// 全局统计（级别 / 分类条数）。日志页与导航角标都读它；没有新日志时
     /// 直接复用，避免每秒重扫整表。
-    stats_cache: Mutex<Option<(u64, Stats)>>,
+    stats_cache: Mutex<Option<(u64, std::time::Instant, Stats)>>,
 }
 
 struct CachedQuery {
@@ -494,8 +494,20 @@ impl LogStore {
                 .stats_cache
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if let Some((cached_epoch, stats)) = cache.as_ref() {
-                if *cached_epoch == epoch {
+            if let Some((cached_epoch, at, stats)) = cache.as_ref() {
+                // 两级失效：epoch（日志有增删，精确）+ 30 秒 TTL（时间兜底）。
+                //
+                // 只有 epoch 的问题：本机日志写频繁（每条 [HTTP] 到达、每条
+                // 阶段插桩都落库），epoch 每秒都在推进 —— stats 缓存永远
+                // 失效，前端 20 秒一轮的统计轮询每次都全表 GROUP BY（百万
+                // 行日志表实测 ~6 秒），扫描期间单连接互斥把余额查询、账号
+                // 列表全部排到 6-10 秒后（2026-11-12 账号页余额查询批量
+                // 超时的根因）。30 秒 TTL 意味着统计最多陈旧 30 秒 —— 角标
+                // 与日志页统计完全可接受，换来 DB 从「持续被统计占住」回到
+                // 「偶发一次聚合」。
+                if *cached_epoch == epoch
+                    && at.elapsed() < std::time::Duration::from_secs(30)
+                {
                     return stats.clone();
                 }
             }
@@ -535,7 +547,7 @@ impl LogStore {
         *self
             .stats_cache
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some((epoch, stats.clone()));
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some((epoch, std::time::Instant::now(), stats.clone()));
         stats
     }
 

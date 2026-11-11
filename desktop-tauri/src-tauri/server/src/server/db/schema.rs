@@ -347,7 +347,13 @@ pub fn is_reserved(key: &str) -> bool {
 /// 请求日志新增「积分」列读它。与 token 四列刻意不同：这一列**可空 REAL** ——
 /// `NULL` = 这一家没上报（旧行 / 不提供该读数），0 = 确实零消耗；用 0 兜底会
 /// 把「没读到」画成「花了 0 积分」，比缺一列更难排查。
-pub const SCHEMA_VERSION: i64 = 29;
+///
+/// ── 版本 30：logs 补 (level, id DESC) 索引（[`schema_logs_level`]）────
+/// 未读失败角标的水位查询（WHERE level='error' ORDER BY id DESC LIMIT 1，
+/// 管理面板 20 秒一轮）在百万行日志表上无索引即全表扫（实测 ~5 秒），且
+/// 扫描期间单连接互斥把余额查询/账号列表全部排到 6-10 秒后——账号页余额
+/// 查询因此批量超时。见 schema_logs_level.sql 的头部说明。
+pub const SCHEMA_VERSION: i64 = 30;
 
 /// 版本 1 的全部表与索引：改造前所有 JSON / JSONL 文件的对应形态。
 ///
@@ -1087,6 +1093,9 @@ fn apply_version(
         27 => conn.execute_batch(include_str!("schema_coding.sql")),
         28 => conn.execute_batch(include_str!("schema_model_recency.sql")),
         29 => conn.execute_batch(include_str!("schema_usage_query.sql")),
+        // v30：logs 补 (level, id DESC) 索引（未读失败角标水位查询的根治，
+        // 见 schema_logs_level.sql 头部说明）
+        30 => conn.execute_batch(include_str!("schema_logs_level.sql")),
         _ => Ok(()),
     }
 }
