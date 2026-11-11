@@ -183,8 +183,19 @@ pub(crate) fn queue_json(state: &ServerState, model: Option<String>) -> Value {
 }
 
 pub(crate) fn queue_for_accounts(state: &ServerState, model: Option<String>, accounts: &[Value]) -> Value {
+    // 分段计时（2026-11-12 剖析插桩）：路由预演段实测 9-21 秒，但逐段读下来
+    // 全是内存操作 —— 用这段计时把墙钟花在哪个调用上钉死。>1 秒才打。
+    let started = std::time::Instant::now();
     if let Some(group) = model.as_deref().and_then(|model| config::routing_profiles().group_for_model(model).cloned()) {
-        return super::routing_groups::group_queue(state, group);
+        let group_model = group.model.clone();
+        let result = super::routing_groups::group_queue(state, group);
+        if started.elapsed().as_millis() > 1_000 {
+            crate::server::logging::console(
+                "[Routing]",
+                &format!("路由预演（路由组 {}）耗时 {} ms", group_model, started.elapsed().as_millis()),
+            );
+        }
+        return result;
     }
     let snapshot = config::current();
     // 候选收窄：点名了模型 → 只留「清单里有它的家」（与转发同一张家清单，
@@ -213,11 +224,13 @@ pub(crate) fn queue_for_accounts(state: &ServerState, model: Option<String>, acc
         .snapshot()
         .into_iter()
         .collect();
+    let connections_at = started.elapsed();
     let keys = routing::CooldownKeys::new(model.as_deref().unwrap_or(""));
     // 限制器软跳过与转发的选路同一判据（被拦的账号在面板上也是「跳过」，
     // 原因写明是限制器而不是限流 —— 两回事）
     let facts = crate::server::core::limiter::sources::facts();
     let limiter_counts = crate::server::core::limiter::counter::facts();
+    let facts_at = started.elapsed();
     let limiter_blocked: HashSet<String> = scoped
         .iter()
         .filter(|account| crate::server::core::limiter::evaluate::blocked(
@@ -241,6 +254,7 @@ pub(crate) fn queue_for_accounts(state: &ServerState, model: Option<String>, acc
         sticky_account: None,
     };
     let plan = routing::plan_route(&scoped, &keys, &counts, &[], now, &meta);
+    let planned_at = started.elapsed();
     let entry_json = |entry: &routing::PlanEntry| {
         json!({
             "id": entry.id,
@@ -253,7 +267,7 @@ pub(crate) fn queue_for_accounts(state: &ServerState, model: Option<String>, acc
             "priority": entry.account.get("priority").cloned().unwrap_or(Value::Null),
         })
     };
-    json!({
+    let result = json!({
         "strategy": settings.strategy.as_str(),
         "sticky": settings.sticky.as_str(),
         "model": model.clone().map(Value::String).unwrap_or(Value::Null),
@@ -262,5 +276,19 @@ pub(crate) fn queue_for_accounts(state: &ServerState, model: Option<String>, acc
         "pickedId": plan.ordered.first().map(|entry| entry.id.clone()).unwrap_or_default(),
         "ordered": plan.ordered.iter().map(entry_json).collect::<Vec<_>>(),
         "blocked": plan.blocked.iter().map(entry_json).collect::<Vec<_>>(),
-    })
+    });
+    if started.elapsed().as_millis() > 1_000 {
+        crate::server::logging::console(
+            "[Routing]",
+            &format!(
+                "路由预演耗时 {} ms（连接数 {} ms / 限流事实 {} ms / 选路 {} ms，账号 {} 个）",
+                started.elapsed().as_millis(),
+                connections_at.as_millis(),
+                facts_at.as_millis(),
+                planned_at.as_millis(),
+                scoped.len(),
+            ),
+        );
+    }
+    result
 }

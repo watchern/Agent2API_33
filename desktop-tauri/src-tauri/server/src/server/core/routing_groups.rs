@@ -178,13 +178,20 @@ pub fn validate_members(group: &RoutingGroup, old: Option<&RoutingGroup>, accoun
 
 pub fn append_public(store: &AccountStore, scope: Option<&KeyScope>, data: &mut Vec<Value>) {
     let accounts = store.routing_snapshot();
+    // 一家的清单在本轮只建一次：catalog_model 逐成员调 manifest(provider)，
+    // 而清单构建（list_models + 元数据 + 能力覆写）在大家数 × 大清单下是
+    // 本轮目录构建里最重的一段（2026-11-12 剖析插桩的假定热点）。
+    let mut manifests: std::collections::HashMap<String, Vec<Value>> = std::collections::HashMap::new();
     for group in config::routing_profiles().groups.values() {
         if !key_scope::allows_model(scope, &group.model) || data.iter().any(|item| model_id(item).eq_ignore_ascii_case(&group.model)) { continue; }
         let members: Vec<_> = group.members.iter().filter(|member| member.included && key_scope::allows_provider(scope, &member.provider)
             && provider_active(&member.provider)
             && accounts.available_providers.contains(&member.provider) && member.accounts.iter().any(|id|
                 accounts.accounts.iter().any(|account| routing::account_id(account) == Some(id) && routing::provider_of(account) == member.provider && account.get("enabled") != Some(&Value::Bool(false)))))
-            .filter_map(|member| catalog_model(&member.provider, &member.model)).filter(|item| !providers::images::model_is_image(item)).collect();
+            .filter_map(|member| {
+                let items = manifests.entry(member.provider.clone()).or_insert_with(|| manifest(&member.provider));
+                items.iter().find(|item| model_id(item).eq_ignore_ascii_case(&member.model)).cloned()
+            }).filter(|item| !providers::images::model_is_image(item)).collect();
         if members.is_empty() { continue; }
         let mut item = json!({ "id": group.model, "name": group.name, "object": "model", "owned_by": "routing-group", "kind": "chat", "routing_group": true });
         for (key, public) in [("supportsToolCall", "supports_tool_call"), ("supportsImages", "supports_images"),

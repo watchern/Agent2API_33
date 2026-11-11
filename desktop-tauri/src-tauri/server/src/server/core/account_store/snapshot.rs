@@ -98,6 +98,9 @@ impl AccountStore {
     }
 
     fn build_routing_snapshot(&self, db: &crate::server::db::Db, revision: u64, metadata: u64) -> Arc<RoutingSnapshot> {
+        // 剖析插桩（2026-11-12）：增量构建实测 2-6 秒（正常应毫秒级），
+        // 把「DB 读密文行」与「解密+投影」分开计时，超过 1 秒打 console。
+        let build_started = Instant::now();
         let cache = self.snapshot_cache();
         // build.lock 已由调用方（routing_snapshot）持有 try_lock，这里不再重复取。
         // 锁内第二检也已在调用方完成，这里直接开始构建。
@@ -139,6 +142,8 @@ impl AccountStore {
             previous.as_ref().map(|(_, _, _, _, decoded)| (**decoded).clone()).unwrap_or_default()
         };
         let mut failed = 0;
+        let changed_rows = changes.len();
+        let db_read_at = build_started.elapsed();
         for (rowid, raw) in changes {
             rows.remove(&rowid);
             decoded.remove(&rowid);
@@ -154,6 +159,18 @@ impl AccountStore {
         }
         if failed > 0 {
             super::sql::warn_load_failure("读取选路账号", &format!("{failed} 条账号记录解密或解析失败，已跳过；原始数据未修改"));
+        }
+        if build_started.elapsed().as_millis() > 1_000 {
+            crate::server::logging::console(
+                "[Storage]",
+                &format!(
+                    "路由快照构建 {} ms（DB 读密文行 {} ms，变更 {} 行，全量={}）",
+                    build_started.elapsed().as_millis(),
+                    db_read_at.as_millis(),
+                    changed_rows,
+                    replace,
+                ),
+            );
         }
         let snapshot = Arc::new(RoutingSnapshot::from_rows(&rows));
         // 缓存**无条件写入**（2026-11-11 活锁修复）。

@@ -78,27 +78,44 @@ fn public_builtin_items(active: &[(String, Vec<Value>)]) -> Vec<(String, Value)>
 }
 
 pub fn models_response(store: &AccountStore, scope: Option<&KeyScope>) -> Value {
-    // 无 scope 的聚合目录走**版本号缓存**（2026-11-11）。
+    // 无 scope 的聚合目录走**内容指纹缓存**（2026-11-12）。
     //
-    // /api/session 首屏与 /v1/models 都在这条热路径上：完整建一次目录要遍历
-    // 全部提供商清单 + 应用规则 + 自定义家 + 路由组，这台机器的 211MB 库上
-    // 单次就是几十秒的纯 CPU（实测 session_models 段 53s）。缓存的失效键与
-    // 选路快照完全一致 —— 账号 revision（可用家变化）+ 目录 generation
-    // （清单 / 规则 / 自定义家 / 路由组变化），任一推进即失效重建，语义与
-    // 不缓存时逐字相同，只是把「每请求重算」变成「每版本重算」。
+    // /api/session 首屏与 /v1/models 都在这条热路径上，完整建一次目录在
+    // 本机是几十秒级（见下方插桩说明）。缓存键曾经是「账号 revision +
+    // 目录 generation」，但实测（beta.8）revision 每 ~12 秒就被推进一次 ——
+    // 提供商目录刷新后写账号台账（usageCredentialRevision），update_hook
+    // 把它计为一次账号行变更 —— 而台账写**不改变模型清单的任何内容**：
+    // 清单只取决于「哪些家可用」+ 目录 generation + 自定义家/路由组配置。
+    // 于是缓存每轮轮询必失效，40-90 秒的重建每轮都跑。
+    //
+    // 现在的键是「可用提供商集合指纹 + 目录 generation」：台账写不改变
+    // available_providers（启用/凭证变化才会），缓存稳定命中；用户启停
+    // 账号、装/卸插件（available_providers 变）或改模型规则/自定义家/
+    // 路由组（generation 变）时照常失效。语义差异只有一处：路由组条目
+    // 对「成员账号是否存在」的匹配在账号行变更后延迟一轮 —— 台账写不
+    // 启停账号，实际不可见。
+    //
     // 带 scope 的调用（受限 Key 过滤）走原路径，不进缓存。
     if scope.is_none() {
-        if let Some(db) = store.database() {
-            let revision = db.account_revision();
+        if store.database().is_some() {
+            let snapshot = store.routing_snapshot();
+            let mut providers: Vec<&String> = snapshot.available_providers.iter().collect();
+            providers.sort();
+            let fingerprint = {
+                use std::hash::{Hash, Hasher};
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                providers.hash(&mut hasher);
+                hasher.finish()
+            };
             let metadata = super::generation();
             if let Some(cached) = MODELS_CACHE.read().ok().and_then(|guard| guard.clone()) {
-                if cached.0 == revision && cached.1 == metadata {
+                if cached.0 == fingerprint && cached.1 == metadata {
                     return (*cached.2).clone();
                 }
             }
             let built = models_response_with_active(store, scope, active_manifests(store));
             if let Ok(mut guard) = MODELS_CACHE.write() {
-                *guard = Some((revision, metadata, std::sync::Arc::new(built.clone())));
+                *guard = Some((fingerprint, metadata, std::sync::Arc::new(built.clone())));
             }
             return built;
         }
@@ -106,7 +123,7 @@ pub fn models_response(store: &AccountStore, scope: Option<&KeyScope>) -> Value 
     models_response_with_active(store, scope, active_manifests(store))
 }
 
-/// 无 scope 聚合目录的版本号缓存：`(account_revision, catalog_generation, Value)`。
+/// 无 scope 聚合目录的内容指纹缓存：`(可用提供商指纹, catalog_generation, Value)`。
 static MODELS_CACHE: std::sync::RwLock<
     Option<(u64, u64, std::sync::Arc<Value>)>,
 > = std::sync::RwLock::new(None);
@@ -116,6 +133,10 @@ pub(super) fn models_response_with_active(
     scope: Option<&KeyScope>,
     active: Vec<(String, Vec<Value>)>,
 ) -> Value {
+    // 分段计时（2026-11-12 剖析插桩）：实测 session_models 段 40-90 秒，
+    // 但整条路径读下来全是内存操作 —— 用这四段计时把「到底哪段慢」钉死。
+    // 超过 1 秒才打（console，不落库），正常请求零开销。
+    let started = std::time::Instant::now();
     let active: Vec<_> = active.into_iter()
         .filter(|(provider, _)| key_scope::allows_provider(scope, provider))
         .collect();
@@ -124,11 +145,29 @@ pub(super) fn models_response_with_active(
         .map(|(_, item)| item)
         .filter(|item| key_scope::allows_model(scope, &model_id(item)))
         .collect();
+    let builtin_at = started.elapsed();
     let builtin_count = data.len();
     super::super::custom::append_models_response(store, scope, &mut data);
+    let custom_at = started.elapsed();
     crate::server::core::routing_groups::append_public(store, scope, &mut data);
+    let groups_at = started.elapsed();
     let source = if data.len() > builtin_count { "aggregate" } else { source };
-    list_response_from(data, source, refreshed_at)
+    let result = list_response_from(data, source, refreshed_at);
+    if started.elapsed().as_millis() > 1_000 {
+        crate::server::logging::console(
+            "[Models]",
+            &format!(
+                "模型目录构建 {} ms（内置 {} ms / 自定义 {} ms / 路由组 {} ms，共 {} 条，家 {} 个）",
+                started.elapsed().as_millis(),
+                builtin_at.as_millis(),
+                custom_at.as_millis(),
+                groups_at.as_millis(),
+                builtin_count,
+                active.len(),
+            ),
+        );
+    }
+    result
 }
 
 /// 一家可用提供商都没有时（没加账号），入口校验要跳过「广告里有才放行」与
