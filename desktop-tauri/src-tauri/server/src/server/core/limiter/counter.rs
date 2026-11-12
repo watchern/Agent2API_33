@@ -1,4 +1,5 @@
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use chrono::{Datelike, Duration, Local, TimeZone};
@@ -111,7 +112,11 @@ pub fn facts() -> Facts {
     facts.clone()
 }
 
-pub fn invalidate() { if let Ok(mut facts) = slot().lock() { facts.clear(); } }
+pub fn invalidate() {
+    if let Ok(mut facts) = slot().lock() { facts.clear(); }
+    // 规则变了：把节流戳归零，sweeper 下一轮 tick 立即全量重算，不用等满间隔。
+    LAST_FULL_REFRESH.store(0, Ordering::Relaxed);
+}
 
 pub fn channel_of(account: &serde_json::Value) -> String {
     account.get("quotaChannel").or_else(|| account.get("zcodePlan"))
@@ -176,7 +181,34 @@ pub fn window_for(condition: &Condition) -> Option<Window> {
     condition.window.clone().or_else(|| condition.source.as_ref()?.window.clone())
 }
 
-pub fn refresh(accounts: &[serde_json::Value]) { refresh_inner(accounts, true); }
+// ─── 全量事实重算的节流（2026-11-13） ────────────────────────
+//
+// refresh_inner(accounts, true) 会为每个账号、每条 Token/Requests 条件各跑
+// 一次 account_limiter_events 区间查询，并替换整份内存事实表。它走的是唯一
+// 一把 DB 连接锁：sweeper 每 10 秒调一次、旧版快照接口每次请求再调一次，
+// 遇上账号多 / 事件表大就是秒级占用，后面所有触库请求（含 /api/session、
+// 日志统计、/health）全部排队 —— trace 里 6–14 秒的余额快照与 3 秒的
+// 「数据库连接等待」就是这么来的。窗口消耗本来就是分钟级数据，请求收尾
+// 还有 note() 增量记账兜着，60 秒全量对齐一次足够；单账号规则编辑仍走
+// 不节流的 refresh_account。
+const FULL_REFRESH_INTERVAL_MS: i64 = 60_000;
+static LAST_FULL_REFRESH: AtomicI64 = AtomicI64::new(0);
+
+/// 按节流间隔做一次全量重算；未到期直接返回，不碰数据库。
+pub fn refresh(accounts: &[serde_json::Value]) {
+    let now = logging::now_ms();
+    let last = LAST_FULL_REFRESH.load(Ordering::Relaxed);
+    if last > 0 && now.saturating_sub(last) < FULL_REFRESH_INTERVAL_MS { return; }
+    // CAS 单飞：sweeper 与并发调用只有一个真正去扫表，避免同一瞬间排两次全量
+    // 聚合。失败说明别的线程已经接手，本次直接返回。
+    if LAST_FULL_REFRESH
+        .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+        .is_err()
+    {
+        return;
+    }
+    refresh_inner(accounts, true);
+}
 
 pub fn refresh_account(account: &serde_json::Value) {
     refresh_inner(std::slice::from_ref(account), false);

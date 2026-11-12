@@ -53,6 +53,9 @@ impl Job {
             "id": self.id, "requestId": self.request_id, "queryStatus": status,
             "usage": Value::Null, "error": Value::Null, "at": logging::now_ms(),
         })));
+        // 快照缓存按版本号失效：任务状态变化要让下一次 800ms 轮询立刻看见，
+        // 不能等 1.5 秒 TTL。原子操作不取锁，与快照那条锁链不会互等。
+        super::invalidate_snapshot();
     }
 }
 
@@ -77,6 +80,7 @@ pub(super) fn begin(store: &AccountStore, id: &str, replace: bool) -> Option<(Ar
         account, config, cancel: CancellationToken::new(), started_at: now, timeout_seconds,
         deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_seconds), result });
     registry.jobs.insert(id.to_string(), job.clone());
+    super::invalidate_snapshot();
     crate::server::core::usage_records::mark_attempt(id);
     Some((job, true))
 }
@@ -90,6 +94,7 @@ pub(super) fn finish(job: &Arc<Job>, action: impl FnOnce() -> Option<Value>) -> 
         "timeout"
     } else if row.get("error").and_then(Value::as_str).is_some() { "failed" } else { "success" });
     job.result.send_replace(Some(row));
+    super::invalidate_snapshot();
     true
 }
 

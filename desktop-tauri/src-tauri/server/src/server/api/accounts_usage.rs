@@ -73,5 +73,13 @@ pub fn cancel_usage(body: &Bytes) -> Response {
 
 /// GET /api/accounts/usage/snapshot：历史读数与当前任务状态分别返回。
 pub async fn accounts_usage_snapshot(state: &ServerState) -> Response {
-    ok_json(usage_query::snapshot(state.store()))
+    // 快照构造整条是同步的（账号公开形态 → 限制器投影 → 排序）。旧实现直接
+    // 跑在 axum 的 tokio worker 上：一条 6–14 秒的慢请求就占住一个 worker，
+    // 几条并发足以让整个管理面板（含 /api/session）停摆。移到 blocking 线程池，
+    // worker 只负责等结果；配合 usage_query 的短缓存，多数请求只取一份现成 JSON。
+    let store = state.store().clone();
+    let snapshot = tokio::task::spawn_blocking(move || usage_query::snapshot(&store))
+        .await
+        .unwrap_or_else(|_| json!({ "at": 0, "results": [], "queries": [], "skipped": 0 }));
+    ok_json(snapshot)
 }

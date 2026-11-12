@@ -2,7 +2,9 @@
 //! 配置变化、取消和替换使旧任务失效，结果提交与限制器判定使用同一份有效配置。
 //! 单次上游超时之外，整轮查询还有独立的总时限，重试不能越过该时限。
 
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
@@ -314,7 +316,10 @@ pub(crate) fn supports_usage_provider(provider_id: &str) -> bool {
         .unwrap_or(false)
 }
 
-pub fn refresh_configuration(store: &AccountStore) { jobs::reconcile(store); }
+pub fn refresh_configuration(store: &AccountStore) {
+    jobs::reconcile(store);
+    invalidate_snapshot();
+}
 
 pub fn start_queries(store: &AccountStore, id: Option<&str>, replace: bool) -> Result<Value, TargetError> {
     let single = id.filter(|value| !value.is_empty());
@@ -324,6 +329,8 @@ pub fn start_queries(store: &AccountStore, id: Option<&str>, replace: bool) -> R
     if queries.len() != targets.len() {
         return Err(TargetError { message: "部分余额查询未能启动，请检查账号与数据库状态".to_string(), status_code: 503 });
     }
+    // 新任务刚登记，下一次 800ms 轮询必须立刻看到 running 状态，不能吃 1.5 秒缓存
+    invalidate_snapshot();
     Ok(json!({ "queries": queries, "skipped": skipped }))
 }
 
@@ -333,6 +340,7 @@ pub async fn query_all(store: &AccountStore, id: Option<&str>) -> Result<Value, 
     let queries: Vec<_> = targets.iter().filter(|account| single.is_some() || supports_usage(account))
         .filter_map(|account| run::start(store, account, false)).map(jobs::wait).collect();
     let results = futures::future::join_all(queries).await;
+    invalidate_snapshot();
     Ok(json!({ "results": results, "skipped": skipped }))
 }
 
@@ -461,6 +469,7 @@ async fn sweep_due(store: &AccountStore) {
         .unwrap_or_default();
     limiter::refresh(&all_accounts);
     limiter::enforce_disable(store, &all_accounts);
+    let limiter_at = tick_started.elapsed();
     let kinds = limiter::enabled_token_kinds(&all_accounts);
     // Token 窗口事实的全量聚合要走 requests 大表（索引 GROUP BY，本机单轮
     // 秒级），每 10 秒一轮会把唯一的 DB 连接反复占成秒级窗口 —— 任何触库
@@ -503,10 +512,11 @@ async fn sweep_due(store: &AccountStore) {
         crate::server::logging::console(
             "[Usage]",
             &format!(
-                "余额巡检 tick {} ms（清理 {} ms / 记账后 {} ms，到期 {} 个）",
+                "余额巡检 tick {} ms（清理 {} / 限制器 {} / 到期计算 {} ms，到期 {} 个）",
                 tick_started.elapsed().as_millis(),
                 prune_at.as_millis(),
-                prune_at.as_millis(),
+                limiter_at.saturating_sub(prune_at).as_millis(),
+                tick_started.elapsed().saturating_sub(limiter_at).as_millis(),
                 due.len(),
             ),
         );
@@ -539,9 +549,23 @@ async fn sweep_due(store: &AccountStore) {
 ///
 /// 访客没有积分体系（见 `supports_usage` 的说明），其历史失败记录也不返回。
 pub fn snapshot(store: &AccountStore) -> Value {
-    // 剖析插桩（2026-11-12）：壳侧实测每条 6-10 秒，但内部逐段读下来都是
-    // 小表/内存操作 —— 四段计时把墙钟钉到具体调用。>500ms 才打 console。
-    let started = std::time::Instant::now();
+    let epoch = SNAPSHOT_EPOCH.load(Ordering::Relaxed);
+    let mut cache = snapshot_cache().lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some((at, cached_epoch, value)) = cache.as_ref() {
+        if at.elapsed() < SNAPSHOT_TTL && *cached_epoch == epoch {
+            return value.clone();
+        }
+    }
+    let value = build_snapshot(store);
+    *cache = Some((Instant::now(), epoch, value.clone()));
+    value
+}
+
+fn build_snapshot(store: &AccountStore) -> Value {
+    // 剖析插桩（2026-11-12 加，2026-11-13 修正）：壳侧实测每条 6-10 秒。
+    // 五段计时把墙钟钉到具体调用；排序原先写在 json! 里、落在计时点之后，
+    // 那段耗时被算进「总计 - 限制器」的差额里，容易误读，现提到计时点之前。
+    let started = Instant::now();
     let queries = jobs::states(store);
     let jobs_at = started.elapsed();
     let records = usage_records::load_all();
@@ -603,7 +627,9 @@ pub fn snapshot(store: &AccountStore) -> Value {
             token_usage.insert(id.to_string(), Value::Array(entries));
         }
     }
-    if let Some(accounts) = list { limiter::counter::refresh(accounts); }
+    // 全量事实重算（counter::refresh）只在 sweeper 里按 60 秒节流跑，读路径
+    // 一律投影内存事实表。旧实现每次快照都全量扫 account_limiter_events，
+    // 在「单连接互斥」下把一条只读接口变成整网关的写锁持有者。
     let source_facts = limiter::sources::facts();
     let counts = limiter::counter::facts();
     let mut limiter_states = serde_json::Map::new();
@@ -621,6 +647,10 @@ pub fn snapshot(store: &AccountStore) -> Value {
             crate::server::core::routing::provider_of(account),
         )).cloned().collect();
     let visible_at = started.elapsed();
+    // 排序必须排在计时点之前：原先写在 json! 里，耗时落进了「总计 - 限制器」
+    // 的差额，四段日志看起来对不上总耗时。
+    let sorting = crate::server::core::account_order::sorting(&visible_accounts, now);
+    let sorted_at = started.elapsed();
     let result = json!({
         "at": at,
         "queries": queries,
@@ -631,23 +661,59 @@ pub fn snapshot(store: &AccountStore) -> Value {
         "limiterStates": limiter_states,
         "quotaSources": quota_sources,
         "limiterModels": limiter_models,
-        "sorting": crate::server::core::account_order::sorting(
-            &visible_accounts, now,
-        ),
+        "sorting": sorting,
     });
-    if started.elapsed().as_millis() > 500 {
+    let total = started.elapsed();
+    if total.as_millis() > 500 {
         crate::server::logging::console(
             "[Usage]",
             &format!(
-                "余额快照 {} ms（任务状态 {} ms / 记录表 {} ms / 账号 {} ms / 限制器+排序 {} ms）",
-                started.elapsed().as_millis(),
+                "余额快照 {} ms（任务状态 {} / 记录表 {} / 账号 {} / 限制器 {} / 排序 {} ms）",
+                total.as_millis(),
                 jobs_at.as_millis(),
-                records_at.as_millis(),
-                accounts_at.as_millis(),
-                visible_at.as_millis(),
+                records_at.saturating_sub(jobs_at).as_millis(),
+                accounts_at.saturating_sub(records_at).as_millis(),
+                visible_at.saturating_sub(accounts_at).as_millis(),
+                sorted_at.saturating_sub(visible_at).as_millis(),
             ),
         );
     }
     result
+}
+
+// ─── 快照结果缓存（2026-11-13） ───────────────────────────────
+//
+// 账号页同时有三条读：20 秒一轮的常规刷新、余额任务进行中每 800ms 一轮的
+// 状态轮询、以及签到/领取成功后的立即补查。旧实现每次请求都从头构造整份
+// 快照（账号公开形态 → 限制器投影 → 排序），其中 counter::refresh 每轮还要
+// 全量重扫 account_limiter_events。所有触库操作共用唯一一把 DB 连接锁，
+// 这些请求因此互相排队：trace 实测单条 6–14 秒，并把 /api/session、日志
+// 统计、健康检查一起堵在后面 —— 「账号中心刷新卡死」就是这个队列；前端读
+// 快照只有 5 秒时限，于是余额读数每次都被丢弃，界面自然一直显示不出来。
+//
+// TTL 1.5 秒只挡重复计算：覆盖 800ms 轮询的相邻两轮，账号变更与余额结果
+// 最多 1.5 秒后可见；任务状态变化（开始/完成/取消）显式调 invalidate_snapshot，
+// 用户点「查询余额」后下一轮立即拿到新结果。整份构造放在 Mutex 内完成，
+// 天然单飞：并发请求只有第一个在算，其余等它写回后直接取缓存，不会一起
+// 抢 DB 锁。持锁的是 blocking 线程（见 api::accounts_usage），不占 tokio worker。
+
+/// 快照结果的缓存时限。
+const SNAPSHOT_TTL: Duration = Duration::from_millis(1500);
+
+/// 缓存版本号：任务状态一变就 +1，迫使下一次快照重算。
+///
+/// 用原子而不是「加锁清空缓存」是为了避开锁顺序反转：build_snapshot 持缓存锁
+/// 时会调 jobs::states 取任务注册表锁，若失效方反过来持注册表锁再抢缓存锁，
+/// 两边就会互等。原子加法不拿任何锁，从根上消除这条死锁路径。
+static SNAPSHOT_EPOCH: AtomicU64 = AtomicU64::new(0);
+
+fn snapshot_cache() -> &'static Mutex<Option<(Instant, u64, Value)>> {
+    static CACHE: OnceLock<Mutex<Option<(Instant, u64, Value)>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(None))
+}
+
+/// 让下一次快照立即重算（余额任务开始 / 结束 / 取消时调用）。
+pub(crate) fn invalidate_snapshot() {
+    SNAPSHOT_EPOCH.fetch_add(1, Ordering::Relaxed);
 }
 
