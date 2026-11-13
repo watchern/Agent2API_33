@@ -335,10 +335,14 @@ impl StoredAccount {
 
     /// 最近一次**领取 ZCode 套餐成功**的时刻（毫秒时间戳，0 = 从未领过）。
     ///
-    /// 与 `checkinAt` 刻意分开：ZCode 没有签到，它的运营玩法是限时发放的套餐
-    /// （2026 那期是「每天登录领 1 亿」，见 `providers::zcode::claim` 的模块头），
-    /// 界面据此显示「今日已领」并在次日恢复按钮。混用签到那个字段会让两家的
-    /// 状态互相污染 —— 改 ZCode 的领取状态会顺手点亮别家的签到按钮。
+    /// 与 `checkinAt` 刻意分开：ZCode 没有签到接口，它的运营玩法是限时发放的
+    /// 套餐（2026 那期是「每天登录领 1 亿」，见 `providers::zcode::claim` 的
+    /// 模块头），界面据此显示「今日已领」并在次日恢复按钮。
+    ///
+    /// 2026-11-14 起 `checkin_state::zcode_claimed_today` 也会读本字段：用户口径
+    /// 是「ZCode 的活动领取成功即视为今日已签」，于是签到中心 / 排程 / 重试
+    /// 判「今天做没做」时把当日领取也算进来。两个字段仍各写各的、互不覆盖：
+    /// 签到链写 `checkinAt`，领取链写 `claimAt`。
     pub fn claim_at(&self) -> i64 {
         integer_of(self.fields.get("claimAt"))
     }
