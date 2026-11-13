@@ -114,14 +114,28 @@ pub fn project(group: &RoutingGroup, accounts: &[Value], needs: &RequestNeeds, s
 
 pub fn project_with_vision(group: &RoutingGroup, accounts: &[Value], needs: &RequestNeeds, scope: Option<&KeyScope>,
     vision: Option<&config::vision_compat::VisionSettings>) -> GroupProjection {
+    let started = std::time::Instant::now();
     let mut result = GroupProjection::default();
     let by_id: HashMap<_, _> = accounts.iter().filter_map(|account| routing::account_id(account).map(|id| (id, account))).collect();
-    let manifests: HashMap<_, _> = group.members.iter().map(|member| member.provider.clone()).collect::<HashSet<_>>()
-        .into_iter().map(|id| { let items = manifest(&id); (id, items) }).collect();
+    // ── 按家预计算（2026-11-14 beta-0 插桩结论）──────────────────────
+    // 成员数（本机 36）远多于家数（约 5），而清单、可用性、展示名都只跟
+    // provider 有关：原来每遇到一个成员就各算一次，账号投影段因此随候选
+    // 数线性涨到 3-8 秒。这里一轮只算「去重后的家数」次，成员循环纯查表。
+    // 三个查询都没有副作用，多算几家（含未 included 的成员）不改变结果。
+    let ids: HashSet<&str> = group.members.iter().map(|member| member.provider.as_str()).collect();
+    let mut manifests: HashMap<String, Vec<Value>> = HashMap::new();
+    for id in &ids { manifests.insert((*id).to_string(), manifest(id)); }
+    let manifest_at = started.elapsed();
+    let mut active: HashMap<&str, bool> = HashMap::new();
+    for id in &ids { active.insert(*id, provider_active(id)); }
+    let active_at = started.elapsed();
+    let mut labels: HashMap<&str, String> = HashMap::new();
+    for id in &ids { labels.insert(*id, providers::label_of(id)); }
+    let labels_at = started.elapsed();
     for member in group.members.iter().filter(|member| member.included) {
         let item = manifests.get(&member.provider).and_then(|items| items.iter().find(|item| model_id(item).eq_ignore_ascii_case(&member.model))).cloned();
         let reason = if !key_scope::allows_provider(scope, &member.provider) { Some("网关 Key 不允许此提供商".to_string()) }
-            else if !provider_active(&member.provider) { Some("提供商当前不可用".to_string()) }
+            else if !active.get(member.provider.as_str()).copied().unwrap_or(false) { Some("提供商当前不可用".to_string()) }
             else if let Some(item) = &item {
                 if providers::images::model_is_image(item) { Some("生图模型不能用于对话路由".to_string()) }
                 else {
@@ -135,7 +149,8 @@ pub fn project_with_vision(group: &RoutingGroup, accounts: &[Value], needs: &Req
         let actual = item.as_ref().map(model_id).unwrap_or_else(|| member.model.clone());
         if let Some(reason) = reason {
             result.blocked.push(json!({ "id": member.id, "memberId": member.id, "provider": member.provider,
-                "providerLabel": providers::label_of(&member.provider), "model": actual, "name": actual, "state": "unavailable", "reason": reason }));
+                "providerLabel": labels.get(member.provider.as_str()).cloned().unwrap_or_else(|| member.provider.clone()),
+                "model": actual, "name": actual, "state": "unavailable", "reason": reason }));
             continue;
         }
         if member.accounts.is_empty() {
@@ -155,6 +170,18 @@ pub fn project_with_vision(group: &RoutingGroup, accounts: &[Value], needs: &Req
             account["routingPriority"] = result.accounts.len().into();
             result.accounts.push(account);
         }
+    }
+    let total = started.elapsed();
+    if total.as_millis() > 1_000 {
+        // 四个数都是**累计**时刻，相邻相减即该段耗时；>1 秒才打，正常请求零开销。
+        crate::server::logging::console(
+            "[Routing]",
+            &format!(
+                "路由组投影 {} ms（累计：清单准备 {} / 可用性 {} / 展示名 {} / 成员循环 {} ms，成员 {} 家 {}）",
+                total.as_millis(), manifest_at.as_millis(), active_at.as_millis(),
+                labels_at.as_millis(), total.as_millis(), group.members.len(), ids.len(),
+            ),
+        );
     }
     result
 }
@@ -182,10 +209,13 @@ pub fn append_public(store: &AccountStore, scope: Option<&KeyScope>, data: &mut 
     // 而清单构建（list_models + 元数据 + 能力覆写）在大家数 × 大清单下是
     // 本轮目录构建里最重的一段（2026-11-12 剖析插桩的假定热点）。
     let mut manifests: std::collections::HashMap<String, Vec<Value>> = std::collections::HashMap::new();
+    // 可用性同样只跟 provider 有关：一个组里 36 个成员常只有 5 家，
+    // 逐成员调 adapter_by_id 会重复几十次（与 project_with_vision 同因）。
+    let mut active: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
     for group in config::routing_profiles().groups.values() {
         if !key_scope::allows_model(scope, &group.model) || data.iter().any(|item| model_id(item).eq_ignore_ascii_case(&group.model)) { continue; }
         let members: Vec<_> = group.members.iter().filter(|member| member.included && key_scope::allows_provider(scope, &member.provider)
-            && provider_active(&member.provider)
+            && *active.entry(member.provider.clone()).or_insert_with(|| provider_active(&member.provider))
             && accounts.available_providers.contains(&member.provider) && member.accounts.iter().any(|id|
                 accounts.accounts.iter().any(|account| routing::account_id(account) == Some(id) && routing::provider_of(account) == member.provider && account.get("enabled") != Some(&Value::Bool(false)))))
             .filter_map(|member| {

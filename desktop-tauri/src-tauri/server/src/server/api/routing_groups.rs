@@ -152,24 +152,35 @@ fn preview_json_with_accounts(state: &ServerState, payload: Preview, accounts: &
         }
     }
     let plan_at = started.elapsed();
+    // 展示名只跟 provider 有关：原来每一行都调一次 label_of，36 个候选
+    // 就是 36 次（beta-0 插桩里结果渲染段 2.7-3.8 秒）。一轮先按家去重。
+    let mut labels: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for entry in plan.blocked.iter().chain(plan.ordered.iter()) {
+        labels.entry(entry.provider.clone())
+            .or_insert_with(|| crate::server::core::providers::label_of(&entry.provider));
+    }
+    let labels_at = started.elapsed();
     let row = |entry: &routing::PlanEntry| json!({ "id": entry.id, "candidateId": routing_groups::attempt_key(&entry.account),
         "memberId": entry.account.get("routingMemberId"), "model": keys.for_account(&entry.account), "name": entry.name,
-        "provider": entry.provider, "providerLabel": crate::server::core::providers::label_of(&entry.provider),
+        "provider": entry.provider, "providerLabel": labels.get(&entry.provider).cloned().unwrap_or_else(|| entry.provider.clone()),
         "state": entry.state, "reason": if payload.fail_first && entry.state == "tried" { "模拟首选成员失败，未实际发送" } else { &entry.reason }, "resetAt": entry.reset_at });
     let mut blocked: Vec<_> = plan.blocked.iter().map(row).collect(); blocked.extend(member_blocked);
+    let ordered: Vec<_> = plan.ordered.iter().map(row).collect();
+    let rows_at = started.elapsed();
     let result = json!({ "model": payload.model, "customized": group.is_some() || profiles.model_profile(&payload.model).is_some(),
         "group": group, "preview": true, "settings": super::routing_api::routing_json(settings),
         "queue": { "strategy": settings.strategy.as_str(), "sticky": settings.sticky.as_str(),
-            "pickedId": plan.ordered.first().map(|entry| &entry.id), "ordered": plan.ordered.iter().map(row).collect::<Vec<_>>(), "blocked": blocked } });
+            "pickedId": plan.ordered.first().map(|entry| &entry.id), "ordered": ordered, "blocked": blocked } });
     let render_at = started.elapsed();
     if render_at.as_millis() > 1_000 {
-        // 四个数都是**累计**时刻，相邻相减即该段耗时。
+        // 六个数都是**累计**时刻，相邻相减即该段耗时；>1 秒才打，正常请求零开销。
         crate::server::logging::console(
             "[Routing]",
             &format!(
-                "路由预演拆分总 {} ms（累计：账号投影 {} / 事实+限流 {} / 选路 {} / 结果渲染 {} ms，候选 {} 个）",
+                "路由预演拆分总 {} ms（累计：账号投影 {} / 事实+限流 {} / 选路 {} / 展示名预取 {} / 行构造 {} / JSON 组装 {} ms，候选 {} 个）",
                 render_at.as_millis(), project_at.as_millis(), facts_at.as_millis(),
-                plan_at.as_millis(), render_at.as_millis(), candidates.len(),
+                plan_at.as_millis(), labels_at.as_millis(), rows_at.as_millis(),
+                render_at.as_millis(), candidates.len(),
             ),
         );
     }
