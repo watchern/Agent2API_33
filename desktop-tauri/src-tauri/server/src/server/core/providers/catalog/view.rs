@@ -1,6 +1,6 @@
 //! 模型的管理视图和对外视图。所有对外出口使用相同的开启绑定集合。
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use serde_json::{json, Map, Value};
 
@@ -96,31 +96,62 @@ pub fn models_response(store: &AccountStore, scope: Option<&KeyScope>) -> Value 
     // 启停账号，实际不可见。
     //
     // 带 scope 的调用（受限 Key 过滤）走原路径，不进缓存。
-    if scope.is_none() {
-        if store.database().is_some() {
-            let snapshot = store.routing_snapshot();
-            let mut providers: Vec<&String> = snapshot.available_providers.iter().collect();
-            providers.sort();
-            let fingerprint = {
-                use std::hash::{Hash, Hasher};
-                let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                providers.hash(&mut hasher);
-                hasher.finish()
-            };
-            let metadata = super::generation();
-            if let Some(cached) = MODELS_CACHE.read().ok().and_then(|guard| guard.clone()) {
-                if cached.0 == fingerprint && cached.1 == metadata {
-                    return (*cached.2).clone();
-                }
+    if scope.is_none() && store.database().is_some() {
+        let fingerprint = providers_fingerprint(store);
+        let metadata = super::generation();
+        if let Some(cached) = MODELS_CACHE.read().ok().and_then(|guard| guard.clone()) {
+            if cached.0 == fingerprint && cached.1 == metadata {
+                return (*cached.2).clone();
             }
-            let built = models_response_with_active(store, scope, active_manifests(store));
+        }
+        // 旧插桩只在 models_response_with_active 内部起表，而 active_manifests
+        // 在它的计时器**之前**执行 —— 那一段慢时日志反而全程沉默（beta.15
+        // 实测 /api/session 的模型目录阶段 36-38 秒、[Models] 一条不打）。
+        // 这里把「清单一准备 + 视图合成」一起计时，超过 1 秒留一行痕迹。
+        let build_started = std::time::Instant::now();
+        let active = active_manifests(store);
+        let active_count = active.len();
+        let built = models_response_with_active(store, scope, active);
+        if build_started.elapsed().as_millis() > 1_000 {
+            crate::server::logging::console(
+                "[Models]",
+                &format!(
+                    "聚合目录重建 {} ms（清单准备 + 视图合成，{} 家）",
+                    build_started.elapsed().as_millis(),
+                    active_count,
+                ),
+            );
+        }
+        // 旧实现直接用构建**前**捕获的 generation 入缓存：启动期插件持续
+        // 注册、generation 一路推进（现场 52→64→68→70）时，这份结果会被
+        // 记成一个再也比对不上的旧键，之后每轮请求都白重建一次。
+        //
+        // 这里只在「构建前后版本号没漂移」时入缓存。漂移就丢弃、下轮重建：
+        // 不能反过来把旧内容配上新 generation 存进去 —— 那样新装的插件 /
+        // 刚启用的账号会被这份陈旧目录一直挡在 /v1/models 外面。与
+        // routing_snapshot 不同，这条缓存没有等待者自旋，丢弃不会活锁。
+        let stable = providers_fingerprint(store) == fingerprint
+            && super::generation() == metadata;
+        if stable {
             if let Ok(mut guard) = MODELS_CACHE.write() {
                 *guard = Some((fingerprint, metadata, std::sync::Arc::new(built.clone())));
             }
-            return built;
         }
+        return built;
     }
     models_response_with_active(store, scope, active_manifests(store))
+}
+
+/// 缓存键里的「哪些家可用」指纹：账号台账写不改变它，启停账号 / 装卸
+/// 插件才会。抽成函数让命中检查与收尾入缓存用同一套算法。
+fn providers_fingerprint(store: &AccountStore) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let snapshot = store.routing_snapshot();
+    let mut providers: Vec<&String> = snapshot.available_providers.iter().collect();
+    providers.sort();
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    providers.hash(&mut hasher);
+    hasher.finish()
 }
 
 /// 无 scope 聚合目录的内容指纹缓存：`(可用提供商指纹, catalog_generation, Value)`。
@@ -192,12 +223,17 @@ pub fn suggest_advertised(store: &AccountStore, model: &str, limit: usize) -> Ve
 }
 
 pub fn session_models(store: &AccountStore) -> Vec<Value> {
+    // 同一家在目录里通常占十几条模型，展示名没必要逐条重算：一次请求内
+    // 按 provider 去重（beta.15 的 34 条 / 5 家 → 5 次而不是 34 次）。
+    let mut labels: HashMap<String, String> = HashMap::new();
     models_response(store, None).get("data").and_then(Value::as_array)
         .cloned().unwrap_or_default().into_iter().map(|mut item| {
             let provider = item.get("owned_by").and_then(Value::as_str).unwrap_or("").to_string();
             let is_default = item.get("is_default").cloned().unwrap_or(Value::Bool(false));
             if let Some(object) = item.as_object_mut() {
-                object.insert("providerLabel".to_string(), Value::String(super::super::label_of(&provider)));
+                let label = labels.entry(provider.clone())
+                    .or_insert_with(|| super::super::label_of(&provider)).clone();
+                object.insert("providerLabel".to_string(), Value::String(label));
                 object.insert("provider".to_string(), Value::String(provider));
                 object.insert("isDefault".to_string(), is_default);
             }

@@ -15,6 +15,10 @@ pub(crate) fn generation() -> u64 {
 
 pub(crate) fn invalidate() {
     GENERATION.fetch_add(1, Ordering::AcqRel);
+    // 展示名读的是「已安装包清单」这份落盘数据，这里的每个调用点
+    // （配置变更 / 插件注册 / 模型目录替换）都意味着名单可能变了。
+    // 顺手清掉 provider_label 的缓存，免得各调用点各自记着失效。
+    crate::server::core::plugin_host::invalidate_provider_labels();
 }
 
 pub(crate) fn validation_snapshot(store: &AccountStore) -> std::sync::Arc<ValidationSnapshot> {

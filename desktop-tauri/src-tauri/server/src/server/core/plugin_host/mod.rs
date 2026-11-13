@@ -95,19 +95,56 @@ pub fn host_target() -> String {
 /// 于是「库里还有它的账号」时界面只能显示裸 id —— 用户看到一个 `demo`
 /// 分组，不知道那是什么。清单里写着 label，读它即可。
 ///
-/// 代价是每次调用都读一遍注册表与 `pack.json`。这个函数的唯一消费方是
-/// provider 摘要（一次 `/api/session` 调一次、只对「有账号但没在跑」的家
-/// 问），量级可以忽略；真要优化再加缓存，别在这里提前做。
+/// ── 为什么必须缓存（2026-11-13 账号中心卡死修复）──────────────
+/// `list_packs()` 不是内存查询：它读一遍注册表，再对**每个包**读
+/// `manifest` 与 `pack.json`，还查兼容性与启动状态；`script::
+/// registered_label` 又要读一遍脚本注册表。早期这里只被 provider 摘要
+/// 调用一次，代价可忽略。后来 `providers::label_of` 成了 `session_models`
+/// 逐条模型、路由组投影逐成员的公共出口 —— 一次 `/api/session` 会问
+/// 三十多次，等于几百次文件读，实测把该阶段拖到 36-38 秒且稳定复现。
+///
+/// 现在一次扫描把**所有包的展示名**装进缓存（也缓存「查不到」的负结果，
+/// 免得陌生 id 反复触发 `registered_label` 的磁盘读），后续纯内存命中。
+/// 失效挂在两个既有出口：`catalog::invalidate()`（配置 / 插件注册 /
+/// 模型目录变更都经过它）与 `PackRegistry::save()`（装卸 / 启停包）。
+/// 展示名只是静态文案，最多陈旧到下一次变更，不参与任何转发判定。
 pub fn provider_label(id: &str) -> Option<String> {
-    for pack in install::list_packs() {
-        if !pack.enabled {
-            continue;
-        }
-        if let Some(found) = pack.providers.iter().find(|item| item.id == id) {
-            return Some(found.label.clone());
+    if let Ok(guard) = label_cache().read() {
+        if let Some(cached) = guard.get(id) {
+            return cached.clone();
         }
     }
-    script::registered_label(id)
+    let mut table: std::collections::HashMap<String, Option<String>> =
+        std::collections::HashMap::new();
+    for pack in install::list_packs().into_iter().filter(|pack| pack.enabled) {
+        for item in pack.providers {
+            table.insert(item.id, Some(item.label));
+        }
+    }
+    let found = table.get(id).cloned()
+        .unwrap_or_else(|| script::registered_label(id));
+    if let Ok(mut guard) = label_cache().write() {
+        guard.extend(table);
+        guard.insert(id.to_string(), found.clone());
+    }
+    found
+}
+
+fn label_cache() -> &'static std::sync::RwLock<
+    std::collections::HashMap<String, Option<String>>,
+> {
+    static CACHE: std::sync::OnceLock<
+        std::sync::RwLock<std::collections::HashMap<String, Option<String>>>,
+    > = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::RwLock::new(std::collections::HashMap::new()))
+}
+
+/// 插件包 / 配置变更后清空展示名缓存。由 `catalog::invalidate()` 与
+/// `PackRegistry::save()` 调用，调用点不必逐个记着这件事。
+pub fn invalidate_provider_labels() {
+    if let Ok(mut guard) = label_cache().write() {
+        guard.clear();
+    }
 }
 
 /// 插件目录的展示路径（界面显示「装到哪儿了」用）。
