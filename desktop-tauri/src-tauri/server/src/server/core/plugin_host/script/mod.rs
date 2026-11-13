@@ -31,7 +31,7 @@ pub(super) use websocket::{abort as abort_ws, open as open_ws, read as read_ws, 
 pub use operations::{change, install, operation};
 pub(super) use protocol::{close as close_stream, open as open_stream, push as push_stream};
 pub(super) use runtime::{host, observe_concurrency, package_for_provider, registered_label};
-pub use runtime::{concurrency_default, known_provider, provider_icons, provider_state, snapshot, start};
+pub use runtime::{concurrency_default, known_provider, provider_icons, provider_state, provider_states, snapshot, start};
 pub use updates::check as check_updates;
 pub fn refresh_catalog() -> serde_json::Value {
     catalog::wake(true);

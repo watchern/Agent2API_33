@@ -56,6 +56,32 @@ pub fn provider_state(provider: &str) -> Option<&'static str> {
     })
 }
 
+/// 一次读注册表返回**全部** provider 的状态串，判据与 [`provider_state`]
+/// 逐字相同（同一个 id 出现在多个包时仍以第一个包为准）。
+///
+/// `hidden_accounts::summary` 以前对每个隐藏 provider 各调一次
+/// [`provider_state`]，每次都 `storage::read()` 读一遍 registry.json ——
+/// 账号列表是首屏热路径，几家隐藏账号就是几次文件读。这里一次读完全量。
+pub fn provider_states() -> std::collections::HashMap<String, &'static str> {
+    let Ok(registry) = super::storage::read() else {
+        return std::collections::HashMap::new();
+    };
+    let mut states = std::collections::HashMap::new();
+    for package in &registry.packages {
+        for id in &package.providers {
+            let state: &'static str = if !package.enabled {
+                "pack_disabled"
+            } else if package.disabled_providers.iter().any(|item| item == id) {
+                "provider_disabled"
+            } else {
+                "not_loaded"
+            };
+            states.entry(id.clone()).or_insert(state);
+        }
+    }
+    states
+}
+
 pub fn clear_owners() {
     if let Ok(mut saved) = owners().lock() {
         saved.clear();

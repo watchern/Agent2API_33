@@ -70,24 +70,35 @@ pub async fn preview(State(state): State<ServerState>, body: Bytes) -> Response 
     }
 }
 
-pub fn group_queue(state: &ServerState, group: config::RoutingGroup) -> Value {
-    preview_json(state, Preview { model: group.model.clone(), group: Some(group), profile: None,
-        global: false, needs: Default::default(), fail_first: false })["queue"].clone()
+pub fn group_queue(state: &ServerState, group: config::RoutingGroup, accounts: &[Value]) -> Value {
+    preview_json_with_accounts(state, Preview { model: group.model.clone(), group: Some(group), profile: None,
+        global: false, needs: Default::default(), fail_first: false }, accounts)["queue"].clone()
 }
 
 fn preview_json(state: &ServerState, payload: Preview) -> Value {
     let accounts = routing::accounts_of(&state.store().list_visible_accounts());
+    preview_json_with_accounts(state, payload, &accounts)
+}
+
+/// 预演主体。`accounts` 由调用方给：`/api/session` 已经算好同一轮账号快照，
+/// 直接复用；独立的 `POST /api/routing/preview` 才由 `preview_json` 现读。
+///
+/// 分段计时（2026-11-14）：去重之后路由预演仍稳定 6-8 秒，而这段窗口里
+/// 一条日志都不打 —— 既有插桩只在 `queue_for_accounts` 外层记总时长。
+/// 这里把「账号投影 / 事实+限流 / 选路 / 结果渲染」四段拆开，>1 秒才打。
+fn preview_json_with_accounts(state: &ServerState, payload: Preview, accounts: &[Value]) -> Value {
+    let started = std::time::Instant::now();
     let (profiles, base) = config::routing_snapshot();
     let settings;
     let mut member_blocked = Vec::new();
     let group = payload.group.or_else(|| profiles.group_for_model(&payload.model).cloned());
     let mut candidates = if let Some(group) = &group {
         settings = group.settings(base);
-        let projection = routing_groups::project(group, &accounts, &payload.needs, None);
+        let projection = routing_groups::project(group, accounts, &payload.needs, None);
         member_blocked = projection.blocked;
         projection.accounts
     } else {
-        let providers = if payload.model.is_empty() { routing_scope::available_providers(&accounts) }
+        let providers = if payload.model.is_empty() { routing_scope::available_providers(accounts) }
             else { crate::server::core::providers::catalog::forwarding_providers(&payload.model) };
         let mut snapshot = (*profiles).clone();
         let global_draft = if payload.global && snapshot.model_profile(&payload.model).is_none() { payload.profile.clone() } else { None };
@@ -96,15 +107,16 @@ fn preview_json(state: &ServerState, payload: Preview) -> Value {
         }
         settings = snapshot.settings_for(&payload.model, base);
         let profile = if let Some(mut profile) = global_draft {
-            let sorting = crate::server::core::account_order::sorting(&accounts, crate::server::logging::now_ms());
+            let sorting = crate::server::core::account_order::sorting(accounts, crate::server::logging::now_ms());
             for (provider, rules) in &sorting.rules {
                 let automatic = rules.iter().any(|rule| crate::server::core::account_order::rule_enabled(provider, rule));
                 if automatic { profile.account_order.remove(provider); }
             }
             profile
-        } else { routing_scope::materialize_profile_with(&accounts, &providers, &payload.model, &snapshot) };
-        routing_scope::project_accounts(&accounts, &profile).into_iter().filter(|account| providers.iter().any(|id| id == routing::provider_of(account))).collect()
+        } else { routing_scope::materialize_profile_with(accounts, &providers, &payload.model, &snapshot) };
+        routing_scope::project_accounts(accounts, &profile).into_iter().filter(|account| providers.iter().any(|id| id == routing::provider_of(account))).collect()
     };
+    let project_at = started.elapsed();
     for (index, account) in candidates.iter_mut().enumerate() { account["routingPriority"] = index.into(); }
     let now = crate::server::logging::now_ms();
     let any_ready = candidates.iter().any(|account| !crate::server::core::providers::readiness::gated(routing::provider_of(account)));
@@ -127,6 +139,7 @@ fn preview_json(state: &ServerState, payload: Preview) -> Value {
     let counters = crate::server::core::limiter::counter::facts();
     let limiter = candidates.iter().filter(|account| crate::server::core::limiter::evaluate::blocked(account, &keys.for_account(account), &facts, &counters, now))
         .map(routing_groups::attempt_key).collect();
+    let facts_at = started.elapsed();
     let meta = routing::PlanMeta { strategy: settings.strategy, sunk: &sunk, resting: &resting, open: &open,
         limiter_blocked: &limiter, cursor: None, provider_cursors: None, sticky_account: None };
     let mut plan = routing::plan_route(&candidates, &keys, &counts, &[], now, &meta);
@@ -138,13 +151,27 @@ fn preview_json(state: &ServerState, payload: Preview) -> Value {
             plan = routing::plan_route(&candidates, &keys, &counts, &excluded, now, &meta);
         }
     }
+    let plan_at = started.elapsed();
     let row = |entry: &routing::PlanEntry| json!({ "id": entry.id, "candidateId": routing_groups::attempt_key(&entry.account),
         "memberId": entry.account.get("routingMemberId"), "model": keys.for_account(&entry.account), "name": entry.name,
         "provider": entry.provider, "providerLabel": crate::server::core::providers::label_of(&entry.provider),
         "state": entry.state, "reason": if payload.fail_first && entry.state == "tried" { "模拟首选成员失败，未实际发送" } else { &entry.reason }, "resetAt": entry.reset_at });
     let mut blocked: Vec<_> = plan.blocked.iter().map(row).collect(); blocked.extend(member_blocked);
-    json!({ "model": payload.model, "customized": group.is_some() || profiles.model_profile(&payload.model).is_some(),
+    let result = json!({ "model": payload.model, "customized": group.is_some() || profiles.model_profile(&payload.model).is_some(),
         "group": group, "preview": true, "settings": super::routing_api::routing_json(settings),
         "queue": { "strategy": settings.strategy.as_str(), "sticky": settings.sticky.as_str(),
-            "pickedId": plan.ordered.first().map(|entry| &entry.id), "ordered": plan.ordered.iter().map(row).collect::<Vec<_>>(), "blocked": blocked } })
+            "pickedId": plan.ordered.first().map(|entry| &entry.id), "ordered": plan.ordered.iter().map(row).collect::<Vec<_>>(), "blocked": blocked } });
+    let render_at = started.elapsed();
+    if render_at.as_millis() > 1_000 {
+        // 四个数都是**累计**时刻，相邻相减即该段耗时。
+        crate::server::logging::console(
+            "[Routing]",
+            &format!(
+                "路由预演拆分总 {} ms（累计：账号投影 {} / 事实+限流 {} / 选路 {} / 结果渲染 {} ms，候选 {} 个）",
+                render_at.as_millis(), project_at.as_millis(), facts_at.as_millis(),
+                plan_at.as_millis(), render_at.as_millis(), candidates.len(),
+            ),
+        );
+    }
+    result
 }

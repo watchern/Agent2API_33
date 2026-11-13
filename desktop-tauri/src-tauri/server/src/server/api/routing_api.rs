@@ -188,7 +188,9 @@ pub(crate) fn queue_for_accounts(state: &ServerState, model: Option<String>, acc
     let started = std::time::Instant::now();
     if let Some(group) = model.as_deref().and_then(|model| config::routing_profiles().group_for_model(model).cloned()) {
         let group_model = group.model.clone();
-        let result = super::routing_groups::group_queue(state, group);
+        // /api/session 已经把本轮的 accounts 传进来了，路由组分支不要再去
+        // list_visible_accounts() 重读一遍（实测那一遍约 2 秒）。
+        let result = super::routing_groups::group_queue(state, group, accounts);
         if started.elapsed().as_millis() > 1_000 {
             crate::server::logging::console(
                 "[Routing]",

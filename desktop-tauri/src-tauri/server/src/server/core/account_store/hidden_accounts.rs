@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -18,7 +18,7 @@ enum HiddenReason {
     NotLoaded,
 }
 
-fn reason_of(provider: &str, registry: &PackRegistry) -> HiddenReason {
+fn reason_of(provider: &str, registry: &PackRegistry, scripts: &HashMap<String, &'static str>) -> HiddenReason {
     if let Some(state) = startup::provider(provider) {
         if !state.pack_enabled { return HiddenReason::PackDisabled; }
         if !state.enabled { return HiddenReason::ProviderDisabled; }
@@ -29,7 +29,7 @@ fn reason_of(provider: &str, registry: &PackRegistry) -> HiddenReason {
             _ => HiddenReason::NotLoaded,
         };
     }
-    if let Some(state) = crate::server::core::plugin_host::script::provider_state(provider) {
+    if let Some(state) = scripts.get(provider).copied() {
         return match state {
             "pack_disabled" => HiddenReason::PackDisabled,
             "provider_disabled" => HiddenReason::ProviderDisabled,
@@ -62,14 +62,16 @@ pub(super) fn summary(counts: BTreeMap<String, usize>) -> Value {
     let total = counts.values().sum::<usize>();
     let mut details = Vec::with_capacity(counts.len());
     if !counts.is_empty() {
+        // 两份注册表各读一次，别在循环里逐 provider 重读磁盘。
         let registry = PackRegistry::load();
+        let scripts = crate::server::core::plugin_host::script::provider_states();
         for (provider, count) in &counts {
             let state = startup::provider(provider);
             details.push(json!({
                 "id": provider,
                 "label": providers::label_of(provider),
                 "count": count,
-                "reason": reason_of(provider, &registry),
+                "reason": reason_of(provider, &registry, &scripts),
                 "packId": state.as_ref().map(|state| &state.pack_id),
                 "startup": state.as_ref().map(|state| &state.startup),
             }));
