@@ -100,6 +100,16 @@ pub fn set_defaults(provider: &str, models: Vec<Value>) -> Option<(usize, i64)> 
     recovered
 }
 
+/// 本轮刷新拿到的清单与内存里的上一份是否逐字相同。
+/// 只比 `models`：`refreshed_at` 只是展示用的刷新时刻，清单、绑定、聚合目录
+/// 这些派生视图一个都不读它。
+fn remote_models_unchanged(provider: &str, models: &[Value]) -> bool {
+    let Ok(map) = table().lock() else { return false };
+    map.get(provider)
+        .and_then(|entry| entry.remote.as_ref())
+        .is_some_and(|old| old.models.as_slice() == models)
+}
+
 pub fn set_remote(provider: &str, mut list: proto::ModelList) -> usize {
     let scoped = accepts_empty(provider);
     let _write = scoped.then(|| write_gate().lock().unwrap_or_else(|poisoned| poisoned.into_inner()));
@@ -118,18 +128,31 @@ pub fn set_remote(provider: &str, mut list: proto::ModelList) -> usize {
     let saved = if scoped {
         vec![json!({ "id": ENVELOPE_ID, "version": ENVELOPE_VERSION, "provider": provider, "list": list })]
     } else { list.models.clone() };
+    // ── 内容未变不推 generation（2026-11-14 beta-2）────────────────
+    // 后台目录刷新会周期性回到这里，绝大多数轮次拿到的清单与上一份逐字
+    // 相同。原来无论内容变没变都无条件 `catalog::invalidate()` 两次，让
+    // generation 在每轮 `/api/session` 期间漂移，连带打掉 manifest_cache /
+    // MODELS_CACHE / provider_label 三张缓存（实测每轮重建 1 秒以上）。
+    // 这里照常更新 refreshed_at、照常持久化，只是不推 generation：
+    // 清单没变，所有以 generation 为键的派生结果本来就仍然有效。
+    let unchanged = remote_models_unchanged(provider, &list.models);
+    let bump = || {
+        if !unchanged {
+            crate::server::core::providers::catalog::invalidate();
+        }
+    };
     if !scoped {
         catalog_cache::save(&scope(provider), &saved, list.meta.refreshed_at);
         let Ok(mut map) = table().lock() else { return 0 };
-        crate::server::core::providers::catalog::invalidate();
+        bump();
         map.entry(provider.to_string()).or_default().remote = Some(list);
-        crate::server::core::providers::catalog::invalidate();
+        bump();
         return count;
     }
     let mut map = table().lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    crate::server::core::providers::catalog::invalidate();
+    bump();
     map.entry(provider.to_string()).or_default().remote = Some(list.clone());
-    crate::server::core::providers::catalog::invalidate();
+    bump();
     // table 与 DB 不重叠持锁；scoped gate 仍保持跨请求的持久化写入顺序。
     drop(map);
     catalog_cache::save(&scope(provider), &saved, list.meta.refreshed_at);

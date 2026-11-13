@@ -73,6 +73,9 @@ pub fn save(registry: &Registry) -> Result<(), String> {
     let bytes = serde_json::to_vec_pretty(registry).map_err(|error| error.to_string())?;
     atomic_write(&super::root().join("registry.json"), &bytes)?;
     super::super::startup::configure_scripts(registry);
+    // 装卸 / 启停 / 改设置都会改「哪些家有展示名」；这是 provider_label
+    // 缓存唯一的脚本侧失效出口（catalog::invalidate 不再清它，见那里注释）。
+    super::super::invalidate_provider_labels();
     Ok(())
 }
 

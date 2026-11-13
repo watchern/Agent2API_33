@@ -202,8 +202,24 @@ impl AccountStore {
     /// 签到中心、成长页…）。没装插件时插件家的账号不出现 —— 用户明确要的是
     /// 「插件不在，这家就不存在」；数据仍在库里，装上插件原样回来。
     pub fn list_visible_accounts(&self) -> Value {
+        let started = std::time::Instant::now();
         let state = self.read_state();
-        self.snapshot(&state, Visibility::UserFacing)
+        let read_at = started.elapsed();
+        let value = self.snapshot(&state, Visibility::UserFacing);
+        let total = started.elapsed();
+        if total.as_millis() > 1_000 {
+            // 2026-11-14 beta-2：路由预演降到 ~1.1 秒后，列表阶段
+            // 1.9-3.1 秒成了首屏新的最大头，这里把它与快照内部拆开记。
+            crate::server::logging::console(
+                "[Accounts]",
+                &format!(
+                    "列表入口 {} ms（读状态 {} / 快照构造 {} ms）",
+                    total.as_millis(), read_at.as_millis(),
+                    total.as_millis().saturating_sub(read_at.as_millis()),
+                ),
+            );
+        }
+        value
     }
 
     /// 全部账号 proxy 指向的池条目 id 集合（去重）。
@@ -292,6 +308,7 @@ impl AccountStore {
     /// 自定义提供商独立直连；本体订阅与真实插件按 `account_visible` 的执行体
     /// 并集判定。旧身份缺插件仍隐藏，记录与导出内容不受展示过滤影响。
     pub(crate) fn snapshot(&self, state: &AccountState, visibility: Visibility) -> Value {
+        let started = std::time::Instant::now();
         // 过滤一次、克隆一次（两个队首派生函数都要 `&[StoredAccount]`）
         let mut visible: Vec<StoredAccount> = Vec::with_capacity(state.accounts.len());
         // 被隐藏的账号按 provider 聚合（界面用它说「哪几家等插件」）。
@@ -322,19 +339,32 @@ impl AccountStore {
         let global_current = Self::pick_current(&visible)
             .map(|record| Value::String(record.id().to_string()))
             .unwrap_or(Value::Null);
+        let filtered_at = started.elapsed();
         // 隐藏摘要独立于可见账号数量，混有自定义账号时也必须能解释缺失的部分。
         let hidden = super::hidden_accounts::summary(hidden);
+        let hidden_at = started.elapsed();
+        let accounts = visible.iter().map(|record| self.public_account(record)).collect::<Vec<_>>();
+        let accounts_at = started.elapsed();
         let mut snapshot = json!({
             "currentAccountId": global_current,
             "currentAccountIds": Value::Object(current_ids),
-            "accounts": visible
-                .iter()
-                .map(|record| self.public_account(record))
-                .collect::<Vec<_>>(),
+            "accounts": accounts,
             "providers": self.provider_summary(&visible),
             "hiddenAccounts": hidden,
         });
         crate::server::core::account_order::enrich_snapshot(&mut snapshot);
+        let total = started.elapsed();
+        if visibility == Visibility::UserFacing && total.as_millis() > 1_000 {
+            // 四个数都是**累计**时刻，相邻相减即该段耗时；>1 秒才打。
+            crate::server::logging::console(
+                "[Accounts]",
+                &format!(
+                    "列表快照 {} ms（累计：过滤+队首 {} / 隐藏摘要 {} / 账号投影 {} / 摘要+排序 {} ms，可见 {} 条）",
+                    total.as_millis(), filtered_at.as_millis(), hidden_at.as_millis(),
+                    accounts_at.as_millis(), total.as_millis(), visible.len(),
+                ),
+            );
+        }
         snapshot
     }
 
