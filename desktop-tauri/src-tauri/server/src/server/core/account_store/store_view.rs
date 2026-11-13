@@ -16,7 +16,10 @@
 //!
 //! 这些方法仍是 `impl AccountStore` 的分块（同一个类型，跨文件不改变可见性）。
 
+use std::cell::Cell;
 use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Map, Value};
 
@@ -27,6 +30,48 @@ use crate::server::core::custom_providers;
 use crate::server::core::endpoints::{resolve_edition, EditionInfo};
 use crate::server::core::proxies::describe_account_proxy;
 use super::usage_settings::usage_query_public;
+
+// ─── `public_account` 分段累计（2026-11-14 beta-4）─────────────
+// 稳态实测「账号投影」14 条要 1.3-2.7 秒，而这一段按代码看全是内存
+// JSON 拼接。分段累计把墙钟摊到「形状分派 / reading_key / 其余注入」，
+// 只记在一个 thread_local 里、由列表快照汇总并清零，正常请求零 I/O。
+thread_local! {
+    static PUBLIC_PARTS: Cell<[u64; 3]> = const { Cell::new([0; 3]) };
+}
+
+fn add_public_part(index: usize, micros: u64) {
+    PUBLIC_PARTS.with(|cell| {
+        let mut parts = cell.get();
+        parts[index] = parts[index].saturating_add(micros);
+        cell.set(parts);
+    });
+}
+
+fn take_public_parts() -> [u64; 3] {
+    PUBLIC_PARTS.with(|cell| {
+        let parts = cell.get();
+        cell.set([0; 3]);
+        parts
+    })
+}
+
+// ─── 列表快照短缓存（2026-11-14 beta-4）───────────────────────
+// 同一个 20 秒轮询窗口里，`/api/session`（UserFacing）、余额快照、
+// 余额巡检、`resolve_batch_targets` 会各自把 14 条账号重新投影一遍。
+// 结果只取决于账号数据（account_revision）、目录/配置/插件状态
+// （catalog generation）与「今天」（签到日界），三者任一变化即换键；
+// 5 秒 TTL 只用来兜住那些不推版本号的运行期状态，界面无感。
+const LIST_TTL: Duration = Duration::from_secs(5);
+
+/// (入口种类, 库路径, account_revision, catalog generation, 北京日期键)
+/// 带上库路径：测试里同一进程可能开多个隔离库，revision 都从 0 开始，
+/// 不加路径会把 A 库的账号列表喂给 B 库。
+type ListKey = (u8, String, u64, u64, String);
+
+fn list_cache() -> &'static Mutex<Vec<(ListKey, Instant, Value)>> {
+    static CACHE: OnceLock<Mutex<Vec<(ListKey, Instant, Value)>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(Vec::new()))
+}
 
 /// 这条账号所属的家，此刻是否出现在管理界面上。
 ///
@@ -57,6 +102,49 @@ pub(crate) enum Visibility {
 }
 
 impl AccountStore {
+    /// 列表快照的缓存键。三个分量都是廉价的内存读，不打库、不碰磁盘。
+    fn list_key(&self, kind: u8) -> ListKey {
+        let revision = self.database().map(|db| db.account_revision()).unwrap_or(0);
+        let generation = crate::server::core::providers::catalog::generation();
+        (
+            kind,
+            self.file_string(),
+            revision,
+            generation,
+            crate::server::core::beijing::today_key(),
+        )
+    }
+
+    /// 命中即返回同一份 Value；未命中时构建并装填。
+    /// 构建期间**不持缓存锁**（避免与账号写路径 / DB 连接锁形成锁序反转）。
+    fn cached_list(&self, kind: u8, build: impl FnOnce() -> Value) -> Value {
+        let key = self.list_key(kind);
+        {
+            let mut cache = list_cache().lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            cache.retain(|entry| entry.1.elapsed() < LIST_TTL);
+            if let Some(entry) = cache.iter().find(|entry| entry.0 == key) {
+                return entry.2.clone();
+            }
+        }
+        let started = Instant::now();
+        let value = build();
+        let elapsed = started.elapsed();
+        if elapsed.as_millis() > 1_000 {
+            // 未命中重建才会出现这行：稳态里它的疏密直接说明缓存有没有生效。
+            crate::server::logging::console(
+                "[Accounts]",
+                &format!(
+                    "列表缓存未命中重建 {} ms（入口 {}，revision {} / generation {}）",
+                    elapsed.as_millis(), kind, key.2, key.3,
+                ),
+            );
+        }
+        let mut cache = list_cache().lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        cache.retain(|entry| entry.0 != key);
+        cache.push((key, Instant::now(), value.clone()));
+        value
+    }
+
     // ─── 公开形态 ────────────────────────────────────────────
 
     /// 记录 → 公开形态（对照 Node 版 `toPublicAccount`，字段逐个对齐）。
@@ -192,8 +280,28 @@ impl AccountStore {
     /// 上就给出**，前端不必再发第二个请求。计数是各 provider 的账号**总数**
     /// （含禁用账号）—— 与分组标题显示的「N 个账号」口径一致。
     pub fn list_accounts(&self) -> Value {
-        let state = self.read_state();
-        self.snapshot(&state, Visibility::All)
+        self.cached_list(0, || {
+            let state = self.read_state();
+            self.snapshot(&state, Visibility::All)
+        })
+    }
+
+    /// 只要 `accounts` 数组的内部读点（余额快照、余额巡检、批量目标解析）。
+    ///
+    /// 这些调用方从来不读 `providers` / `hiddenAccounts` / `sorting`，旧的
+    /// `list_accounts()` 却每次都把这三份一起算出来 —— 稳态实测其中
+    /// `account_order::enrich_snapshot` 约 1.3 秒，是纯浪费。`accounts`
+    /// 数组本身仍由同一个 `public_account` 逐条构造，字段口径逐字一致。
+    pub fn account_rows(&self) -> Value {
+        self.cached_list(2, || {
+            let state = self.read_state();
+            let accounts = state
+                .accounts
+                .iter()
+                .map(|record| self.public_account(record))
+                .collect::<Vec<_>>();
+            json!({ "accounts": accounts })
+        })
     }
 
     /// 界面用的账号快照：**只含此刻真的能用的那些家**（判据见 [`account_visible`]）。
@@ -202,24 +310,26 @@ impl AccountStore {
     /// 签到中心、成长页…）。没装插件时插件家的账号不出现 —— 用户明确要的是
     /// 「插件不在，这家就不存在」；数据仍在库里，装上插件原样回来。
     pub fn list_visible_accounts(&self) -> Value {
-        let started = std::time::Instant::now();
-        let state = self.read_state();
-        let read_at = started.elapsed();
-        let value = self.snapshot(&state, Visibility::UserFacing);
-        let total = started.elapsed();
-        if total.as_millis() > 1_000 {
-            // 2026-11-14 beta-2：路由预演降到 ~1.1 秒后，列表阶段
-            // 1.9-3.1 秒成了首屏新的最大头，这里把它与快照内部拆开记。
-            crate::server::logging::console(
-                "[Accounts]",
-                &format!(
-                    "列表入口 {} ms（读状态 {} / 快照构造 {} ms）",
-                    total.as_millis(), read_at.as_millis(),
-                    total.as_millis().saturating_sub(read_at.as_millis()),
-                ),
-            );
-        }
-        value
+        self.cached_list(1, || {
+            let started = Instant::now();
+            let state = self.read_state();
+            let read_at = started.elapsed();
+            let value = self.snapshot(&state, Visibility::UserFacing);
+            let total = started.elapsed();
+            if total.as_millis() > 1_000 {
+                // 2026-11-14 beta-2：路由预演降到 ~1.1 秒后，列表阶段
+                // 1.9-3.1 秒成了首屏新的最大头，这里把它与快照内部拆开记。
+                crate::server::logging::console(
+                    "[Accounts]",
+                    &format!(
+                        "列表入口 {} ms（读状态 {} / 快照构造 {} ms）",
+                        total.as_millis(), read_at.as_millis(),
+                        total.as_millis().saturating_sub(read_at.as_millis()),
+                    ),
+                );
+            }
+            value
+        })
     }
 
     /// 全部账号 proxy 指向的池条目 id 集合（去重）。
@@ -308,7 +418,10 @@ impl AccountStore {
     /// 自定义提供商独立直连；本体订阅与真实插件按 `account_visible` 的执行体
     /// 并集判定。旧身份缺插件仍隐藏，记录与导出内容不受展示过滤影响。
     pub(crate) fn snapshot(&self, state: &AccountState, visibility: Visibility) -> Value {
-        let started = std::time::Instant::now();
+        let started = Instant::now();
+        // 本轮之前的调用（选路快照构建、按 provider 查询）也可能调过
+        // public_account；先清零，下面的分段累计只算这次列表快照的。
+        let _ = take_public_parts();
         // 过滤一次、克隆一次（两个队首派生函数都要 `&[StoredAccount]`）
         let mut visible: Vec<StoredAccount> = Vec::with_capacity(state.accounts.len());
         // 被隐藏的账号按 provider 聚合（界面用它说「哪几家等插件」）。
@@ -345,25 +458,33 @@ impl AccountStore {
         let hidden_at = started.elapsed();
         let accounts = visible.iter().map(|record| self.public_account(record)).collect::<Vec<_>>();
         let accounts_at = started.elapsed();
+        let providers = self.provider_summary(&visible);
+        let providers_at = started.elapsed();
         let mut snapshot = json!({
             "currentAccountId": global_current,
             "currentAccountIds": Value::Object(current_ids),
             "accounts": accounts,
-            "providers": self.provider_summary(&visible),
+            "providers": providers,
             "hiddenAccounts": hidden,
         });
         crate::server::core::account_order::enrich_snapshot(&mut snapshot);
         let total = started.elapsed();
         if visibility == Visibility::UserFacing && total.as_millis() > 1_000 {
-            // 四个数都是**累计**时刻，相邻相减即该段耗时；>1 秒才打。
+            // 五个数都是**累计**时刻，相邻相减即该段耗时；>1 秒才打。
+            let parts = take_public_parts();
             crate::server::logging::console(
                 "[Accounts]",
                 &format!(
-                    "列表快照 {} ms（累计：过滤+队首 {} / 隐藏摘要 {} / 账号投影 {} / 摘要+排序 {} ms，可见 {} 条）",
+                    "列表快照 {} ms（累计：过滤+队首 {} / 隐藏摘要 {} / 账号投影 {} / provider 摘要 {} / 排序 {} ms，可见 {} 条；账号投影子项：形状 {} / reading_key {} / 其余 {} ms）",
                     total.as_millis(), filtered_at.as_millis(), hidden_at.as_millis(),
-                    accounts_at.as_millis(), total.as_millis(), visible.len(),
+                    accounts_at.as_millis(), providers_at.as_millis(), total.as_millis(),
+                    visible.len(),
+                    parts[0] / 1000, parts[1] / 1000,
+                    (parts[2] / 1000).saturating_sub(parts[0] / 1000 + parts[1] / 1000),
                 ),
             );
+        } else {
+            let _ = take_public_parts();
         }
         snapshot
     }
@@ -402,6 +523,7 @@ impl AccountStore {
     ///
     /// 纯新增字段：各家的既有字段一个不动，旧客户端忽略它即可。
     pub(crate) fn public_account(&self, record: &StoredAccount) -> Value {
+        let started = Instant::now();
         // ── 插件记录优先（必须排在所有内置分支之前）─────────────────
         // 内置家装上插件后，新账号由插件落库（凭证在 `pluginSecret` 里，顶层
         // 没有任何内置字段）。若继续按 provider id 走下面的内置投影，那条
@@ -513,6 +635,7 @@ impl AccountStore {
         } else {
             self.to_public_account(record)
         };
+        add_public_part(0, started.elapsed().as_micros() as u64);
         match shaped {
             Value::Object(mut fields) => {
                 for key in ["rateLimits", "upstreamCooldownUntil", "upstreamBlockedReason"] {
@@ -651,7 +774,10 @@ impl AccountStore {
                 // 弹窗、徽章读的是**同一份事实**，不能各家形状一个口径。
                 // 恒为对象（未配置 = 各家缺省档的规范化形状，与写入侧
                 // `apply_patch` 的归一化一致），读侧不必判「键缺失」。
-                fields.insert("usageConfigKey".to_string(), Value::String(crate::server::core::usage_query::config::reading_key(record)));
+                let key_started = Instant::now();
+                let usage_key = crate::server::core::usage_query::config::reading_key(record);
+                add_public_part(1, key_started.elapsed().as_micros() as u64);
+                fields.insert("usageConfigKey".to_string(), Value::String(usage_key));
                 fields.insert(
                     "usageQuery".to_string(),
                     usage_query_public(record.fields().get("usageQuery")),
@@ -713,10 +839,14 @@ impl AccountStore {
                         Value::Bool(super::chatglm_accounts::guest_of_record(record)),
                     );
                 }
+                add_public_part(2, started.elapsed().as_micros() as u64);
                 Value::Object(fields)
             }
             // 各家形状恒为对象；真出现异常形态时原样透出，不在这里改语义
-            other => other,
+            other => {
+                add_public_part(2, started.elapsed().as_micros() as u64);
+                other
+            }
         }
     }
 

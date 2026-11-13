@@ -63,7 +63,9 @@ pub fn resolve_batch_targets(
     provider: Option<&str>,
     id: Option<&str>,
 ) -> Result<(Vec<Value>, usize), TargetError> {
-    let snapshot = store.list_accounts();
+    // 本函数只读 accounts 数组；旧入口会顺手算 provider 摘要与排序（稳态
+    // 约 1.3 秒），那是余额查询热路径上的纯浪费。
+    let snapshot = store.account_rows();
     let accounts: Vec<Value> = snapshot
         .get("accounts")
         .and_then(Value::as_array)
@@ -462,7 +464,7 @@ async fn sweep_due(store: &AccountStore) {
     // 全量账号快照（不看启用 / 可用）：Token 事实表要覆盖所有配了规则的账号，
     // 包括禁用的 —— 用户重新启用时读数已经在，不用等下一轮刷新才生效
     let all_accounts: Vec<Value> = store
-        .list_accounts()
+        .account_rows()
         .get("accounts")
         .and_then(Value::as_array)
         .cloned()
@@ -570,7 +572,7 @@ fn build_snapshot(store: &AccountStore) -> Value {
     let jobs_at = started.elapsed();
     let records = usage_records::load_all();
     let records_at = started.elapsed();
-    let accounts = store.list_accounts();
+    let accounts = store.account_rows();
     let accounts_at = started.elapsed();
     let list = accounts.get("accounts").and_then(Value::as_array);
     let mut rows = Vec::new();
