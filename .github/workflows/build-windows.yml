@@ -17,6 +17,34 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # 前端产物是**入库的静态文件**（ui/islands/ui.js、ui.css、login.js、
+      # ui/m/**、ui/i18n/**），Tauri 打包时直接把 frontendDist: ../ui 的字节
+      # 编进 exe；cargo build 自身不会重建前端。改了 ui-islands/src、
+      # ui-shared、mobile/src 或 i18n-src 后若不在打包前重建，exe 里就只有
+      # Rust 后端改动生效、UI 仍是旧的（半残版，见 3.5.1-beta-7）。
+      # 这里在 CI 上统一重建，保证上线的字节与源码同源，本地无需构建。
+      - name: Install Node (frontend assets)
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: |
+            desktop-tauri/ui-kit/package-lock.json
+            desktop-tauri/ui-islands/package-lock.json
+            desktop-tauri/mobile/package-lock.json
+            desktop-tauri/i18n/package-lock.json
+
+      - name: Rebuild frontend assets
+        shell: bash
+        run: |
+          npm --prefix desktop-tauri/ui-kit ci
+          npm --prefix desktop-tauri/ui-islands ci
+          npm --prefix desktop-tauri/mobile ci
+          npm --prefix desktop-tauri/i18n ci
+          npm --prefix desktop-tauri/ui-islands run build
+          npm --prefix desktop-tauri/mobile run build
+          npm --prefix desktop-tauri/i18n run build
+
       - name: Install Rust (stable)
         uses: dtolnay/rust-toolchain@stable
 
@@ -24,6 +52,11 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: desktop-tauri/src-tauri
+          # Tauri 在编译期把 frontendDist 里的静态文件嵌进 exe，rustc 不会把
+          # 这些文件登记为编译依赖。若命中上一次的 target/ 缓存，cargo 可能
+          # 整包跳过编译、直接复用旧 exe，把这里刚重建的前端字节丢掉。
+          # 把重建后的 ui/ 内容哈希加进缓存键：前端变了就不复用旧缓存。
+          key: frontend-${{ hashFiles('desktop-tauri/ui/**') }}
 
       - name: Build (release)
         working-directory: desktop-tauri/src-tauri

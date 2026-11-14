@@ -383,7 +383,7 @@ function AccountsPage() {
   return (
     <>
       <Card render={<section />} className='panel account-table'>
-        <PageAutoRefresh id='accountsAutoRefresh' settings={auto} onRefresh={() => void syncConnections()} />
+        <PageAutoRefresh id='accountsAutoRefresh' settings={auto} onRefresh={() => syncConnections()} />
         <div className='toolbar'>
           {/* 窄屏「筛选」入口：只在 ≤767px 显示（桌面由 CSS 隐藏）。
               按钮上的角标是当前生效的筛选条数 —— 筛选条件收进抽屉后，

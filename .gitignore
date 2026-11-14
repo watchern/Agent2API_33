@@ -13,6 +13,7 @@ desktop-tauri/target/
 # 本地开发过程产物
 .zcode/
 .verify/
+_verify*/
 prototype/
 .codeartsdoer/
 # 排查模型目录时导出的临时快照
