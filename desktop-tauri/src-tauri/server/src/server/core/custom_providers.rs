@@ -207,31 +207,37 @@ const FETCH_MODELS_TIMEOUT_MS: u64 = 15_000;
 /// baseUrl / enabled）缺失时按各自默认值补齐（见 `item_of`），不在这里丢弃 ——
 /// 「能列出来但编辑时才报缺字段」比「静默消失」好定位。
 fn read_items() -> Vec<Value> {
-    let raw = config::current();
-    let items = raw
-        .raw()
-        .get(KEY_CUSTOM_PROVIDERS)
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    let mut items: Vec<Value> = items
-        .into_iter()
-        .filter_map(|item| {
-            let object = item.as_object()?;
-            let id = object.get("id").and_then(Value::as_str)?.trim();
-            if id.is_empty() {
-                return None;
-            }
-            Some(item_of(object))
-        })
-        .collect();
-    // 对外契约是「按 createdAt 升序」。存储里本来就应当是这个顺序（create 追加），
-    // 但手改配置/旧版本写入可能乱序，所以读取时**总是**重排一次 —— 稳定排序，
-    // 同一个 createdAt（毫秒相同）保持原有相对顺序。
-    items.sort_by_key(|item| {
-        item.get("createdAt").and_then(Value::as_i64).unwrap_or(0)
-    });
-    items
+    // 热路径：每条账号投影都会走到这里（reading_key → get → read_items）。
+    // 旧实现 `config::current()` 会克隆整份 raw（含提示词全文几百行），14 条账号
+    // 就要克隆 14 次，正是 beta-4 实测「账号投影 reading_key 1173ms」的来源。
+    // 改用 `with_raw`：只在配置读锁内借出 raw 表、按需取一个键，**不克隆整份配置**。
+    // 闭包只做纯内存的取键/比较/拷值，不含 IO、不再获取其它锁（见 config::with_raw 约束）。
+    config::with_raw(|raw| {
+        let items = raw
+            .get(KEY_CUSTOM_PROVIDERS)
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let mut items: Vec<Value> = items
+            .into_iter()
+            .filter_map(|item| {
+                let object = item.as_object()?;
+                let id = object.get("id").and_then(Value::as_str)?.trim();
+                if id.is_empty() {
+                    return None;
+                }
+                Some(item_of(object))
+            })
+            .collect();
+        // 对外契约是「按 createdAt 升序」。存储里本来就应当是这个顺序（create 追加），
+        // 但手改配置/旧版本写入可能乱序，所以读取时**总是**重排一次 —— 稳定排序，
+        // 同一个 createdAt（毫秒相同）保持原有相对顺序。
+        items.sort_by_key(|item| {
+            item.get("createdAt").and_then(Value::as_i64).unwrap_or(0)
+        });
+        items
+    })
+    .unwrap_or_default()
 }
 
 /// 一条存储条目 → 对外形态：补齐缺失的默认字段，**只有契约里的八个键**。

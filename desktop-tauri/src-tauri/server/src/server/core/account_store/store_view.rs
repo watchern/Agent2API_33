@@ -60,8 +60,13 @@ fn take_public_parts() -> [u64; 3] {
 // 余额巡检、`resolve_batch_targets` 会各自把 14 条账号重新投影一遍。
 // 结果只取决于账号数据（account_revision）、目录/配置/插件状态
 // （catalog generation）与「今天」（签到日界），三者任一变化即换键；
-// 5 秒 TTL 只用来兜住那些不推版本号的运行期状态，界面无感。
-const LIST_TTL: Duration = Duration::from_secs(5);
+// TTL 25 秒：前端轮询间隔是 20s，原本 5s 会让每个轮询窗口必 miss（beta-4 实测
+// 36 次未命中重建），缓存形同虚设。提到 25s 后缓存跨越整个 20s 轮询窗口，同一轮询
+// 周期内的 /api/session、余额快照、巡检、resolve_batch_targets 共享同一份投影，
+// 把 reading_key / sorting / 限制器 等重算摊销掉。缓存键已含 account_revision、
+// catalog generation、北京日界，配置类改动至多延迟一个 TTL 边界（≤25s）透出，
+// 对 20s 轮询的界面无感。
+const LIST_TTL: Duration = Duration::from_secs(25);
 
 /// (入口种类, 库路径, account_revision, catalog generation, 北京日期键)
 /// 带上库路径：测试里同一进程可能开多个隔离库，revision 都从 0 开始，
