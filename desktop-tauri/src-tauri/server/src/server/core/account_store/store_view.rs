@@ -482,7 +482,8 @@ impl AccountStore {
                 &format!(
                     "列表快照 {} ms（累计：过滤+队首 {} / 隐藏摘要 {} / 账号投影 {} / provider 摘要 {} / 排序 {} ms，可见 {} 条；账号投影子项：形状 {} / reading_key {} / 其余 {} ms）",
                     total.as_millis(), filtered_at.as_millis(), hidden_at.as_millis(),
-                    accounts_at.as_millis(), providers_at.as_millis(), total.as_millis(),
+                    accounts_at.as_millis(), providers_at.as_millis(),
+                    total.saturating_sub(providers_at).as_millis(),
                     visible.len(),
                     parts[0] / 1000, parts[1] / 1000,
                     (parts[2] / 1000).saturating_sub(parts[0] / 1000 + parts[1] / 1000),

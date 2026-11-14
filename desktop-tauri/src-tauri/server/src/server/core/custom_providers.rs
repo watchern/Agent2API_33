@@ -616,14 +616,32 @@ where
 }
 
 /// 按 id 取一条；不存在返回 None。
+///
+/// 热路径修正（beta-6）：旧实现 `read_items().into_iter().find(...)` 会先把
+/// **整份自定义提供商数组**（14 家，每家可能带长 model / mapping 列表）整体
+/// `.cloned()` 成 `Vec<Value>`，再只挑出 1 家 —— 等于为找 1 条付了 14 条的
+/// 克隆成本。账号投影里的 `reading_key` 每条账号都走一次 `get`，14 条账号就是
+/// 14 次整份克隆（beta-4 / beta-5 实测 `reading_key` 仍 ~1.1–1.6s 的真因；
+/// beta-5 的 `with_raw` 只去掉了 `RuntimeConfig` 提示词克隆，数组克隆原封不动）。
+///
+/// 新实现直接在 `config::with_raw` 读锁内**借**数组、`.iter().find()` 按 id
+/// 定位，**只 `item_of` 命中那 1 家**（与 `read_items` 同一归一口径，输出字节
+/// 一致），不再克隆其余 13 家。把「整份克隆 ×14」降到「单家克隆 ×14」。
 pub fn get(id: &str) -> Option<Value> {
     let id = id.trim();
     if id.is_empty() {
         return None;
     }
-    read_items()
-        .into_iter()
-        .find(|item| item.get("id").and_then(Value::as_str) == Some(id))
+    config::with_raw(|raw| {
+        let items = raw
+            .get(KEY_CUSTOM_PROVIDERS)
+            .and_then(Value::as_array)?;
+        let object = items.iter().find(|item| {
+            item.get("id").and_then(Value::as_str) == Some(id)
+        })?;
+        Some(item_of(object.as_object()?))
+    })
+    .flatten()
 }
 
 /// 这个 id 是不是**已注册的自定义提供商**。
