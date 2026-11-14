@@ -1,6 +1,6 @@
 import { useCallback, useSyncExternalStore } from 'react'
 
-export type PageRefreshTaskId = 'requestsAutoRefresh' | 'logsAutoRefresh' | 'reportAutoRefresh'
+export type PageRefreshTaskId = 'requestsAutoRefresh' | 'logsAutoRefresh' | 'reportAutoRefresh' | 'accountsAutoRefresh'
 export type PageRefreshTask = {
   id?: string
   enabled?: boolean

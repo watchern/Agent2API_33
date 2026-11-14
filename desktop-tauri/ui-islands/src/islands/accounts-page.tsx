@@ -15,7 +15,7 @@ import {
   filterActive, getStore, groupSortRules, groupView, hiddenAccounts, installAccountsApi, normalizeProviderFilter, openBatchDialog,
   providerSummaryList, queryAllUsage, cancelAllUsage, refreshList, reorderQueue, rowContext, seats, segmentCounts,
   setAllGroupsCollapsed, setAllPicked, setProviderFilter, setSearchFilter, setSegmentFilter,
-  snapshot, startConnectionsPolling, subscribe, subscribeProxyPool, syncGroupTotalPreference,
+  snapshot, subscribe, subscribeProxyPool, syncConnections, syncGroupTotalPreference,
   tokenUsageOf, togglePick, usageEntryOf, GROUP_TOTAL_FILTERED_KEY,
 } from './accounts-data'
 import {
@@ -29,6 +29,7 @@ import { getPluginStartup, hiddenWithStartup, subscribePluginStartup } from '../
 import { activeGroupSortRules, manualOrderBlockedMessage } from './accounts-group-settings'
 import { Badge, Spinner } from '@ui'
 import { Alert } from '@ui'
+import { PageAutoRefresh, usePageAutoRefresh } from './page-auto-refresh'
 
 /** 列设置的句柄（注册在挂载后的布局 effect 里，见下方说明） */
 let colHandle: ColSettingsHandle | null = null
@@ -101,6 +102,10 @@ function AccountsPage() {
   const hidden = hiddenWithStartup(hiddenAccounts())
   /** 「未显示的账号」明细抽屉：平时关着，工具栏那枚入口打开它 */
   const [hiddenOpen, setHiddenOpen] = React.useState(false)
+  /** 账号页连接数自动刷新的开关 + 间隔（与日志页同一套控件 + 轮询）。
+   *  只管「实时连接数」这一列：停用来后连接数不再自动更新，手动「刷新」
+   *  按钮仍走整表重载。关掉它不影响其它列。 */
+  const auto = usePageAutoRefresh('accountsAutoRefresh')
   // groups = 要渲染的（当前筛选下一条都看不见的组不留空壳）；allGroups = 全部组，
   // 拼队列与「折叠 / 展开全部」都用它
   const { groups, allGroups } = groupView(usageEntryOf, tokenUsageOf)
@@ -165,6 +170,18 @@ function AccountsPage() {
     window.addEventListener('storage', onStorage)
     return () => window.removeEventListener('storage', onStorage)
   }, [])
+
+  // 连接数自动刷新（仅账号页可见时轮询）：把改造前「写死 10 秒」的连接数轮询
+  // 换成可配置间隔（auto.ms）与开关（auto.enabled）—— 与日志页同一手法。
+  // 依赖 [auto.enabled, auto.ms]：改了开关或间隔立即重建定时器；离开页面 / 隐藏
+  // 标签页时本就不轮询（见回调里的判定），所以不把 currentPage 也列进依赖。
+  React.useEffect(() => {
+    if (!auto.enabled) return
+    const timer = window.setInterval(() => {
+      if (!document.hidden && shared().wbApp?.currentPage === 'accounts') void syncConnections()
+    }, auto.ms)
+    return () => window.clearInterval(timer)
+  }, [auto.enabled, auto.ms])
 
   // 列设置的注册必须在挂载后：按钮要插进本岛渲染出来的 `.batch-actions`，而
   // syncStaticHead 要求登记表已存在（它按 id 查配置）。用布局 effect 是为了让首屏的
@@ -366,6 +383,7 @@ function AccountsPage() {
   return (
     <>
       <Card render={<section />} className='panel account-table'>
+        <PageAutoRefresh id='accountsAutoRefresh' settings={auto} onRefresh={() => void syncConnections()} />
         <div className='toolbar'>
           {/* 窄屏「筛选」入口：只在 ≤767px 显示（桌面由 CSS 隐藏）。
               按钮上的角标是当前生效的筛选条数 —— 筛选条件收进抽屉后，
@@ -670,7 +688,6 @@ function mount(): void {
 // 对外契约与连接数轮询都在模块求值时完成（app.js 的 refresh() 是异步的，但
 // report.js / add-account.js 这些同步脚本紧随其后执行 —— 拿不到就会退化成静默不生效）
 installAccountsApi()
-startConnectionsPolling()
 
 // 首次切到本页时才挂载（见 island-lazy）：隐藏页不在首屏渲染，也不拉数据。
 mountOnPage('accounts', PAGE_SELECTOR, mount)

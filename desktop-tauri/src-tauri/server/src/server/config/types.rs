@@ -492,6 +492,8 @@ pub const KEY_LOGS_AUTO_REFRESH: &str = "logsAutoRefresh";
 pub const KEY_REQUESTS_AUTO_REFRESH: &str = "requestsAutoRefresh";
 /// 报表页自动刷新在 `scheduledTasks` 下的子键（同上）
 pub const KEY_REPORT_AUTO_REFRESH: &str = "reportAutoRefresh";
+/// 账号页连接数自动刷新在 `scheduledTasks` 下的子键（同上，前端定时器，后端只存配置）
+pub const KEY_ACCOUNTS_AUTO_REFRESH: &str = "accountsAutoRefresh";
 /// 软件版本检查在 `scheduledTasks` 下的子键（后端定时向 GitHub 查最新发布版本）
 pub const KEY_UPDATE_CHECK: &str = "updateCheck";
 
@@ -512,6 +514,14 @@ pub const DEFAULT_MODEL_REFRESH_MINUTES: i64 = 60;
 pub const DEFAULT_LOGS_AUTO_REFRESH_SECONDS: i64 = 1;
 pub const DEFAULT_REQUESTS_AUTO_REFRESH_SECONDS: i64 = 1;
 pub const DEFAULT_REPORT_AUTO_REFRESH_SECONDS: i64 = 1;
+/// 账号页连接数自动刷新的默认间隔（秒）：10 秒。
+///
+/// 沿用改造前账号页「连接数轮询」的硬编码节奏（旧 `accounts-data.ts` 里写死的
+/// 10 秒，本次改造抽成可配置任务）。连接数走的是独立的轻量接口（只回写各账号的
+/// 实时连接计数，不重拉整张账号表），10 秒一刷对「看一眼现在几条连接在跑」足够，
+/// 也不会给转发层添负担。与另外两个前端刷新不同：那两条是「正盯着那一页要
+/// 实时」所以默认压到 1 秒；连接数是边角信息，10 秒更合适。
+pub const DEFAULT_ACCOUNTS_AUTO_REFRESH_SECONDS: i64 = 10;
 /// 软件版本检查默认间隔（分钟）：每 20 分钟查一次 GitHub 最新发布。
 ///
 /// 20 分钟 = 3 次/小时，相对匿名限额（60 次/小时，且**按出口 IP 计** —— 同一
@@ -554,6 +564,7 @@ pub struct ScheduledSettings {
     pub logs_auto_refresh: IntervalTask,
     pub requests_auto_refresh: IntervalTask,
     pub report_auto_refresh: IntervalTask,
+    pub accounts_auto_refresh: IntervalTask,
     pub update_check: IntervalTask,
 }
 
@@ -579,6 +590,10 @@ impl Default for ScheduledSettings {
             report_auto_refresh: IntervalTask {
                 enabled: true,
                 interval: DEFAULT_REPORT_AUTO_REFRESH_SECONDS,
+            },
+            accounts_auto_refresh: IntervalTask {
+                enabled: true,
+                interval: DEFAULT_ACCOUNTS_AUTO_REFRESH_SECONDS,
             },
             update_check: IntervalTask {
                 enabled: true,

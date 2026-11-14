@@ -80,8 +80,9 @@ pub const TASK_UPDATE_CHECK: &str = config::KEY_UPDATE_CHECK;
 pub const TASK_LOGS_AUTO_REFRESH: &str = config::KEY_LOGS_AUTO_REFRESH;
 pub const TASK_REQUESTS_AUTO_REFRESH: &str = config::KEY_REQUESTS_AUTO_REFRESH;
 pub const TASK_REPORT_AUTO_REFRESH: &str = config::KEY_REPORT_AUTO_REFRESH;
+pub const TASK_ACCOUNTS_AUTO_REFRESH: &str = config::KEY_ACCOUNTS_AUTO_REFRESH;
 
-pub const TASKS: [TaskDef; 6] = [
+pub const TASKS: [TaskDef; 7] = [
     TaskDef {
         id: TASK_CREDENTIAL_MAINTENANCE,
         label: "凭证维护",
@@ -142,6 +143,16 @@ pub const TASKS: [TaskDef; 6] = [
         max: config::INTERVAL_MAX_SECONDS,
         default_interval: config::DEFAULT_REPORT_AUTO_REFRESH_SECONDS,
     },
+    TaskDef {
+        id: TASK_ACCOUNTS_AUTO_REFRESH,
+        label: "账号页连接数自动刷新",
+        description: "停留在「账号」页时按此间隔重新拉取各账号的实时连接数；页面不可见时不请求。连接数走独立轻量接口，不重拉整张账号表。",
+        unit: "seconds",
+        runner: Runner::Frontend,
+        min: config::INTERVAL_MIN_SECONDS,
+        max: config::INTERVAL_MAX_SECONDS,
+        default_interval: config::DEFAULT_ACCOUNTS_AUTO_REFRESH_SECONDS,
+    },
 ];
 
 pub fn find(id: &str) -> Option<&'static TaskDef> {
@@ -156,6 +167,7 @@ fn settings_of(settings: config::ScheduledSettings, id: &str) -> config::Interva
         TASK_LOGS_AUTO_REFRESH => settings.logs_auto_refresh,
         TASK_REQUESTS_AUTO_REFRESH => settings.requests_auto_refresh,
         TASK_REPORT_AUTO_REFRESH => settings.report_auto_refresh,
+        TASK_ACCOUNTS_AUTO_REFRESH => settings.accounts_auto_refresh,
         _ => config::IntervalTask { enabled: false, interval: 0 },
     }
 }

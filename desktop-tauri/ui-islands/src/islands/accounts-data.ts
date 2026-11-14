@@ -79,15 +79,12 @@ export function refreshCaches(validIds: Set<string>): void {
   if (touched) patch({ connections, usageInflight: inflight, selected })
 }
 
-/* ─── 连接数（实时，2 秒一轮）────────────────────
+/* ─── 连接数（实时，可配置间隔轮询）────────────────────
  * 口径与 OmniProxy 上游管理页的「连接」列一致：**此刻正在使用这个账号的请求数**
  * （一个请求在账号间轮换时计数跟着走，见后端 core::upstream::connections）。
- * 单独一条 2 秒轮询而不是跟着 app.js 那 20 秒一轮：连接数的全部意义就在「现在」。
+ * 连接数走独立轻量接口（只回写各账号实时连接数，不重拉整张账号表）而不是跟着 app.js 那 20 秒一轮：连接数的全部意义就在「现在」。
  * 后端那边是进程内计数（不读盘、不出网），所以这条链路的代价足够低。 */
 
-/** 10 秒：连接数对实时性要求低（「正在跑」晚几秒可见无所谓），降频把轮询成本
- * 压到可忽略；原 2 秒间隔在慢环境下请求会堆叠，账号页跟着发卡。 */
-export const CONNECTIONS_POLL_MS = 10000
 
 export function connectionsOf(id: string): number {
   return getStore().connections.get(id) || 0
@@ -142,19 +139,6 @@ function sameConnections(
     if (prev.get(id) !== count) return false
   }
   return true
-}
-
-/**
- * 起轮询定时器（只起一次）。只在**账号页可见**时真发请求：切到别的页、或窗口被
- * 最小化时不打后端 —— 与 requests-page / logs-panel 的轮询同一取舍。
- */
-let connectionsTimer: ReturnType<typeof setInterval> | null = null
-export function startConnectionsPolling(): void {
-  if (connectionsTimer) return
-  connectionsTimer = setInterval(() => {
-    if (document.hidden || shared().wbApp?.currentPage !== 'accounts') return
-    void syncConnections()
-  }, CONNECTIONS_POLL_MS)
 }
 
 /* ─── 行内动作（启用 / 顺序 / 限流 / 代理）─────

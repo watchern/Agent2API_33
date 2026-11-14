@@ -14,7 +14,7 @@ type Host = {
   wbApp?: { readonly currentPage?: string; toast?(message: string, kind?: 'ok' | 'err'): void }
 }
 const host = () => window as unknown as Host
-const pages = { requestsAutoRefresh: 'requests', logsAutoRefresh: 'logs', reportAutoRefresh: 'overview' } as const
+const pages = { requestsAutoRefresh: 'requests', logsAutoRefresh: 'logs', reportAutoRefresh: 'overview', accountsAutoRefresh: 'accounts' } as const
 
 function api() {
   const bridge = host().workbuddyDesktop

@@ -296,6 +296,12 @@ pub(super) fn scheduled_from(map: &Map<String, Value>) -> ScheduledSettings {
             INTERVAL_MIN_SECONDS,
             INTERVAL_MAX_SECONDS,
         ),
+        accounts_auto_refresh: task(
+            KEY_ACCOUNTS_AUTO_REFRESH,
+            defaults.accounts_auto_refresh.interval,
+            INTERVAL_MIN_SECONDS,
+            INTERVAL_MAX_SECONDS,
+        ),
         update_check: task(
             KEY_UPDATE_CHECK,
             defaults.update_check.interval,
