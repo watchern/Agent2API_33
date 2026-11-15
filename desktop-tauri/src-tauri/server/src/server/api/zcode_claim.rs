@@ -33,6 +33,13 @@
 //!     否则用户会一直点那颗按钮、每次拿回同一句「该账号已领取过」。
 //! 响应里带上落库后的状态，前端不必为了刷新那颗按钮再拉一次账号列表。
 //!
+//! ── 本期活动全部已领 = 今日已签（2026-11-15）──────────────────
+//! 活动常常跨天（周末场、周中场）：昨天领的、今天仍有效的活动不会进插件
+//! 的当日 `checkin_targets`，`dailyCheckin.completed` 因此恒为 false，
+//! 签到中心停在「待签」，而套餐弹窗里那个活动明明是「已领取」。
+//! `preview` 会读响应里的 `plans`，本期有效活动全部已领取就把当日台账
+//! 落成已完成，见 `record_all_plans_claimed`。
+//!
 //! ── 定时领取与手动领取 ──────────────────────────────────────
 //! 手动领取由本接口接收界面当次验证结果；定时领取由插件按需发布验证任务，
 //! 管理界面经 `zcode_claim_verification` 回传，继续同一轮领取和签到记账。
@@ -134,6 +141,7 @@ pub async fn preview(state: &ServerState, account_id: &str) -> Response {
     match call_action(state, account_id, "claim.preview", &Value::Null).await {
         Ok(body) => {
             record_daily_checkin(state, account_id, &body);
+            record_all_plans_claimed(state, account_id, &body);
             ok_json(body)
         },
         Err((status, message)) => management_error(status, message),
@@ -204,6 +212,70 @@ pub async fn claim_plan(state: &ServerState, account_id: &str, body: &Bytes) -> 
         return ok_json(result);
     }
     ok_json(outcome)
+}
+
+/// 「本期活动全部已领取」也算今日已签（用户口径 2026-11-15）。
+///
+/// ZCode 没有签到接口，每天的「签到」就是领限时套餐。但插件算
+/// `dailyCheckin.completed` 时只把**今天领过 / 今天上游下发**的套餐算作
+/// 目标：跨天活动（昨天领、今天仍有效）会让 `totalCount = 0`、
+/// `completed = false`，于是签到中心停在「待签」，而套餐弹窗里那个活动
+/// 明明是「已领取」。
+///
+/// 这里直接读 `claim.preview` 返回的 `plans`（插件已把台账里已领的活动
+/// merge 回来，正是弹窗展示的那份）：本期仍有有效活动、且全部 `claimed`
+/// 时，把当日台账落成已完成。`checkin_state::apply` 会同步点亮 `checkinAt`，
+/// 签到中心 / 排程 / 补签轮共用同一份判据，无需改动它们。
+///
+/// 三种情况不落，避免活动还没开抢就误判成已签：没有本期活动、存在未领或
+/// 状态未知的活动、以及插件明确报告来源查询不完整（`sourcesComplete != true`）。
+/// 已结束的历史活动（`endsAt` 过期）不参与判定，否则 90 天台账会一直把
+/// 账号钉在「已签」。
+fn record_all_plans_claimed(state: &ServerState, account_id: &str, body: &Value) {
+    let now = crate::server::logging::now_ms();
+    let Some(plans) = body.get("plans").and_then(Value::as_array) else { return; };
+    let current: Vec<&Value> = plans
+        .iter()
+        .filter(|plan| {
+            plan.get("endsAt").and_then(Value::as_i64)
+                .map(|end| end > now / 1000)
+                .unwrap_or(true)
+        })
+        .collect();
+    if current.is_empty() { return; }
+    if !current.iter().all(|plan| {
+        plan.get("claimed").and_then(Value::as_bool) == Some(true)
+            || plan.get("claimState").and_then(Value::as_str) == Some("claimed")
+    }) {
+        return;
+    }
+    if body.get("dailyCheckin")
+        .and_then(|value| value.get("sourcesComplete").and_then(Value::as_bool))
+        != Some(true)
+    {
+        return;
+    }
+    let at = body.get("dailyCheckin")
+        .and_then(|value| value.get("at").and_then(Value::as_i64))
+        .filter(|at| *at > 0)
+        .unwrap_or(now);
+    let total = current.len() as u64;
+    // `checkin_state::apply` 要求 completed 时 count == total > 0 且来源完整，
+    // 这里按「本期活动数」如实填，不伪造领取时刻。
+    let done = serde_json::json!({
+        "at": at,
+        "kind": "plans",
+        "completed": true,
+        "completedCount": total,
+        "totalCount": total,
+        "sourcesComplete": true,
+    });
+    if let Err(message) = state.store().plugin_set_ledger(account_id, "dailyCheckin", &done) {
+        crate::server::logging::verbose(
+            "[Claim]",
+            &format!("账号 {account_id} 的「本期活动全部已领」状态未能落盘：{message}"),
+        );
+    }
 }
 
 fn record_daily_checkin(state: &ServerState, account_id: &str, body: &Value) {
