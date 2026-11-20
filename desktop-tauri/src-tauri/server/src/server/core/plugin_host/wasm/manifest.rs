@@ -6,7 +6,7 @@ use serde::Deserialize;
 pub const TARGET: &str = "wasm32-unknown-unknown";
 pub const ABI: u32 = 1;
 pub const CAPABILITIES: &[&str] = &[
-    "http.v1", "websocket.v1", "accounts.cas.v1", "settings.v1", "sessions.v1",
+    "http.v1", "http.timeout.v1", "websocket.v1", "accounts.cas.v1", "settings.v1", "sessions.v1",
     "clock.v1", "random.v1", "locks.v1", "catalog.v1", "chat.stream.v1",
     "login.forms.v1", "checkin.rolling.v1", "errors.v1", "accounts.identity.v1",
     "catalog.accounts.v1", "state.v1", "resources.v1", "images.v1", "tasks.v1",
@@ -67,6 +67,9 @@ pub fn read(dir: &Path, manifest: &proto::PackManifest) -> Result<Option<Options
     let requires = |name: &str| spec.requires.iter().any(|item| item == name);
     for (capability, dependencies) in [
         ("settings.schema.v1", &["settings.v1"][..]),
+        // 上游 3.5.0-beta.2+ 的独立 WASM 插件都声明了这一能力；只允许它建立在
+        // 普通 http.v1 之上。本 fork 暂沿用全局默认超时，不按 timeout_ms 细分期限。
+        ("http.timeout.v1", &["http.v1"][..]),
         ("catalog.accounts.v1", &["catalog.v1", "accounts.cas.v1"][..]),
         ("accounts.identity.v1", &["accounts.cas.v1"][..]),
         ("login.interaction.v1", &["login.forms.v1", "state.v1"][..]),
