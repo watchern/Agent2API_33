@@ -2,6 +2,7 @@
 
 pub(crate) mod catalog;
 mod context;
+pub(crate) mod desktop_launch;
 mod errors;
 mod http;
 mod limits;
@@ -66,10 +67,11 @@ pub(crate) fn contract() -> serde_json::Value {
         "state": { "login": "discard_on_reload", "conversation": "preserve_on_reload_reset_on_restart",
             "account": "encrypted_persistent_compare_exchange", "schema": "plugin_owned" },
         "settings": { "schema": "init.settings_schema", "group": "init.settings_group",
-            "types": ["string", "number", "boolean", "select"], "placement": "host_owned",
+            "types": ["string", "number", "boolean", "select", "upstream_version"], "placement": "host_owned",
             "values": "host_saved_overrides", "secrets": "account_store_only", "runtimeOverrides": "settings.overrides" },
         "images": "normalized_result_resources", "catalog": "account_snapshots_provider_union",
-        "nativeHelpers": "explicit_grant_pinned_package", "network": "https_exact_origins_no_redirects" })
+        "nativeHelpers": "explicit_grant_pinned_package", "network": "https_exact_origins_no_redirects",
+        "desktopLaunch": desktop_launch::contract() })
 }
 
 pub(crate) fn forget(provider: &str) {

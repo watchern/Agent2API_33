@@ -110,6 +110,8 @@ pub enum SecretScope {
     CodingSessions,
     /// 登录校验凭据与部署域名绑定，不参与账号云同步。
     PanelCaptcha,
+    /// 本机客户端恢复材料不能随账号密钥的云同步或恢复而失效。
+    DesktopLaunch,
 }
 
 impl SecretScope {
@@ -124,6 +126,7 @@ impl SecretScope {
             SecretScope::CloudSync => "cloud-sync.key",
             SecretScope::CodingSessions => "coding-sessions.key",
             SecretScope::PanelCaptcha => "panel-captcha.key",
+            SecretScope::DesktopLaunch => "desktop-client.key",
         }
     }
 
@@ -138,6 +141,7 @@ impl SecretScope {
             SecretScope::CloudSync => "在「设置 → 数据 → 云同步」里重新输入同步密码即可自愈",
             SecretScope::CodingSessions => "在 AI 助手的编程会话连接设置里重新输入密钥即可自愈",
             SecretScope::PanelCaptcha => "在机器人校验设置中重新保存 Turnstile 服务端密钥即可恢复",
+            SecretScope::DesktopLaunch => "本机凭证备份密钥缺失或不匹配，请保留备份并恢复原 desktop-client.key",
         }
     }
 }
@@ -161,12 +165,15 @@ fn cache_for(scope: SecretScope) -> &'static std::sync::Mutex<Option<[u8; KEY_LE
         std::sync::OnceLock::new();
     static PANEL_CAPTCHA: std::sync::OnceLock<std::sync::Mutex<Option<[u8; KEY_LEN]>>> =
         std::sync::OnceLock::new();
+    static DESKTOP_LAUNCH: std::sync::OnceLock<std::sync::Mutex<Option<[u8; KEY_LEN]>>> =
+        std::sync::OnceLock::new();
     match scope {
         SecretScope::UpdateToken => UPDATE_TOKEN.get_or_init(|| std::sync::Mutex::new(None)),
         SecretScope::Accounts => ACCOUNTS.get_or_init(|| std::sync::Mutex::new(None)),
         SecretScope::CloudSync => CLOUD_SYNC.get_or_init(|| std::sync::Mutex::new(None)),
         SecretScope::CodingSessions => CODING_SESSIONS.get_or_init(|| std::sync::Mutex::new(None)),
         SecretScope::PanelCaptcha => PANEL_CAPTCHA.get_or_init(|| std::sync::Mutex::new(None)),
+        SecretScope::DesktopLaunch => DESKTOP_LAUNCH.get_or_init(|| std::sync::Mutex::new(None)),
     }
 }
 

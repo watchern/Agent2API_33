@@ -31,6 +31,8 @@ pub(crate) mod client;
 pub mod selfupdate;
 mod token;
 mod version;
+/// 官网上游版本清单抓取（upstream_versions 的定时同步依赖）。
+pub(crate) mod website;
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};

@@ -14,6 +14,8 @@ pub const CAPABILITIES: &[&str] = &[
     "settings.schema.v1",
     // 上游 3.5.0-beta.2+ 的独立 WASM 插件（如 zcode-intl）依赖的能力。
     "protocol.convert.v1", "verification.account.v1", "verification.claim.v1",
+    // beta.6 的独立 WASM 插件（zcode-intl beta.3）声明的本机启动能力。
+    "desktop.launch.v1",
 ];
 
 #[derive(Clone, Debug, Deserialize)]
@@ -22,6 +24,8 @@ pub struct Manifest {
     pub abi: u32,
     pub requires: Vec<String>,
     pub origins: Vec<String>,
+    #[serde(default)]
+    pub desktop_launch: Option<super::desktop_launch::declaration::Declaration>,
     #[serde(default)]
     pub helpers: Vec<String>,
     #[serde(default = "memory_default")]
@@ -81,6 +85,15 @@ pub fn read(dir: &Path, manifest: &proto::PackManifest) -> Result<Option<Options
         if requires(capability) && dependencies.iter().any(|dependency| !requires(dependency)) {
             return Err(format!("Wasm 能力 {capability} 缺少依赖声明"));
         }
+    }
+    // beta.6 要求 desktop.launch.v1 同时声明 desktop_launch 配置块；反之亦然。
+    // 注意：上游还要求它依赖 accounts.identity.v1，但 zcode-intl beta.3 的清单
+    // 并未声明该能力，故 fork 不照搬这条依赖约束，只做「能力↔配置块」一致性校验。
+    if requires("desktop.launch.v1") != spec.desktop_launch.is_some() {
+        return Err("本机启动必须同时声明能力与客户端范围".into());
+    }
+    if let Some(declaration) = &spec.desktop_launch {
+        declaration.validate()?;
     }
     if !(8..=128).contains(&spec.memory_mib) || !(1..=16).contains(&spec.concurrency) {
         return Err("Wasm 资源声明超出允许范围（内存 8–128 MiB，并发 1–16）".into());

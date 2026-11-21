@@ -139,6 +139,8 @@ pub mod task_state;
 /// Trae 历史模型 ID（`-solo` / `-solo-max`）的一次性清理：见模块头。
 pub(crate) mod trae_model_ids;
 pub mod update;
+/// 插件声明的上游客户端版本同步（beta.6 schema 的 upstream_version 类型依赖）。
+pub mod upstream_versions;
 pub mod upstream;
 pub(crate) mod user_agent;
 pub mod usage_query;

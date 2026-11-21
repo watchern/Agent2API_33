@@ -28,11 +28,45 @@ pub(super) fn user_owned(host: &Host, provider: &str, field: &str) -> bool {
         (id == provider || schema.owner(id) == provider) && schema.fields.iter().any(|entry| entry.key == field)))
 }
 
-fn stored(schema: &Schema, provider: &str) -> Map<String, Value> {
-    config::with_raw(|raw| schema.fields.iter().map(|field| {
-        let value = raw.get(&key(schema.owner(provider), &field.key)).cloned().unwrap_or(Value::Null);
+fn stored_from_raw(raw: &Map<String, Value>, schema: &Schema, provider: &str) -> Map<String, Value> {
+    schema.fields.iter().map(|field| {
+        let value = if field.kind == "upstream_version" {
+            field.source_id.as_deref()
+                .and_then(|source_id| crate::server::core::upstream_versions::configured_interval_from_raw(raw, source_id))
+                .map(Value::from)
+                .unwrap_or(Value::Null)
+        } else {
+            raw.get(&key(schema.owner(provider), &field.key)).cloned().unwrap_or(Value::Null)
+        };
         (field.key.clone(), value)
-    }).collect()).unwrap_or_default()
+    }).collect()
+}
+
+fn stored(schema: &Schema, provider: &str) -> Map<String, Value> {
+    config::with_raw(|raw| stored_from_raw(raw, schema, provider)).unwrap_or_default()
+}
+
+/// 列出当前已启用插件声明的全部上游版本源（upstream_versions 定时同步用）。
+pub(crate) fn declared_upstream_sources() -> Vec<String> {
+    let mut sources = HashSet::new();
+    for info in super::runtime::provider_infos() {
+        let Ok(host) = active(info.id.as_str()) else { continue };
+        let Ok(schema) = declared(&host, info.id.as_str()) else { continue };
+        for field in &schema.fields {
+            if field.kind == "upstream_version" {
+                if let Some(source_id) = field.source_id.as_deref() {
+                    sources.insert(source_id.to_string());
+                }
+            }
+        }
+    }
+    let mut list: Vec<_> = sources.into_iter().collect();
+    list.sort();
+    list
+}
+
+pub(crate) fn has_upstream_source(source_id: &str) -> bool {
+    declared_upstream_sources().iter().any(|item| item == source_id)
 }
 
 fn revision(host: &Host, provider: &str, schema: &Schema, values: &Map<String, Value>) -> String {

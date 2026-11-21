@@ -56,6 +56,7 @@ impl Host {
             })?;
             let value = unwrap_reply(reply).map_err(|error| error.message)?;
             let settings = super::super::provider_settings::parse(self, &value)?;
+            super::desktop_launch::validate_metadata(&runtime.shared.options, &value)?;
             let providers: Vec<proto::ProviderInfo> = serde_json::from_value(value).map_err(|_| "Wasm 握手返回无效提供商信息")?;
             if providers.len() != 1 || providers[0].id.as_str() != runtime.shared.options.provider {
                 return Err("Wasm 提供商身份与安装清单不一致".to_string());

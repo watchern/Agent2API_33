@@ -366,6 +366,7 @@ impl ServerState {
         // 结果 —— 老用户升级后第一次启动拿到的就是他真正的旧配置，
         // 下面日志裁剪天数与旧文件候选目录才不会用错值。
         let snapshot = config::init(db.clone());
+        core::upstream_versions::install(db.clone());
         core::task_state::install(db.clone());
         core::maintenance::storage::install(db.clone());
         // 每账号的余额查询记录（余额不足跳过 / 自动禁用的底座）：装库句柄时
@@ -763,6 +764,8 @@ impl ServerState {
         core::scheduled_tasks::spawn(state.store.clone(), state.update.clone());
         // 配置更新和插件热加载会唤醒排程，关闭时保持等待而不是省掉调度循环。
         core::growth_scheduler::spawn(state.store.clone());
+        // 插件 upstream_version 设置项的定时同步循环（无声明源时空转）。
+        core::upstream_versions::spawn();
         // ZCode 活动套餐的「推理要不要验证码令牌」由上游配置说 —— 那份同步
         // 循环随实现搬到插件了（它挂在插件的转发钩子上，见插件侧
         // `zcode::config_sync::maybe_sync`）。网关这边不再有常驻任务。
