@@ -61,7 +61,7 @@ impl Transient {
         if let Some(revision) = self.sequence.checked_add(1) { self.sequence = revision; entry.revision = revision; }
         else { self.entries.remove(&id); }
     }
-    fn invoke(&mut self, method: &str, namespace: &str, key: &str, params: &Value, max_ttl: i64, limit: usize) -> Result<Value, proto::WireError> {
+    pub(super) fn invoke(&mut self, method: &str, namespace: &str, key: &str, params: &Value, max_ttl: i64, limit: usize) -> Result<Value, proto::WireError> {
         let now = crate::server::logging::now_ms();
         self.entries.retain(|_, entry| entry.expires > now);
         let id = format!("{namespace}\0{key}");
