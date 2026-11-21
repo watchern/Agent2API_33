@@ -50,7 +50,7 @@ pub async fn fetch_json_limit(value: &str, timeout_ms: u64, limit: usize) -> Res
     for (name, header_value) in &headers {
         builder = builder.header(name.as_str(), header_value.as_str());
     }
-    let response = tokio::time::timeout(Duration::from_millis(timeout_ms), builder.send())
+    let mut response = tokio::time::timeout(Duration::from_millis(timeout_ms), builder.send())
         .await
         .map_err(|_| UpdateError::new("连接官网上游版本服务超时"))?
         .map_err(|error| UpdateError::new(format!("连接官网上游版本服务失败：{}", egress::describe_error_detail(&error))))?;
