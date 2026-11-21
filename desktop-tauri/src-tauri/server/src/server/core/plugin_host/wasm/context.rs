@@ -14,6 +14,8 @@ pub struct Shared {
     pub cancel: CancellationToken,
     pub slots: Arc<Semaphore>,
     pub control_slots: Arc<Semaphore>,
+    // 验证码交互短通道的并发槽（上游 verification.slots 用）。
+    pub(super) verification_slots: Arc<Semaphore>,
     pub locks: Mutex<HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>>,
     pub sessions: Mutex<HashMap<String, (i64, Value)>>,
     pub(super) login_state: Mutex<super::state::Transient>,
@@ -25,7 +27,7 @@ impl Shared {
     pub fn new(options: Options, callbacks: Arc<dyn GatewayCallbacks>) -> Arc<Self> {
         Arc::new(Self {
             slots: Arc::new(Semaphore::new(options.manifest.concurrency)),
-            control_slots: Arc::new(Semaphore::new(2)), options, callbacks,
+            control_slots: Arc::new(Semaphore::new(2)), verification_slots: Arc::new(Semaphore::new(4)), options, callbacks,
             cancel: CancellationToken::new(), locks: Mutex::new(HashMap::new()),
             sessions: Mutex::new(HashMap::new()), login_state: Mutex::new(Default::default()),
             interactions: Default::default(), login_proxies: Mutex::new(HashMap::new()),
@@ -68,6 +70,11 @@ pub struct Context {
     pub resources: HashMap<String, &'static str>,
     pub blobs: super::resources::Resources,
     pub guards: HashMap<String, OwnedMutexGuard<()>>,
+    // 协议转换句柄（上游 beta.4 的 protocol.convert.v1 能力）。
+    pub(super) converters: HashMap<String, super::protocol::Conversion>,
+    // 验证码交互短通道绑定（上游 beta.4 的 verification.* 能力）。
+    pub(super) verification: Option<super::verification::VerificationCall>,
+    pub(super) claim_owner: Option<super::verification::lease::Owner>,
     pub calls: u32,
 }
 
@@ -80,7 +87,8 @@ impl Context {
             proxy: params.get("proxy").cloned().unwrap_or(Value::Null),
             proxy_selected: params.get("proxy").is_some(), user_agent: None,
             trace: params.get("plugin_trace").cloned().unwrap_or(Value::Null),
-            sink, head_sent: false, resources: HashMap::new(), blobs: Default::default(), guards: HashMap::new(), calls: 0,
+            sink, head_sent: false, resources: HashMap::new(), blobs: Default::default(), guards: HashMap::new(),
+            converters: HashMap::new(), verification: None, claim_owner: None, calls: 0,
         }
     }
 }

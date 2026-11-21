@@ -7,8 +7,9 @@ use serde_json::{json, Value};
 use tokio::sync::Semaphore;
 
 use super::context::{Shared, Sink};
-use super::runtime::Runtime;
 use super::errors::decode as unwrap_reply;
+use super::runtime::Runtime;
+use super::verification;
 use super::super::{Host, StreamCall, StreamEvent};
 
 fn validate_identity(options: &super::manifest::Options, account: &Value) -> Result<(), proto::WireError> {
@@ -95,7 +96,42 @@ impl Host {
         }
     }
 
+    /// 主程序签发的账号验证短通道。与 `call_wasm` 隔离：不 ensure、不等待
+    /// 注册表切换，也不走普通账号出口投影；只接受固定三种 action。
+    pub(crate) async fn call_wasm_verification(self: &Arc<Self>, store: &crate::server::core::account_store::AccountStore,
+        provider: &str, account: &str, action: &str, payload: &Value) -> Result<Value, proto::WireError> {
+        let deadline = tokio::time::Instant::now() + verification::TIMEOUT;
+        if !self.ready() { return Err(verification::unavailable()); }
+        let _lease = self.activity.acquire().ok_or_else(verification::unavailable)?;
+        let runtime = self.embedded.runtime.try_read().map_err(|_| verification::unavailable())?
+            .clone().ok_or_else(verification::unavailable)?;
+        let permits = verification::slots(&runtime.shared)?;
+        {
+            let _state = self.lifecycle.lock().unwrap_or_else(|error| error.into_inner());
+            if self.closing.load(Ordering::Acquire) || !self.ready() { return Err(verification::unavailable()); }
+            self.embedded.active.fetch_add(1, Ordering::AcqRel);
+        }
+        let _active = Active(&self.embedded);
+        let work = async {
+            let call = verification::VerificationCall::for_action(self, &runtime.shared, store,
+                provider, account, action, payload, deadline, permits).await?;
+            let reply = runtime.invoke_verification(call.clone()).await?;
+            verification::lease::project(&call, unwrap_reply(reply)?)
+        };
+        tokio::select! {
+            biased;
+            _ = runtime.shared.cancel.cancelled() => Err(verification::unavailable()),
+            result = tokio::time::timeout_at(deadline, work) => result
+                .map_err(|_| proto::WireError::with_code("验证码提交超时，请重新读取当前账号状态", "timeout"))?,
+        }
+    }
+
     pub(crate) async fn call_wasm(&self, method: &str, mut params: Value, timeout: Duration) -> Result<Value, proto::WireError> {
+        // 这三类验证码动作只能从 `verification` 短通道进入；普通管理调用
+        // 即使拿到 admin.action 也不能伪造主程序签发的账号快照与状态槽。
+        if method == "admin.action" && verification::guarded_action(params["action"].as_str().unwrap_or("")) {
+            return Err(proto::WireError::with_code("验证码交互必须由主程序账号验证入口发起", "forbidden"));
+        }
         let _lease = self.activity.acquire().ok_or_else(|| super::error("插件正在切换或已关闭"))?;
         let runtime = self.embedded.runtime.read().await.clone().ok_or_else(|| super::error("Wasm 插件尚未加载"))?;
         {
@@ -140,7 +176,14 @@ impl Host {
         if method == "login.submit" { runtime.shared.interactions.check(&flow, &params)?; }
         let proxy = params.get("proxy").cloned().unwrap_or(Value::Null);
         let submitted = (method == "login.submit").then(|| params.clone());
-        let reply = runtime.invoke(method, params, timeout, None).await?;
+        // 领取类调用由宿主绑定 Owner：插件只能在本次调用的 Context 内创建
+        // /检查/关闭验证租约，不能凭 requestId 访问其它账号的等待任务。
+        let claim_owner = verification::lease::Owner::new(self, &runtime.shared, method, &params, timeout)?;
+        let reply = if let Some(owner) = claim_owner {
+            runtime.invoke_claim(method, params, timeout, owner).await?
+        } else {
+            runtime.invoke(method, params, timeout, None).await?
+        };
         let result = unwrap_reply(reply)?;
         if let Some(submitted) = submitted { runtime.shared.interactions.accepted(&flow, &submitted); }
         if method == "login.start" {
@@ -235,6 +278,7 @@ impl Host {
             runtime.shared.cancel.cancel();
             runtime.shared.slots.close();
             runtime.shared.control_slots.close();
+            runtime.shared.verification_slots.close();
         }
         loop {
             let idle = self.embedded.idle.notified();

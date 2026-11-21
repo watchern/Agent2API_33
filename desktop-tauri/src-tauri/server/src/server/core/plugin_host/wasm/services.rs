@@ -36,6 +36,8 @@ impl Context {
         self.calls += 1;
         if self.calls > 100_000 { return Err(proto::WireError::with_code("插件调用次数超出上限", "plugin_resource_limit")); }
         if method != "clock.now" && !params.is_object() { return Err(super::error("插件能力参数必须是 JSON 对象")); }
+        // 验证码短通道：绑定了 VerificationCall 时，by-method 统一约束，返回 Some 即已处理。
+        if let Some(result) = self.verification_guard(method, &params).await? { return Ok(result); }
         let provider = self.shared.options.provider.clone();
         match method {
             "clock.now" => { self.permission("clock.v1")?; Ok(json!(crate::server::logging::now_ms())) }
@@ -244,6 +246,12 @@ impl Context {
                     credit.forget();
                 }
                 Ok(Value::Null)
+            }
+            // 协议转换（上游 beta.4 的 protocol.convert.v1 能力，独立 WASM 插件依赖）。
+            "protocol.request" | "protocol.open" | "protocol.push" | "protocol.close" => self.protocol(method, &params),
+            // 领取验证租约（上游 beta.4 的 verification.claim.v1 能力）。
+            "verification.lease.open" | "verification.lease.check" | "verification.lease.close" => {
+                self.verification_lease(method, &params).await
             }
             _ => Err(proto::WireError::with_code("插件请求了未支持的主程序能力", proto::WireError::NO_METHOD)),
         }

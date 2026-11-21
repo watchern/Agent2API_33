@@ -20,13 +20,23 @@ pub(super) struct Transient {
     sequence: u64,
 }
 
-fn conversations() -> &'static Mutex<Transient> {
-    static STATE: OnceLock<Mutex<Transient>> = OnceLock::new();
-    STATE.get_or_init(|| Mutex::new(Transient::default()))
+/// 会话状态与领取验证租约共用同一把锁，保证 CAS 与租约状态原子提交。
+/// 从上游 3.5.0-beta.4 移植。
+#[derive(Default)]
+pub(super) struct ConversationState {
+    pub(super) state: Transient,
+    pub(super) leases: super::verification::lease::Registry,
+}
+
+pub(super) fn conversations() -> &'static Mutex<ConversationState> {
+    static STATE: OnceLock<Mutex<ConversationState>> = OnceLock::new();
+    STATE.get_or_init(|| Mutex::new(ConversationState::default()))
 }
 
 pub(super) fn forget_provider(provider: &str) {
-    if let Ok(mut state) = conversations().lock() {
+    if let Ok(mut all) = conversations().lock() {
+        let ConversationState { state, leases } = &mut *all;
+        leases.forget(provider, state);
         state.entries.retain(|key, _| !key.starts_with(&format!("{provider}\0")));
     }
 }
@@ -35,6 +45,21 @@ impl Transient {
     pub fn remove_namespace(&mut self, namespace: &str) {
         let prefix = format!("{namespace}\0");
         self.entries.retain(|key, _| !key.starts_with(&prefix));
+    }
+    /// 读取一个状态槽的当前值（领取验证租约的 CAS 校验用；过期视为不存在）。
+    pub(super) fn value(&self, namespace: &str, key: &str) -> Option<&Value> {
+        self.entries.get(&format!("{namespace}\0{key}"))
+            .filter(|entry| entry.expires > crate::server::logging::now_ms())
+            .map(|entry| &entry.value)
+    }
+    /// 清除领取验证租约发布在状态槽里的请求；仅当槽里的 requestId 匹配时清除。
+    pub(super) fn clear_request(&mut self, namespace: &str, key: &str, request: &str) {
+        let id = format!("{namespace}\0{key}");
+        let Some(entry) = self.entries.get_mut(&id).filter(|entry| entry.value["request"]["requestId"] == request) else { return; };
+        entry.value["request"] = Value::Null;
+        entry.bytes = entry.value.to_string().len();
+        if let Some(revision) = self.sequence.checked_add(1) { self.sequence = revision; entry.revision = revision; }
+        else { self.entries.remove(&id); }
     }
     fn invoke(&mut self, method: &str, namespace: &str, key: &str, params: &Value, max_ttl: i64, limit: usize) -> Result<Value, proto::WireError> {
         let now = crate::server::logging::now_ms();
@@ -101,8 +126,12 @@ impl Context {
                 use sha2::{Digest, Sha256};
                 let identity = format!("{:x}", Sha256::digest(self.identity.as_bytes()));
                 let namespace = format!("{provider}\0{account}\0{identity}\0{session}");
+                // 领取交互的 conversation 状态走 lease 的 CAS 包装，普通调用直接读写。
+                if self.verification.is_some() || self.claim_owner.is_some() {
+                    return super::verification::lease::state_invoke(self, method, &namespace, key, params).await;
+                }
                 conversations().lock().map_err(|_| super::error("会话状态不可用"))?
-                    .invoke(method, &namespace, key, params, 86_400_000, 32)
+                    .state.invoke(method, &namespace, key, params, 86_400_000, 32)
             }
             Some("account") => {
                 let account = self.account()?.to_string();

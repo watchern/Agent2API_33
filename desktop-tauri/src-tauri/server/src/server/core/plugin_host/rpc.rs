@@ -805,6 +805,64 @@ impl ProviderAdapter for RpcAdapter {
         Some(self.metadata().capabilities.checkin)
     }
 
+    /// 模型验证码提交只允许经主程序签发的短通道；插件不能从普通
+    /// `admin.action` 伪造账号快照与状态槽。
+    fn verification_action<'a>(
+        &'a self,
+        store: &'a AccountStore,
+        account_id: &'a str,
+        payload: &'a Value,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Value, GatewayError>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            let host = self.metadata().host.clone();
+            if super::host_for_provider(self.id).is_none_or(|current| !Arc::ptr_eq(&current, &host))
+                || !super::serves_provider(self.id) || super::registry::is_switching(self.id) {
+                return Err(GatewayError::with_status(503, "验证码执行体正在切换或尚未就绪"));
+            }
+            if host.options.wasm.is_some() {
+                return host.call_wasm_verification(store, self.id, account_id, "captcha.push", payload).await
+                    .map_err(|error| rpc_error(self.id, error, proto::methods::gateway::ADMIN_ACTION));
+            }
+            // 旧原生只保留历史全局池；新账号范围提交必须经新协议。
+            if host.options.script || !account_id.is_empty() || !super::wasm::verification::legacy_global_allowed() {
+                return Err(GatewayError::with_status(403, "当前执行体不支持此验证码提交契约"));
+            }
+            let _lease = host.activity.acquire().ok_or_else(|| GatewayError::with_status(503, "验证码执行体正在切换"))?;
+            host.ensure().await.map_err(|_| GatewayError::with_status(503, "原生验证码执行体不可用"))?;
+            let params = serde_json::json!({ "provider": self.id, "account": "", "action": "captcha.push", "payload": payload });
+            host.call_coded(proto::methods::gateway::ADMIN_ACTION, params, NETWORK_TIMEOUT).await
+                .map_err(|error| rpc_error(self.id, error, proto::methods::gateway::ADMIN_ACTION))
+        })
+    }
+
+    /// 领取验证轮询/回传：WASM 走账号短通道，旧原生走受控兼容桥。
+    fn claim_verification_action<'a>(
+        &'a self,
+        store: &'a AccountStore,
+        account_id: &'a str,
+        complete: bool,
+        payload: &'a Value,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Value, GatewayError>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            let host = self.metadata().host.clone();
+            let action = if complete { "claim.verification.complete" } else { "claim.verification.poll" };
+            if super::host_for_provider(self.id).is_none_or(|current| !Arc::ptr_eq(&current, &host))
+                || !super::serves_provider(self.id) || super::registry::is_switching(self.id) {
+                return Err(GatewayError::with_status(503, "领取验证码执行体正在切换或尚未就绪"));
+            }
+            if host.options.wasm.is_some() {
+                return host.call_wasm_verification(store, self.id, account_id, action, payload).await
+                    .map_err(|error| rpc_error(self.id, error, proto::methods::gateway::ADMIN_ACTION));
+            }
+            super::wasm::verification::native_claim(&host, self.id, account_id, complete, payload).await
+                .map_err(|error| rpc_error(self.id, error, proto::methods::gateway::ADMIN_ACTION))
+        })
+    }
+
     /// 厂商专属管理动作：转发成一次 `admin.action` RPC。
     ///
     /// ── 超时用 `network` 而不是 `control` ───────────────────────

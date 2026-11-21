@@ -1595,6 +1595,31 @@ pub trait ProviderAdapter: Send + Sync {
         None
     }
 
+    /// 主程序模型验证码提交入口；默认不让普通管理调用取得交互通道。
+    fn verification_action<'a>(
+        &'a self,
+        _store: &'a AccountStore,
+        _account_id: &'a str,
+        _payload: &'a Value,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Value, GatewayError>> + Send + 'a>,
+    > {
+        Box::pin(async { Err(GatewayError::with_status(501, "当前执行体不支持账号验证码提交")) })
+    }
+
+    /// 主程序领取验证入口；固定轮询/回传动作，不影响既有模型验证码签名。
+    fn claim_verification_action<'a>(
+        &'a self,
+        _store: &'a AccountStore,
+        _account_id: &'a str,
+        _complete: bool,
+        _payload: &'a Value,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Value, GatewayError>> + Send + 'a>,
+    > {
+        Box::pin(async { Err(GatewayError::with_status(501, "当前执行体不支持领取验证码交互")) })
+    }
+
     /// **厂商专属的管理动作**（成长任务 / 每日活跃保活 / 平台福利 / 套餐领取…）。
     ///
     /// ── 为什么是一条通道 ────────────────────────────────────────
@@ -2172,6 +2197,29 @@ impl ProviderAdapter for BuiltinAdapter {
 
     fn plugin_checkin_capability(&self) -> Option<bool> {
         adapter_for(self.0).plugin_checkin_capability()
+    }
+
+    fn verification_action<'a>(
+        &'a self,
+        store: &'a AccountStore,
+        account_id: &'a str,
+        payload: &'a Value,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Value, GatewayError>> + Send + 'a>,
+    > {
+        adapter_for(self.0).verification_action(store, account_id, payload)
+    }
+
+    fn claim_verification_action<'a>(
+        &'a self,
+        store: &'a AccountStore,
+        account_id: &'a str,
+        complete: bool,
+        payload: &'a Value,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Value, GatewayError>> + Send + 'a>,
+    > {
+        adapter_for(self.0).claim_verification_action(store, account_id, complete, payload)
     }
 
     fn admin_action<'a>(

@@ -7,6 +7,7 @@ mod http;
 mod limits;
 mod login;
 pub(crate) mod manifest;
+mod protocol;
 pub(crate) mod native;
 mod public_view;
 mod resources;
@@ -14,6 +15,7 @@ mod runtime;
 mod services;
 mod state;
 pub(crate) mod tasks;
+pub(crate) mod verification;
 mod host;
 
 use std::collections::HashMap;

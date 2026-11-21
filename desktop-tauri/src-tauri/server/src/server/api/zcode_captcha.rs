@@ -8,7 +8,8 @@ use axum::response::Response;
 use serde_json::{json, Value};
 
 use crate::server::config;
-use crate::server::core::providers::zcode;
+use crate::server::core::plugin_host::{self, wasm::verification};
+use crate::server::core::providers::{adapter, zcode};
 use crate::server::errors::management_error;
 use crate::server::http::{ok_json, parse_body};
 use crate::server::logging;
@@ -33,6 +34,27 @@ async fn call_action(state: &ServerState, account_id: &str, action: &str, payloa
         .admin_action(state.store(), account_id, action, payload)
         .await
         .map_err(|error| (error.status_code, error.message))
+}
+
+/// 令牌提交时核对声称的 provider 与账号真实归属；不使用公开视图构建路径，
+/// 避免为了核对归属去解析代理或读取无关字段。
+pub(super) fn account_provider(state: &ServerState, account_id: &str, requested: Option<&str>) -> Result<String, (i32, String)> {
+    if account_id.is_empty() || account_id.len() > 512 || account_id.chars().any(char::is_control) {
+        return Err((400, "请明确验证码所属账号".into()));
+    }
+    let record = state.store().route_account(account_id).ok_or_else(|| (404, "找不到该 ZCode 账号".into()))?;
+    let provider = record["provider"].as_str().unwrap_or("");
+    if zcode::region::Region::from_provider_id(provider).is_none() {
+        return Err((400, "该账号不是 ZCode 账号".into()));
+    }
+    if requested.is_some_and(|requested| requested != provider) {
+        return Err((400, "验证码提供商与账号真实归属不一致".into()));
+    }
+    if !plugin_host::serves_provider(provider)
+        || plugin_host::host_for_provider(provider).is_none_or(|host| !host.ready()) {
+        return Err((503, "验证码执行体尚未就绪".into()));
+    }
+    Ok(provider.to_string())
 }
 
 /// 库存概况补上网关的显示参数、账号计数和近期请求需求。
@@ -112,6 +134,7 @@ pub async fn get_captcha(State(state): State<ServerState>) -> Response {
 
 /// POST /api/zcode/captcha —— body `{tokens: [{param, region}]}`；也兼容单条形态。
 pub async fn push_captcha(State(state): State<ServerState>, body: Bytes) -> Response {
+    if body.len() > verification::MAX_MESSAGE { return management_error(413, "验证码提交超过大小限制"); }
     let payload = match parse_body(&body) {
         Ok(value) => value,
         Err(error) => return management_error(400, error.message),
@@ -125,6 +148,47 @@ pub async fn push_captcha(State(state): State<ServerState>, body: Bytes) -> Resp
         Some(_) => return management_error(400, "tokens 必须是数组"),
         None => vec![payload.clone()],
     };
+    // 独立 WASM 插件的验证码提交必须经主程序签发的短通道：它会用无代理
+    // 账号快照核对身份、绑定本次配置，并禁止插件自行读取/写入账号出口。
+    let bound_provider = payload["provider"].as_str()
+        .filter(|provider| zcode::region::Region::from_provider_id(provider).is_some())
+        .filter(|provider| plugin_host::wasm::owns(provider));
+    if let Some(provider) = bound_provider {
+        let Some(account) = payload["accountId"].as_str().filter(|id| !id.is_empty()) else {
+            return management_error(400, "验证码提交必须明确账号");
+        };
+        let account = match account_provider(&state, account, Some(provider)) {
+            Ok(account) => account,
+            Err((status, message)) => return management_error(status, message),
+        };
+        if payload["configId"].as_str().is_none_or(|id| id.trim().is_empty()) {
+            return management_error(400, "验证码提交缺少当次配置标识，请重新获取配置");
+        }
+        let Some(adapter) = adapter::adapter_by_id(provider) else {
+            return management_error(503, "验证码执行体不可用");
+        };
+        let result = adapter.verification_action(state.store(), &account, &payload).await
+            .map_err(|error| (error.status_code, error.message));
+        let result = match result {
+            Ok(result) => result,
+            Err((status, message)) => return management_error(status, message),
+        };
+        let count = items.len() as u64;
+        let accepted = result["accepted"].as_u64().filter(|accepted| *accepted <= count)
+            .ok_or_else(|| (502, "验证码提交回执无效".to_string()));
+        let accepted = match accepted {
+            Ok(accepted) => accepted,
+            Err((status, message)) => return management_error(status, message),
+        };
+        if accepted == 0 {
+            return management_error(400, "没有可入池的令牌（令牌为空或已提交）");
+        }
+        let mut response = stats_json(&state).await;
+        response["accepted"] = json!(accepted);
+        response["provider"] = json!(provider);
+        response["accountId"] = json!(account);
+        return ok_json(response);
+    }
     // 入池的判据（param 非空）也在插件里：网关不解析令牌形态，它只知道
     // 「有一批条目要推过去」。插件回 `accepted`，网关据此决定要不要报 400。
     let accepted = match call_action(&state, "", "captcha.push", &json!({ "tokens": items })).await {

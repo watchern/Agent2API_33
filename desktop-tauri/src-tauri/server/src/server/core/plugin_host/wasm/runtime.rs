@@ -13,6 +13,14 @@ struct State {
     reply: Vec<u8>,
 }
 
+/// 调用的特殊来源：验证码短通道 / 领取等待租约需要在创建 Context 后预绑定状态。
+/// 从上游 3.5.0-beta.4 移植（精简掉 fork 未使用的变体）。
+enum InvocationContext {
+    Ordinary,
+    Verification(super::verification::VerificationCall),
+    Claim(super::verification::lease::Owner),
+}
+
 pub struct Runtime {
     pub shared: Arc<Shared>,
     module: Module,
@@ -94,6 +102,24 @@ impl Runtime {
     }
 
     pub async fn invoke(&self, method: &str, params: Value, timeout: Duration, sink: Option<Sink>) -> Result<Value, proto::WireError> {
+        self.invoke_inner(method, params, timeout, sink, InvocationContext::Ordinary).await
+    }
+
+    /// 验证码交互短通道：用宿主签发的 VerificationCall 绑定账号上下文后执行。
+    pub(super) async fn invoke_verification(&self, call: super::verification::VerificationCall) -> Result<Value, proto::WireError> {
+        let params = call.params();
+        let timeout = call.remaining();
+        self.invoke_inner("admin.action", params, timeout, None, InvocationContext::Verification(call)).await
+    }
+
+    /// 领取调用：用宿主签发的 Owner 绑定领取等待租约后执行。
+    pub(super) async fn invoke_claim(&self, method: &str, params: Value, timeout: Duration,
+        owner: super::verification::lease::Owner) -> Result<Value, proto::WireError> {
+        self.invoke_inner(method, params, timeout, None, InvocationContext::Claim(owner)).await
+    }
+
+    async fn invoke_inner(&self, method: &str, params: Value, timeout: Duration, sink: Option<Sink>,
+        entry: InvocationContext) -> Result<Value, proto::WireError> {
         let cancel = sink.as_ref().map(|sink| sink.cancel.clone()).unwrap_or_else(|| self.shared.cancel.child_token());
         let streaming = sink.is_some() || matches!(method, "images.generate" | "images.edit" | "tasks.run");
         let work = async {
@@ -114,7 +140,22 @@ impl Runtime {
             if context.flow.len() > 256 || context.session.len() > 1024 || context.session.contains('\0') {
                 return Err(proto::WireError::with_code("登录或会话标识无效", "bad_params"));
             }
-            if !context.account.is_empty() { context.invoke("account.get", json!({})).await?; }
+            // 验证码短通道自带账号快照，不能被普通读取覆盖；领取调用仍需走
+            // 普通 account.get 装配 identity，否则 conversation 状态命名空间
+            // 会与租约发布时用的命名空间不一致。
+            let verification_bound = match entry {
+                InvocationContext::Ordinary => false,
+                InvocationContext::Verification(call) => {
+                    call.validate().await?;
+                    context.bind_verification(call);
+                    true
+                }
+                InvocationContext::Claim(owner) => {
+                    context.claim_owner = Some(owner);
+                    false
+                }
+            };
+            if !verification_bound && !context.account.is_empty() { context.invoke("account.get", json!({})).await?; }
             let mut params = params;
             if let Some(map) = params.as_object_mut() {
                 for key in ["proxy", "proxy_override", "plugin_trace"] { map.remove(key); }

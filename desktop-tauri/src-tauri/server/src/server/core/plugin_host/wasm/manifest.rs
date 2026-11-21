@@ -12,6 +12,8 @@ pub const CAPABILITIES: &[&str] = &[
     "catalog.accounts.v1", "state.v1", "resources.v1", "images.v1", "tasks.v1",
     "login.interaction.v1", "login.callback.v1", "login.captcha.geetest.v1", "native.helpers.v1",
     "settings.schema.v1",
+    // 上游 3.5.0-beta.2+ 的独立 WASM 插件（如 zcode-intl）依赖的能力。
+    "protocol.convert.v1", "verification.account.v1", "verification.claim.v1",
 ];
 
 #[derive(Clone, Debug, Deserialize)]
@@ -70,6 +72,7 @@ pub fn read(dir: &Path, manifest: &proto::PackManifest) -> Result<Option<Options
         // 上游 3.5.0-beta.2+ 的独立 WASM 插件都声明了这一能力；只允许它建立在
         // 普通 http.v1 之上。本 fork 暂沿用全局默认超时，不按 timeout_ms 细分期限。
         ("http.timeout.v1", &["http.v1"][..]),
+        ("verification.claim.v1", &["verification.account.v1"][..]),
         ("catalog.accounts.v1", &["catalog.v1", "accounts.cas.v1"][..]),
         ("accounts.identity.v1", &["accounts.cas.v1"][..]),
         ("login.interaction.v1", &["login.forms.v1", "state.v1"][..]),
