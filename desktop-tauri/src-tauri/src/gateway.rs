@@ -285,11 +285,70 @@ pub async fn call_with_timeout(
     body: Option<&Value>,
     timeout_ms: u64,
 ) -> Result<Value, String> {
+    call_with_retry_policy(method, path, body, timeout_ms, false).await
+}
+
+/// 本机管理会话确认类请求：会话在过程中变化时不自动重发，避免把旧确认
+/// 打到新会话上（上游 beta.6 的安全口径）。命令层与托管登录流程都走这里。
+pub async fn call_without_auth_replay(method: &str, path: &str, body: Option<&Value>) -> Result<Value, String> {
+    call_with_retry_policy(method, path, body, REQUEST_TIMEOUT_MS, true).await
+}
+
+/// 合并丢失后补回（上游 3.5.1）：统一的重试策略入口。
+///
+/// `never=true` 时标记 no_auth_replay —— 一批会改变本机管理会话的请求
+/// （登录、账号操作、签到领取等）在会话 generation 变化后不自动重发，
+/// 防止旧请求误落到新会话；同时记录起始 generation，发请求前后都校验。
+/// 慢调用观测（fork 2026-11-09 排障）并入此处：正常管理请求是毫秒级，
+/// 超过 5 秒与网关侧 get_session 分段计时配对，定位调度/传输卡点。
+async fn call_with_retry_policy(
+    method: &str,
+    path: &str,
+    body: Option<&Value>,
+    timeout_ms: u64,
+    never: bool,
+) -> Result<Value, String> {
     let started = std::time::Instant::now();
-    let result = call_with_retry_policy(method, path, body, timeout_ms, false).await;
-    // 慢调用观测（2026-11-09 排障）：正常管理请求是毫秒级。这条与网关侧
-    // get_session 的分段计时配对 —— 壳侧慢而网关侧毫秒级 = 请求没被调度或
-    // 响应传输卡住；两侧都慢 = handler 真慢。
+    let generation = crate::panel_session::revision();
+    let no_auth_replay = never || url::Url::parse(&format!("http://127.0.0.1:{}{path}", proxy_port()))
+        .is_ok_and(|url| {
+            let path = url.path();
+            path.starts_with("/api/plugins/desktop-import/chatglm/")
+                || path.starts_with("/api/plugins/desktop-launch/")
+                || method.eq_ignore_ascii_case("PATCH") && path == "/api/plugins/permissions"
+                || method.eq_ignore_ascii_case("POST")
+                    && (path == "/api/accounts"
+                        || path == "/api/accounts/refresh" || path == "/api/accounts/refresh-expiring"
+                        || path == "/api/zcode/captcha"
+                        || path.starts_with("/api/session/login/")
+                        || path == "/api/zcode/claim-verification"
+                            && body.and_then(|value| value.get("action")).and_then(Value::as_str) == Some("complete")
+                        || path == "/api/accounts/checkin"
+                        || path == "/api/plugins/tasks/run"
+                        || path == "/api/travel-schedule/run"
+                        || path.ends_with("/growth/travel") || path.ends_with("/growth/task") || path.ends_with("/growth/school")
+                        || path == "/api/checkin-activity"
+                        || path == "/api/checkin-activity/reset"
+                        || path.ends_with("/campaigns/claim") || path.ends_with("/campaigns/redeem")
+                        || path.ends_with("/onboarding/claim")
+                        || path.strip_prefix("/api/accounts/").and_then(|rest| rest.strip_suffix("/zcode-claim"))
+                            .is_some_and(|account| !account.is_empty() && !account.contains('/')))
+        });
+    crate::startup::wait().await?;
+    let first = send_once_with_source(method, path, body, timeout_ms, no_auth_replay.then_some(generation)).await?;
+    if no_auth_replay && crate::panel_session::revision() != generation {
+        return Err("本机管理会话已变化，本次确认或请求没有自动重发；请重新读取状态".into());
+    }
+    let recovered = recover_management_session(&first, path)?;
+    if recovered && no_auth_replay {
+        return Err("本机管理会话已变化，本次确认或请求没有自动重发；请重新读取状态".into());
+    }
+    let result = if recovered {
+        let retried = send_once(method, path, body, timeout_ms).await?;
+        unwrap_envelope(&retried.text, retried.status)
+    } else {
+        unwrap_envelope(&first.text, first.status)
+    };
     let elapsed = started.elapsed();
     if elapsed >= std::time::Duration::from_secs(5) {
         crate::server::logging::log_with_level(
