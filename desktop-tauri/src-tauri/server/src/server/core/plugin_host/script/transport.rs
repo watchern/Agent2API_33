@@ -294,6 +294,9 @@ async fn open_inner(params: &Value, body: Option<RequestBody>, pinned: Option<re
                     &sent_body,
                 );
             }
+            // 超时与连接失败分开归类：前者是「等响应头等太久」，后者是
+            // reqwest 的连接/传输错误。归类要拿到原始的 reqwest::Error，
+            // 所以这一层只把超时翻成 WireError，连接错误留给下一段处理。
             let outcome = download.wait(
                 tokio::time::timeout(Duration::from_millis(timeout), request.send()),
             ).await?
@@ -303,7 +306,7 @@ async fn open_inner(params: &Value, body: Option<RequestBody>, pinned: Option<re
                             "连接或等待响应头超时");
                     }
                     proto::WireError::with_code("脚本上游连接等待超时", "timeout")
-                });
+                })?;
             let response = match outcome {
                 Ok(response) => response,
                 Err(failure) => {
