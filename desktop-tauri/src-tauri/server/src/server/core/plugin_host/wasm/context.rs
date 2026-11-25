@@ -118,11 +118,6 @@ pub struct Context {
     pub blobs: super::resources::Resources,
     pub(super) progress: super::progress::Progress,
     pub guards: HashMap<String, OwnedMutexGuard<()>>,
-    // 协议转换句柄（上游 beta.4 的 protocol.convert.v1 能力）。
-    pub(super) converters: HashMap<String, super::protocol::Conversion>,
-    // 验证码交互短通道绑定（上游 beta.4 的 verification.* 能力）。
-    pub(super) verification: Option<super::verification::VerificationCall>,
-    pub(super) claim_owner: Option<super::verification::lease::Owner>,
     pub calls: u32,
     pub(super) spin_calls: u32,
 }
