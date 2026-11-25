@@ -116,6 +116,72 @@ pub fn gh(repository: &str, reference: &str, path: &str) -> String {
     )
 }
 
+/// `raw.githubusercontent.com` 的仓库文件地址 → jsDelivr `/gh/` 线路地址。
+///
+/// 形态：
+/// `https://raw.githubusercontent.com/{owner}/{repo}/{ref}/{path}`
+/// → `https://{线路}/gh/{owner}/{repo}@{ref}/{path}`
+///
+/// ── 为什么插件侧也需要这条 ────────────────────────────────────
+/// 宿主自己的仓库文件读取早就走 jsDelivr 了（见本模块头），但**插件在运行时
+/// 自己拼出来的地址**（模型目录、官方配置、索引文件……）仍然直打
+/// `raw.githubusercontent.com`。该域在部分网络里是连不上的（TCP 直接被重置，
+/// 不是超时），插件拿不到数据就会把整条链路报成失败 —— 例如 ZCode 国际版
+/// 插件的模型清单取不到，`catalog.refresh` 整个失败，账号一条模型都注册不上。
+///
+/// ── 为什么不改写而是回退 ──────────────────────────────────────
+/// 改写等于「永远走 CDN」：CDN 挂了而官方源恰好能通时，反而把本来好用的
+/// 路径弄坏。所以这里只给出**替身地址**，由调用方在官方地址连接失败后再试
+/// （见 `core::update::source::plugin_candidates`）。
+///
+/// 不是上面这个形态的地址（别的域、ref 里带 `/`、空路径、`..` 段）一律返回
+/// `None` —— 宁可不改写，也不要拼出一条打不开的 URL。
+pub fn raw_cdn(value: &str) -> Option<String> {
+    let url = url::Url::parse(value).ok()?;
+    if url.host_str() != Some("raw.githubusercontent.com")
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
+        return None;
+    }
+    let segments: Vec<&str> = url.path().trim_start_matches('/').split('/').collect();
+    if segments.len() < 4 { return None; }
+    let (owner, repository, reference) = (segments[0], segments[1], segments[2]);
+    let path = segments[3..].join("/");
+    if owner.is_empty() || repository.is_empty() || reference.is_empty() || path.is_empty() {
+        return None;
+    }
+    // ref 里带 `/`（`refs/heads/main` 这类）拼不成 jsDelivr 的 `@ref` 形态。
+    if reference.contains('/') {
+        return None;
+    }
+    if path.split('/').any(|part| part.is_empty() || part == "." || part == "..") {
+        return None;
+    }
+    Some(route(&gh(&format!("{owner}/{repository}"), reference, &path)))
+}
+
+/// 后台惰性测速：当前请求**不等**它。
+///
+/// ── 为什么不在出网路径上等 ────────────────────────────────────
+/// 测速要等三条线路各回一个探测文件，最坏 5 秒。插件出网是热路径（每次
+/// 插件发 HTTP 都要过），让它挡在请求前面会直接吃掉首包延迟。
+///
+/// 没有测速结果时 [`route`] 用 [`DEFAULT_HOST`] —— 那条线路本机实测可用，
+/// 所以「先发、用默认线路，后台再测速择优」是安全的。
+pub fn ensure_in_background() {
+    let cached = selection()
+        .read()
+        .ok()
+        .and_then(|guard| guard.as_ref().map(|value| value.at));
+    if cached.is_some_and(|at| now_ms().saturating_sub(at) < TTL_MS) {
+        return;
+    }
+    tokio::spawn(async move {
+        ensure(false).await;
+    });
+}
+
 fn selected_host() -> Option<&'static str> {
     let guard = selection().read().ok()?;
     let value = guard.as_ref()?;

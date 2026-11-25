@@ -122,6 +122,45 @@ pub fn is_resource(value: &str) -> bool {
     }
 }
 
+/// 插件运行时出网用的 GitHub 替身候选。
+///
+/// 与 [`candidates`] 的分工：那边是**宿主自己下载**用的（要记账限流、要按
+/// 测速结果排序）；这边是**插件在运行时自己拼出来的地址**用的 —— 例如
+/// ZCode 国际版插件的模型清单直打 `raw.githubusercontent.com`，该域在部分
+/// 网络里连不上，插件拿不到数据就整条链路失败（账号一条模型都注册不上）。
+///
+/// 顺序按「GitHub 访问方式」设置走：
+///   · `official` —— 只用官方地址，用户明确不要第三方加速就不给替身；
+///   · `auto` —— 官方优先，连不上才退到 jsDelivr 线路与加速前缀；
+///   · `accelerated` —— 替身优先，官方地址留作最后兜底。
+///
+/// 非 GitHub 资源地址原样返回（只有一个候选）—— 替身只覆盖 GitHub 域，
+/// 别的站点不该被改写。
+pub fn plugin_candidates(value: &str) -> Vec<String> {
+    let mut candidates = vec![value.to_string()];
+    if !is_resource(value) { return candidates; }
+    let settings = config::github_access();
+    if settings.mode == GithubAccessMode::Official { return candidates; }
+    // jsDelivr 线路：与宿主读仓库文件用的是同一套测速结论。
+    let cdn = super::jsdelivr::raw_cdn(value);
+    // 加速前缀：只对官方 API 之外的资源用（`supports_api` 为假的源不代理
+    // api.github.com，与 `configured_candidates` 的口径一致）。
+    let mirrors: Vec<String> = settings.mirrors.iter()
+        .filter(|mirror| mirror.enabled && !(is_official_api(value) && !mirror.supports_api))
+        .map(|mirror| format!("{}{value}", mirror.url))
+        .collect();
+    let mut alternates: Vec<String> = Vec::new();
+    if let Some(cdn) = cdn { alternates.push(cdn); }
+    alternates.extend(mirrors);
+    if settings.mode == GithubAccessMode::Accelerated {
+        let mut ordered = alternates;
+        ordered.append(&mut candidates);
+        return ordered;
+    }
+    candidates.extend(alternates);
+    candidates
+}
+
 pub fn candidates(value: &str, allow_mirror: bool) -> Vec<Candidate> {
     let mut candidates = configured_candidates(value, allow_mirror);
     if candidates[0].mode == GithubAccessMode::Auto {

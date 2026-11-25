@@ -65,6 +65,9 @@ use crate::server::errors::management_error;
 use crate::server::http::{ok_json, parse_body};
 use crate::server::ServerState;
 
+/// 插件台账里 ZCode 套餐记忆的键名（插件自己写的键，宿主只当键用）。
+const LEDGER_CLAIM_PLANS: &str = "zcodeClaimPlans";
+
 /// 取账号记录（不是 ZCode 系一律报错）。
 fn zcode_account_of(
     state: &ServerState,
@@ -139,12 +142,73 @@ pub async fn preview(state: &ServerState, account_id: &str) -> Response {
         return management_error(status, message);
     }
     match call_action(state, account_id, "claim.preview", &Value::Null).await {
-        Ok(body) => {
+        Ok(mut body) => {
             record_daily_checkin(state, account_id, &body);
             record_all_plans_claimed(state, account_id, &body);
+            // 合并必须排在「本期全部已领」的判定之后：那条判定要的是「本期
+            // 活动全部已领」，把未领条目混进去会让它永远早退、账号永远停在
+            // 「待签」。
+            merge_pending_plans(state, account_id, &mut body);
             ok_json(body)
         },
         Err((status, message)) => management_error(status, message),
+    }
+}
+
+/// 把插件台账里「见过但没领到」的活动补进预览结果。
+///
+/// 插件的预览只给**已领到**的条目（靠余额通道回捞）。「当时看见了、但领取
+/// 没成功」（验证码没过 / 额度耗尽）的那一次，会在插件台账里留一条空壳记录：
+/// `owned` 为 null、名称就是 plan id、没有权益也没有有效期。宿主不把它透出，
+/// 用户在面板上就完全看不到「还有个活动等着领」，只能等下一次探测成功 ——
+/// 而探测通道恰恰是登录态失效时最先断的那条。
+///
+/// 判据：
+///   · 台账条目 `owned` 为 null（从未到账）；
+///   · 插件给的 `plans[]` 里没有同一个 planId（已领的由插件负责）。
+///
+/// 合并出来的条目标成 `claimState: "unknown"`（界面显示「状态待确认」）而不是
+/// "claimable"：宿主无从判断它现在是否还在活动期内（空壳条目连有效期都没有），
+/// 交给用户点一下试 —— 领取接口会回 already_claimed / captcha / not_found
+/// 这类明确结果，不会真金白银领错。
+fn merge_pending_plans(state: &ServerState, account_id: &str, body: &mut Value) {
+    let ledger = state.store().plugin_ledger(account_id, LEDGER_CLAIM_PLANS);
+    let Some(plans) = ledger.get("plans").and_then(Value::as_object) else { return; };
+    let verification = ledger.get("checkin_verification");
+    let Some(list) = body.get_mut("plans").and_then(Value::as_array_mut) else { return; };
+    let known: Vec<String> = list.iter()
+        .filter_map(|plan| plan.get("planId").and_then(Value::as_str).map(str::to_string))
+        .collect();
+    for (plan_id, entry) in plans {
+        if known.iter().any(|id| id == plan_id) { continue; }
+        if entry.get("owned").is_some_and(|owned| !owned.is_null()) { continue; }
+        let failed = verification
+            .and_then(|value| value.get("plan_id").and_then(Value::as_str))
+            == Some(plan_id.as_str());
+        let message = match (failed, verification.and_then(|value| value.get("message").and_then(Value::as_str))) {
+            (true, Some(reason)) => format!("上次领取未成功（{reason}），可再次尝试"),
+            (true, None) => "上次领取未成功，可再次尝试".to_string(),
+            (false, _) => "上次见到该活动，尚未领到；可尝试领取".to_string(),
+        };
+        let name = entry
+            .get("plan")
+            .and_then(|plan| plan.get("name"))
+            .and_then(Value::as_str)
+            .filter(|name| !name.is_empty() && *name != plan_id.as_str());
+        list.push(serde_json::json!({
+            "planId": plan_id,
+            "name": name,
+            "description": "",
+            "claimed": false,
+            "claimState": "unknown",
+            "claimMessage": message,
+            "source": "ledger",
+            "sources": ["ledger"],
+            "priority": 0,
+            "startsAt": Value::Null,
+            "endsAt": Value::Null,
+            "entitlements": [],
+        }));
     }
 }
 
