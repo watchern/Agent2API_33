@@ -22,9 +22,11 @@ const DRIFT_LOG_MIN_GAP: Duration = Duration::from_secs(10);
 
 #[derive(Clone)]
 struct CachedSnapshot {
-    /// 账号修订号：写路径推进 account_revision 时自然失效（fork 的跨请求缓存键）。
+    /// 账号修订号：**本份行数据对应的**修订号（不是构建收尾时刻的修订号）。
+    /// 写路径推进 `account_revision` 时自然失效；下一轮增量也从这里续上，
+    /// 保证构建期间落库的行改动不会被人为跳过。
     revision: u64,
-    /// 目录 generation：插件装卸 / 启用停用推进（fork 的跨请求缓存键）。
+    /// 目录 generation：插件装卸 / 启用停用推进。
     metadata: u64,
     /// SQLite `data_version`：别的连接改了库就失效（增量复用的前提）。
     data_version: i64,
@@ -32,8 +34,9 @@ struct CachedSnapshot {
     beijing_day: String,
     /// 这一份缓存的构建时刻（诊断用：漂移日志里报缓存年龄）。
     checked_at: Instant,
-    /// 账号行的**公开投影** + 插件台账结算态（上游新增，供 `public_accounts`
-    /// / `public_by_id` / `onboarding_settled` 三个索引共用同一份行数据）。
+    /// 账号行的**公开投影** + 插件台账结算态（上游新增）：`public_accounts`
+    /// / `public_by_id` / `onboarding_settled` 三个索引共用同一份行数据，
+    /// 免得同一行投影两遍。
     rows: Arc<BTreeMap<i64, CachedRow>>,
     /// 与 `rows` 同一份 rowid 键的**完整解码记录**（`read_rows::decode` 的产物，
     /// 含 extra 合并 —— 公开投影 `rows` 只是它的字段子集）。UI 列表
@@ -180,8 +183,9 @@ impl AccountStore {
             let data_version: i64 = conn.pragma_query_value(None, "data_version", |row| row.get(0))?;
             // 队列作用域与账号数据同库同版本号：随这一轮增量一并刷新
             let priority_scope = super::sql::load_priority_scope(conn).ok().flatten();
-            // 增量基线 = 上一份缓存的修订号。上一次缓存的 generation / data_version /
-            // 北京自然日有一项对不上就不能复用旧行做增量（对不上就是全量重读）。
+            // 增量基线 = 上一份缓存的修订号。上一份缓存的 generation /
+            // data_version / 北京自然日有一项对不上就不能复用旧行做增量
+            // （对不上就是全量重读）。
             let since = previous.as_ref().filter(|old| {
                 old.metadata == metadata && old.data_version == data_version && old.beijing_day == beijing_day
             }).map(|old| old.revision);
@@ -227,12 +231,12 @@ impl AccountStore {
             if let Some(raw) = raw {
                 match read_rows::decode(raw) {
                     Ok((_, record)) => {
-                        // 完整解码记录留给 UI 列表 / read_record 的热路径（fork）。
-                        decoded.insert(rowid, Arc::new(record.clone()));
                         // 公开投影 + 插件台账结算态（上游）。
                         let public = Arc::new(self.public_account(&record));
                         let ledger = super::plugin_ledger::ledger_value(&record, "onboarding");
                         let onboarding_settled = ledger.is_object().then(|| Arc::new(ledger));
+                        // 完整解码记录留给 UI 列表 / read_record 的热路径（fork）。
+                        decoded.insert(rowid, Arc::new(record));
                         rows.insert(rowid, CachedRow { public, onboarding_settled });
                     }
                     Err(_) => failed += 1,
@@ -263,10 +267,11 @@ impl AccountStore {
         // 丢弃：下一个等待者从头再建，再被丢弃 —— 无限重建 + 等待者自旋，
         // 五个 worker 全部烧满（实测 CPU 2900+ 秒），运行时饿死。
         //
-        // 现在以**本轮读到的那份行数据**为准入缓存：即使构建期间有变更被
-        // 本轮漏掉，下一轮构建也会以这份缓存为底、按行级增量补齐
-        // （`previous` 复用 + `account_changes(since)`），一两个增量循环
-        // 内必然收敛 —— 慢，但有限，且等待者只自旋一轮。
+        // 现在以**本轮读到的那份行数据**为准入缓存（修订号 = 本轮读到的
+        // 修订号，不是收尾时刻的）：即使构建期间有变更被本轮漏掉，下一轮
+        // 构建也会以这份缓存为底、按行级增量补齐（`previous` 复用 +
+        // `account_changes(since)`），一两个增量循环内必然收敛 —— 慢，但有限，
+        // 且等待者只自旋一轮。
         //
         // 漂移观测（console-only，不落库）：构建前后版本号不一致时留一行
         // 痕迹 —— 若某写方以极高频率推版本号，这里会连续刷屏，第一现场直指。
