@@ -34,6 +34,7 @@ import { activeGroupSortRules, manualOrderBlockedMessage } from './accounts-grou
 import { Badge, Spinner } from '@ui'
 import { Alert } from '@ui'
 import { PageAutoRefresh, usePageAutoRefresh } from './page-auto-refresh'
+import { getPluginStartup, hiddenWithStartup, subscribePluginStartup } from '../../../ui-shared/plugin-startup'
 
 /** 列设置的句柄（注册在挂载后的布局 effect 里，见下方说明） */
 let colHandle: ColSettingsHandle | null = null

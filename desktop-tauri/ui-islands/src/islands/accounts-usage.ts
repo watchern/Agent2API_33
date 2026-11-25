@@ -1,7 +1,7 @@
 import {
   errorMessage, shared, toast, type AccountRecord, type TokenReading,
 } from './accounts-shared'
-import { supportsUsage } from './accounts-domain'
+import { supportsCreditDetail, supportsUsage } from './accounts-domain'
 import { allAccounts, bump, findAccount, getStore } from './accounts-store'
 import { adoptLimiterSnapshot } from './accounts-limiter-model'
 import { adoptAccountSorting, refreshAccountSorting } from './accounts-sort'
@@ -93,6 +93,24 @@ export function applyBalances(
   return applied
 }
 
+function detailMissing(account: AccountRecord): boolean {
+  if (!supportsCreditDetail(account) || account.needsRelogin) return false
+  const entry = usageEntryOf(account)
+  if (!entry || typeof entry !== 'object' || Array.isArray(entry) || usageFailureOf(entry)) return false
+  return !Array.isArray(entry.credits)
+}
+
+/** 每个会话只补一次旧版读数的明细；查询失败也必须保留失败状态。 */
+async function repairStaleDetail(): Promise<void> {
+  if (shapeRepairStarted) return
+  shapeRepairStarted = true
+  for (const account of allAccounts().filter(detailMissing)) {
+    try {
+      await queryUsageFor(account.id, false)
+    } catch { /* 明细补查不覆盖已有的余额结论。 */ }
+  }
+}
+
 export function syncBalancesSnapshot(): Promise<boolean> {
   snapshotRequested++
   if (!snapshotPending) snapshotPending = (async () => {
@@ -129,7 +147,11 @@ async function readBalancesSnapshot(): Promise<boolean> {
     }
     const applied = applyBalances(data)
     applyUsageTasks(data?.queries)
-    return applied > 0 || tokenApplied
+    if (!applied) return tokenApplied
+    // 余额读数里没有明细（credits）的老账号补查一次：明细缺失会让账号页
+    // 的「积分明细」空着，而余额本身是有值的 —— 只补明细，不改余额结论。
+    void repairStaleDetail()
+    return true
   } catch {
     // 快照读取失败不代表上游余额查询失败，保留当前结果等待下次轮询。
     return false

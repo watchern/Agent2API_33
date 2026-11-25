@@ -374,7 +374,38 @@ pub fn is_reserved(key: &str) -> bool {
 ///   · 已经升到 30 的库（索引已建）→ 升 31/32/33 时再跑一次同一条 SQL，
 ///     脚本是 `CREATE INDEX IF NOT EXISTS`，幂等，不会报错；
 ///   · 停在 29 或更早的库 → 依次跑完 30/31/32/33，四条迁移一次到位。
-pub const SCHEMA_VERSION: i64 = 33;
+///   · 上游谱系的库（30/31/32 各有各的含义）→ v33 让它们也补上这条索引。
+///
+/// 但**同号不同义**的代价不止索引这一条：上游 v30 的「加 diagnostics 列」
+/// 对停在 30 的本 fork 旧版库是**整段没跑过**的。那一条由 v34 兜底
+/// （见下面的 v34 段）。
+/// ── 版本 34：补齐 v30 撞号漏掉的 `account_usage_records.diagnostics` 列 ──
+/// 上游 v30 是 `ALTER TABLE account_usage_records ADD COLUMN diagnostics TEXT`，
+/// 而本 fork 的 v30 曾是「logs 补 (level, id DESC) 索引」——**同一个版本号在
+/// 两条谱系里含义不同**。迁移按 `PRAGMA user_version` 逐版本推进、每个版本只跑
+/// 一次，于是：
+///   · 从**本 fork 旧版**（user_version 已是 30）升上来 → v30 永不执行 ⇒
+///     `account_usage_records` 永远缺 `diagnostics` 列。而
+///     `core::usage_records` 的 `RECORD_COLUMNS` 已经带上了这一列（上游
+///     v3.5.1 的用量诊断读数就存在它里面），于是每一次余额查询都报
+///     「no such column: diagnostics」—— 整条账号页余额链路瘫掉。
+///   · 从**上游 3.5.1** 升上来 → v30 已经是「加 diagnostics 列」，不缺。
+///
+/// 所以这一版做的是**幂等补列**：先查 `PRAGMA table_info` 看列在不在，
+/// 不在才 ALTER。已在的库（上游谱系 / 全新库）跑它等于空操作。
+///
+/// 为什么不用「把上游 v30 挪到 34、本 fork 的索引挪回 30」：上游 3.5.1 的
+/// user_version 已经推进到 32，它的 v30/v31/v32 语义对**已经在 32 的库**是
+/// 既成事实；改编号会让那些库跳过本该跑的迁移。只能往后加补偿版本。
+///
+/// 为什么不用 `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`：SQLite 不支持这个
+/// 语法（`ADD COLUMN` 只有裸形式），重复执行会报 "duplicate column name"。
+/// 幂等只能靠「先查列、再决定加不加」。
+///
+/// 顺带把上游 v32 的 `cost_usd` / `cache_creation_tokens` / `unpriced_requests`
+/// 一并按同样的方式兜住：那几条也是 `ALTER TABLE ADD COLUMN`（非幂等），
+/// 撞号同样可能让它们对某些库整段没跑过。
+pub const SCHEMA_VERSION: i64 = 34;
 
 /// 版本 1 的全部表与索引：改造前所有 JSON / JSONL 文件的对应形态。
 ///
@@ -1121,8 +1152,77 @@ fn apply_version(
         // 见 schema_logs_level.sql 头部说明）。原为 v30，与上游的三条迁移
         // 撞号后顺延到 33；脚本幂等，重跑无害。
         33 => conn.execute_batch(include_str!("schema_logs_level.sql")),
+        // v34：补齐 v30 撞号可能漏跑的那些 `ALTER TABLE ADD COLUMN`（见
+        // SCHEMA_VERSION 的 v34 段）。逐列查 `PRAGMA table_info`，缺了才加
+        // —— 上游谱系 / 全新库跑它等于空操作，从本 fork 旧版升上来的库
+        // 才会真正补上那一列。
+        34 => ensure_columns_34(conn),
         _ => Ok(()),
     }
+}
+
+/// 版本 34：按「列在不在」补齐 v30 撞号可能漏跑的加列迁移。
+///
+/// 涉及的列分两组：
+///   · `account_usage_records.diagnostics` —— 上游 v30 的内容。本 fork 旧版
+///     的 v30 撞号后这条整段没跑过，余额查询会报「no such column」。
+///   · `requests.cost_usd` / `cache_creation_tokens` /
+///     `cache_creation_1h_tokens` 与 `request_daily.cost_usd` /
+///     `unpriced_requests` —— 上游 v32 的内容。v32 在撞号后**排在**本 fork
+///     的 v30 之后，所以正常路径都会跑到；但「从 user_version=31 升上来」
+///     这类库（上游谱系中途停在 31）之外的边界情形同样靠这里兜住。
+///
+/// 为什么逐列判断而不是整段重放：`ALTER TABLE ADD COLUMN` 没有
+/// `IF NOT EXISTS` 形式，重复执行会报 "duplicate column name"，整段重放
+/// 因此不能幂等。列的类型与默认值必须与原始迁移**逐字一致**（NOT NULL
+/// 的列要带 DEFAULT，否则旧行插不进去）。
+fn ensure_columns_34(conn: &Connection) -> rusqlite::Result<()> {
+    // (表名, 列名, 列定义)
+    const COLUMNS: &[(&str, &str, &str)] = &[
+        ("account_usage_records", "diagnostics", "TEXT"),
+        ("requests", "cache_creation_tokens", "INTEGER NOT NULL DEFAULT 0"),
+        ("requests", "cache_creation_1h_tokens", "INTEGER NOT NULL DEFAULT 0"),
+        ("requests", "cost_usd", "REAL"),
+        ("request_daily", "cost_usd", "REAL NOT NULL DEFAULT 0.0"),
+        ("request_daily", "unpriced_requests", "INTEGER NOT NULL DEFAULT 0"),
+    ];
+    for &(table, column, definition) in COLUMNS {
+        match table_has_column(conn, table, column)? {
+            Some(true) => continue,
+            // 表本身不在（不该发生：这三张表分别由 v1 / v1 / v8 建出来，而 v34
+            // 一定排在它们之后）—— 跳过而不是硬 ALTER，免得报 "no such table"
+            // 把整次迁移卡住。
+            None => continue,
+            Some(false) => {}
+        }
+        conn.execute_batch(&format!(
+            "ALTER TABLE {table} ADD COLUMN {column} {definition};"
+        ))?;
+    }
+    Ok(())
+}
+
+/// 表里有没有这一列（`PRAGMA table_info` 逐行读列名）。
+///
+/// 返回 `Option<bool>`：`Some(true)` = 列在，`Some(false)` = 表在但列不在，
+/// `None` = 表本身不存在。三态是必要的 —— 「表不在」与「列不在」在
+/// `PRAGMA table_info` 下的表现一样（都读不到那一行），但前者不该去 ALTER。
+fn table_has_column(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+) -> rusqlite::Result<Option<bool>> {
+    let mut statement = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let mut rows = statement.query([])?;
+    let mut found_table = false;
+    while let Some(row) = rows.next()? {
+        found_table = true;
+        let name: String = row.get(1)?;
+        if name == column {
+            return Ok(Some(true));
+        }
+    }
+    Ok(if found_table { Some(false) } else { None })
 }
 
 /// 版本 22：把「模型目录刷新」那条任务的**失败冷却**清掉（数据修复，无 DDL）。
