@@ -64,30 +64,32 @@ env:
 
 jobs:
   # ── macOS（job 名与 build.yml 一致：macos）──────────────────
-  macos:
-    runs-on: macos-latest
-    steps:
-      - uses: actions/checkout@v7
-
-      # universal 需要两个目标都装上（与 build.yml 一致）
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: aarch64-apple-darwin,x86_64-apple-darwin
-
-      # workspaces 与 build.yml 逐字一致，key 才能对上
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: desktop-tauri/src-tauri -> ../../target
-
-      # 无前端构建链（frontendDist 是仓库里的静态目录 ui/），直接
-      # cargo 即可，不必装 node/npm —— 也因此预热比正式构建还快
-      - name: 预热 Rust 编译（aarch64）
-        run: cargo build --release --target aarch64-apple-darwin
-        working-directory: desktop-tauri/src-tauri
-
-      - name: 预热 Rust 编译（x86_64）
-        run: cargo build --release --target x86_64-apple-darwin
-        working-directory: desktop-tauri/src-tauri
+  # 用户不关注 macOS 构建，暂时停用预热（不影响 Windows 出包，
+  # build-windows.yml 仍是 Windows runner）。需要时取消注释即可恢复。
+  # macos:
+  #   runs-on: macos-latest
+  #   steps:
+  #     - uses: actions/checkout@v7
+  #
+  #     # universal 需要两个目标都装上（与 build.yml 一致）
+  #     - uses: dtolnay/rust-toolchain@stable
+  #       with:
+  #         targets: aarch64-apple-darwin,x86_64-apple-darwin
+  #
+  #     # workspaces 与 build.yml 逐字一致，key 才能对上
+  #     - uses: Swatinem/rust-cache@v2
+  #       with:
+  #         workspaces: desktop-tauri/src-tauri -> ../../target
+  #
+  #     # 无前端构建链（frontendDist 是仓库里的静态目录 ui/），直接
+  #     # cargo 即可，不必装 node/npm —— 也因此预热比正式构建还快
+  #     - name: 预热 Rust 编译（aarch64）
+  #       run: cargo build --release --target aarch64-apple-darwin
+  #       working-directory: desktop-tauri/src-tauri
+  #
+  #     - name: 预热 Rust 编译（x86_64）
+  #       run: cargo build --release --target x86_64-apple-darwin
+  #       working-directory: desktop-tauri/src-tauri
 
   # ── Windows（job 名与 build.yml 一致：windows）──────────────
   windows:
@@ -101,9 +103,24 @@ jobs:
         with:
           workspaces: desktop-tauri/src-tauri -> ../../target
 
+      # 临时诊断：把编译错误写进 STEP_SUMMARY，便于从 check-run API 匿名读取。
+      # 拿到错误后还原这段。
       - name: 预热 Rust 编译
-        run: cargo build --release
+        shell: bash
         working-directory: desktop-tauri/src-tauri
+        run: |
+          set -o pipefail
+          cargo build --release 2>&1 | tee build-diag.log
+          status=${PIPESTATUS[0]}
+          if [ "$status" -ne 0 ]; then
+            {
+              echo "### cargo build --release 失败（exit $status）"
+              echo '```'
+              grep -E '^(error|warning:)|^  -->|^   -->|could not compile' build-diag.log | head -80
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+          exit "$status"
 
   # ── Docker 镜像缓存预热 ─────────────────────────────────────
   # BuildKit 的 gha 缓存 key 不含 job 名，这个 job 名不影响命中。
