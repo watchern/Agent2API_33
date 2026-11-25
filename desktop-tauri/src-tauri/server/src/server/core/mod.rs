@@ -149,7 +149,6 @@ pub mod update;
 /// 插件声明的上游客户端版本同步（beta.6 schema 的 upstream_version 类型依赖）。
 pub mod upstream_versions;
 pub mod upstream;
-pub mod upstream_versions;
 pub(crate) mod user_agent;
 pub mod usage_query;
 pub mod usage_records;
