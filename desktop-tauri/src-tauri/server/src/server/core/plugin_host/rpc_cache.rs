@@ -49,11 +49,17 @@ fn from_cached(provider: &str, cached: catalog_cache::CachedCatalog) -> Option<p
             { return None; }
             let mut list: proto::ModelList = serde_json::from_value(envelope.get("list")?.clone()).ok()?;
             if !list.meta.remote || list.meta.refreshed_at < 0 { return None; }
-            list.models = valid_models(list.models, true);
+            list.models = valid_models(list.models);
             return Some(list); // 已确认的空目录也恢复，不复活静态或上次模型。
         }
     }
-    let models = valid_models(cached.models, crate::server::core::providers::is_scoped_runtime_provider(provider));
+    // ── 信封永远不是模型 ────────────────────────────────────────
+    // `ENVELOPE_ID` 是 scoped 目录的**信封**，不是一条模型。它只在
+    // `accepts_empty` 为真时才有意义（那边会把信封解包成真清单）；一旦这家
+    // 不再是 scoped 执行体（换了插件形态 / 插件被换掉），缓存里那份信封就
+    // 成了陈旧数据 —— 放行的话它会顶掉插件真正的模型清单，界面上只剩一个
+    // 叫 `__scoped_plugin_catalog_v1` 的假模型，按真实模型名对话一律 404。
+    let models = valid_models(cached.models);
     (!models.is_empty()).then_some(proto::ModelList {
         models,
         meta: proto::CatalogMeta { remote: true, refreshed_at: cached.fetched_at },
@@ -73,21 +79,43 @@ fn restore(provider: &str) -> Option<proto::ModelList> {
     }).and_then(|cached| from_cached(provider, cached))
 }
 
-fn valid_models(models: Vec<Value>, scoped: bool) -> Vec<Value> {
+/// 去掉不能当模型广告出去的条目。
+///
+/// `ENVELOPE_ID`（scoped 目录的信封）**无条件**排除：它在 `accepts_empty`
+/// 为真时由 [`from_cached`] 解包成真清单，为假时就是陈旧数据 —— 两种情形
+/// 下它都不该作为一条模型出现在目录里。
+fn valid_models(models: Vec<Value>) -> Vec<Value> {
     let mut claimed = HashSet::new();
     models.into_iter().filter(|model| {
         model.get("id").and_then(Value::as_str)
-            .is_some_and(|id| (!scoped || id != ENVELOPE_ID) && !id.trim().is_empty() && claimed.insert(id.to_ascii_lowercase()))
+            .is_some_and(|id| id != ENVELOPE_ID && !id.trim().is_empty() && claimed.insert(id.to_ascii_lowercase()))
     }).collect()
 }
 
 pub fn set_defaults(provider: &str, models: Vec<Value>) -> Option<(usize, i64)> {
     let _write = accepts_empty(provider)
         .then(|| write_gate().lock().unwrap_or_else(|poisoned| poisoned.into_inner()));
-    let restored = restore(provider);
-    crate::server::core::providers::catalog::invalidate();
+    // 只有「内存里还没有远端清单」时才需要从持久层恢复：已经有的话下面会
+    // 直接丢弃恢复结果，别白读一次 DB（单连接锁，抢得很凶）。
+    let needs_restore = table().lock().ok()
+        .and_then(|map| map.get(provider).map(|entry| entry.remote.is_none()))
+        .unwrap_or(true);
+    let restored = needs_restore.then(|| restore(provider)).flatten();
+    let fallback = valid_models(models);
     let mut map = table().lock().ok()?;
     let entry = map.entry(provider.to_string()).or_default();
+    // ── 内容未变不推 generation（2026-11-25）────────────────────────
+    // `set_defaults` 是**插件握手必经之路**：插件包里每家提供商装载时都会
+    // 走一遍（bootstrap / script runtime）。原来这里无条件 `invalidate()`
+    // 两次，于是「装一个 30 家的插件包」就把 generation 推高 60 格 ——
+    // 而 manifest_cache / MODELS_CACHE / ValidationCache / routing_snapshot
+    // 四张派生缓存全以 generation 为键，于是每轮请求都要重建全量模型
+    // 目录（实测 /api/session 114-194 秒、/v1/models 首次 33 秒第二次
+    // 116 秒）。旧版日志里 generation 从 1 涨到 274、装一次插件包 50 秒
+    // 内涨 84 格，就是这么来的。
+    // 现在只在目录内容真的变了时推：远端清单换了、或兜底清单换了。
+    let before_remote = entry.remote.as_ref().map(|list| list.models.clone());
+    let before_fallback = entry.fallback.clone();
     let recovered = if entry.remote.is_none() {
         let recovered = restored.as_ref().map(|list| (list.models.len(), list.meta.refreshed_at));
         entry.remote = restored;
@@ -95,8 +123,11 @@ pub fn set_defaults(provider: &str, models: Vec<Value>) -> Option<(usize, i64)> 
     } else {
         None
     };
-    entry.fallback = valid_models(models, crate::server::core::providers::is_scoped_runtime_provider(provider));
-    crate::server::core::providers::catalog::invalidate();
+    entry.fallback = fallback;
+    let after_remote = entry.remote.as_ref().map(|list| list.models.clone());
+    if before_remote != after_remote || before_fallback != entry.fallback {
+        crate::server::core::providers::catalog::invalidate();
+    }
     recovered
 }
 
@@ -116,7 +147,7 @@ pub fn set_remote(provider: &str, mut list: proto::ModelList) -> usize {
     if scoped && !list.meta.remote {
         return 0; // 静态或失败目录不能在持久层被重新标成远程成功。
     }
-    list.models = valid_models(list.models, scoped);
+    list.models = valid_models(list.models);
     if !scoped && list.models.is_empty() {
         return 0;
     }
@@ -222,27 +253,31 @@ pub fn rename_models(provider: &str, mapping: &HashMap<String, String>) -> usize
         (changed, entry.remote.clone())
     };
     if changed > 0 {
+        // 改名后内存里的清单已经与 `set_remote` 看到的「上一份」一致，
+        // set_remote 自己不会再推 generation —— 这里显式推一次（只推一次）。
         crate::server::core::providers::catalog::invalidate();
         if let Some(list) = list {
             set_remote(provider, list);
         }
-        crate::server::core::providers::catalog::invalidate();
     }
     changed
 }
 
 pub fn forget(provider: &str) {
-    if let Ok(mut map) = table().lock() {
-        crate::server::core::providers::catalog::invalidate();
-        map.remove(provider);
+    let removed = table().lock().ok().and_then(|mut map| map.remove(provider));
+    // 只有真的带走了内容才需要作废派生缓存：空条目被删掉不影响目录。
+    if removed.is_some_and(|entry| entry.remote.is_some() || !entry.fallback.is_empty()) {
         crate::server::core::providers::catalog::invalidate();
     }
 }
 
 pub fn clear_all() {
-    if let Ok(mut map) = table().lock() {
-        crate::server::core::providers::catalog::invalidate();
+    let had_content = table().lock().ok().map(|mut map| {
+        let had = map.values().any(|entry| entry.remote.is_some() || !entry.fallback.is_empty());
         map.clear();
+        had
+    });
+    if had_content == Some(true) {
         crate::server::core::providers::catalog::invalidate();
     }
 }

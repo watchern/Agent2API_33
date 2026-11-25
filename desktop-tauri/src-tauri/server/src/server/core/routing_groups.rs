@@ -145,7 +145,16 @@ pub fn project_with_vision(group: &RoutingGroup, accounts: &[Value], needs: &Req
                     }
                     requirements.reason(item)
                 }
-            } else { Some("模型已不在提供商目录中，配置保留但不参与转发".to_string()) };
+            } else {
+                // 点名是哪家、哪个模型：原来只说「模型已不在提供商目录中」，
+                // 用户在路由页上无从判断要改哪一条（2026-11-25：ZCode 国际版
+                // 那条组里存的是 scoped 目录的信封名 `__scoped_plugin_catalog_v1`，
+                // 界面上只看到一个不存在的模型名）。
+                Some(format!(
+                    "{} 的模型 {} 已不在该提供商的目录中，配置保留但不参与转发，请在路由组里换成现有模型",
+                    member.provider, member.model,
+                ))
+            };
         let actual = item.as_ref().map(model_id).unwrap_or_else(|| member.model.clone());
         if let Some(reason) = reason {
             result.blocked.push(json!({ "id": member.id, "memberId": member.id, "provider": member.provider,

@@ -29,23 +29,47 @@ fn changed() -> &'static Notify {
     CHANGED.get_or_init(Notify::new)
 }
 
+/// 在册提供商的集合（排序后）。
+///
+/// 只看「有哪些家」，不看适配器身份：同一家换了新适配器时，模型目录的
+/// 内容变化由 `rpc_cache` 自己按内容判定要不要推 generation（见
+/// `set_remote` / `set_defaults`）。
+///
+/// 集合没变就不推 generation —— 否则每次插件握手 / 启停都会把
+/// manifest_cache、MODELS_CACHE、ValidationCache、routing_snapshot
+/// 四张派生缓存一起打掉，每轮请求都得重建全量模型目录
+/// （2026-11-25 实测：/api/session 114-194 秒）。
+fn provider_ids(table: &Registry) -> Vec<String> {
+    let mut ids: Vec<String> = table.adapters.keys().cloned().collect();
+    ids.sort();
+    ids
+}
+
 pub fn install(id: String, adapter: Arc<RpcAdapter>) {
     if crate::server::core::providers::availability::is_suspended(&id) { return; }
-    crate::server::core::providers::catalog::invalidate();
-    table().lock().unwrap_or_else(|error| error.into_inner()).adapters.insert(id, adapter);
-    crate::server::core::providers::catalog::invalidate();
+    let mut table = table().lock().unwrap_or_else(|error| error.into_inner());
+    let before = provider_ids(&table);
+    table.adapters.insert(id, adapter);
+    let after = provider_ids(&table);
+    drop(table);
+    if before != after {
+        crate::server::core::providers::catalog::invalidate();
+    }
     changed().notify_waiters();
 }
 
 pub(super) fn stage_all(adapters: Vec<(String, Arc<RpcAdapter>)>) {
     let mut table = table().lock().unwrap_or_else(|error| error.into_inner());
-    crate::server::core::providers::catalog::invalidate();
+    let before = provider_ids(&table);
     for (id, adapter) in adapters {
         if table.switching.contains(&id) { table.staged.insert(id, adapter); }
         else { table.adapters.insert(id, adapter); }
     }
-    crate::server::core::providers::catalog::invalidate();
+    let after = provider_ids(&table);
     drop(table);
+    if before != after {
+        crate::server::core::providers::catalog::invalidate();
+    }
     changed().notify_waiters();
 }
 
@@ -111,9 +135,16 @@ pub fn installed_ids() -> Vec<String> {
 }
 
 pub fn remove(id: &str) {
-    crate::server::core::providers::catalog::invalidate();
-    table().lock().unwrap_or_else(|error| error.into_inner()).adapters.remove(id);
-    crate::server::core::providers::catalog::invalidate();
+    let mut table = table().lock().unwrap_or_else(|error| error.into_inner());
+    // 两处都要摘：`||` 会短路，写成 `a.is_some() || b.is_some()` 会在
+    // 第一处命中时跳过第二处的删除。
+    let from_adapters = table.adapters.remove(id).is_some();
+    let from_staged = table.staged.remove(id).is_some();
+    drop(table);
+    // 真的摘掉了一家才作废派生缓存；没摘掉的不用推 generation。
+    if from_adapters || from_staged {
+        crate::server::core::providers::catalog::invalidate();
+    }
     super::rpc_cache::forget(id);
     super::schedules::forget(id);
     super::wasm::forget(id);
@@ -122,9 +153,13 @@ pub fn remove(id: &str) {
 
 pub fn clear() {
     for id in installed_ids() { super::wasm::forget(&id); }
-    crate::server::core::providers::catalog::invalidate();
-    table().lock().unwrap_or_else(|error| error.into_inner()).adapters.clear();
-    crate::server::core::providers::catalog::invalidate();
+    let mut table = table().lock().unwrap_or_else(|error| error.into_inner());
+    let had = !table.adapters.is_empty();
+    table.adapters.clear();
+    drop(table);
+    if had {
+        crate::server::core::providers::catalog::invalidate();
+    }
     super::schedules::clear_all();
     changed().notify_waiters();
 }
@@ -150,7 +185,7 @@ impl SwitchGuard {
 
     pub fn clear_adapters(&self) {
         let mut table = table().lock().unwrap_or_else(|error| error.into_inner());
-        crate::server::core::providers::catalog::invalidate();
+        let before = provider_ids(&table);
         for id in &self.providers {
             table.staged.remove(id);
             match self.previous.get(id) {
@@ -158,8 +193,13 @@ impl SwitchGuard {
                 None => { table.adapters.remove(id); }
             }
         }
-        crate::server::core::providers::catalog::invalidate();
+        let after = provider_ids(&table);
         drop(table);
+        // 集合没变就不推：切换期间反复清/装适配器（插件启停、reload）
+        // 原来每次都推两格，是 generation 高频漂移的第二来源。
+        if before != after {
+            crate::server::core::providers::catalog::invalidate();
+        }
         for id in &self.providers {
             super::schedules::forget(id);
             super::wasm::tasks::forget(id);
@@ -170,6 +210,7 @@ impl SwitchGuard {
 impl Drop for SwitchGuard {
     fn drop(&mut self) {
         let mut table = table().lock().unwrap_or_else(|error| error.into_inner());
+        let before = provider_ids(&table);
         for id in &self.providers {
             if let Some(adapter) = table.staged.remove(id).filter(|adapter| adapter.host().ready()) {
                 table.adapters.insert(id.clone(), adapter);
@@ -179,9 +220,12 @@ impl Drop for SwitchGuard {
                 table.adapters.remove(id);
             }
         }
+        let after = provider_ids(&table);
         self.pauses.clear();
-        crate::server::core::providers::catalog::invalidate();
         drop(table);
+        if before != after {
+            crate::server::core::providers::catalog::invalidate();
+        }
         changed().notify_waiters();
     }
 }

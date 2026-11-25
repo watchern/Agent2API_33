@@ -178,12 +178,13 @@ fn load() -> Snapshot {
 
 /// 用新索引整体替换内存快照（刷新成功后调用）。
 pub fn replace(snapshot: Snapshot) {
-    crate::server::core::providers::catalog::invalidate();
     let lock = SNAPSHOT.get_or_init(|| RwLock::new(None));
     match lock.write() {
         Ok(mut slot) => *slot = Some(Arc::new(snapshot)),
         Err(poisoned) => *poisoned.into_inner() = Some(Arc::new(snapshot)),
     }
+    // 只在换完之后推一次：换之前推的话，这一推作废掉的缓存可能又被按
+    // **旧**快照重建，等于白推一轮（generation 是所有派生缓存的键）。
     crate::server::core::providers::catalog::invalidate();
 }
 

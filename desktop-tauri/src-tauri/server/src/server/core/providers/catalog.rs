@@ -127,6 +127,27 @@ pub(crate) fn manifest_for(kind: ProviderKind) -> Vec<Value> {
     manifest_for_provider(kind_id(kind))
 }
 
+/// 只读**已缓存**的清单条数；**不触发构建**。
+///
+/// 供 `/health` 用。健康检查是桌面壳的就绪探针（单次 1.5 秒超时、整体
+/// 5 秒窗口），而冷启动时一次插件清单构建要 2-8.6 秒（见
+/// `build_manifest_for_provider` 的分段插桩）—— 把它挂在 /health 上等于
+/// 让网关在自己的启动自检里超时自杀（2026-11-25 实测：端口已绑定、
+/// 健康检查未通过、进程退出）。
+///
+/// 这里只报「内存里已经有的」条数：缓存没建起来就是 0，与 Node 版
+/// `modelCatalog.list().length`（未刷新时等于当时内存里的条数）同口径。
+pub(crate) fn cached_manifest_len(kind: ProviderKind) -> usize {
+    let metadata = generation();
+    let provider = kind_id(kind);
+    let Ok(cache) = manifest_cache().lock() else { return 0 };
+    cache.get(provider)
+        .and_then(|(cached_generation, manifest)| {
+            (*cached_generation == metadata).then_some(manifest.len())
+        })
+        .unwrap_or(0)
+}
+
 /// 旧内置目录已迁入插件，网关不再持有按 kind 划分的刷新元数据。
 pub(crate) fn refresh_meta(_kind: ProviderKind) -> (bool, i64) {
     (false, 0)

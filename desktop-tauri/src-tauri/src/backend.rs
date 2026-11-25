@@ -66,8 +66,19 @@ use crate::state::AppState;
 ///
 /// 旧实现给 node 冷启动留了 12 秒；进程内服务器没有进程启动与模块加载开销，
 /// bind + 首次响应是毫秒级的，5 秒足够覆盖「系统繁忙/杀软扫描」这类抖动。
-const STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
-const HEALTH_TIMEOUT: Duration = Duration::from_millis(1500);
+///
+/// 2026-11-25 放宽到 30 秒：冷启动时插件包陆续就绪，首个 `/health` 可能
+/// 撞上插件清单构建与单连接 DB 锁（实测 2-8.6 秒）。窗口太窄会让网关在
+/// 「其实正在就绪」的时候被判定为启动失败并直接退出 —— 用户看到的是
+/// 「端口已绑定但健康检查未通过」，而进程已经没了。
+const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
+/// 单次 `/health` 探测的超时。
+///
+/// 1500 毫秒原本够用（/health 是纯本地读），但它与 STARTUP_TIMEOUT 是
+/// 「整体窗口 ÷ 单次超时」的关系：窗口 5 秒、单次 1.5 秒时，冷启动里连续
+/// 几次慢响应就把窗口吃光了。现在单次放宽到 5 秒、整体 30 秒，冷启动能等到
+/// 真正的就绪信号。
+const HEALTH_TIMEOUT: Duration = Duration::from_secs(5);
 const HEALTH_INTERVAL: Duration = Duration::from_millis(100);
 
 /// 探测本机网关是否已就绪（只看能否拿到 /health 响应）。

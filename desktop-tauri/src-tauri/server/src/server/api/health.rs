@@ -81,9 +81,12 @@ pub async fn handle(State(state): State<ServerState>) -> Response {
         // 目录。现在目录由各家适配器在读取时聚合（见 `core::providers::catalog`），
         // 这里报**国内版**那一家的条数 —— 与旧口径对齐（同一时刻的同一份清单）。
         // 完整的可用清单看 `/v1/models`（聚合视图）。
-        "models": crate::server::core::providers::catalog::manifest_for(
+        //
+        // 只读**已缓存**的条数，不触发清单构建（2026-11-25）：/health 是桌面
+        // 壳的就绪探针，冷启动时一次插件清单构建要 2-8.6 秒，会把壳侧 1.5 秒
+        // 的单次探测拖到超时、让网关在自己的启动自检里退出。
+        "models": crate::server::core::providers::catalog::cached_manifest_len(
             crate::server::core::providers::ProviderKind::WorkBuddy,
-        )
-        .len(),
+        ),
     }))
 }
