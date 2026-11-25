@@ -351,7 +351,8 @@ impl AccountStore {
                     .unwrap_or(false)
             })
             .count();
-        logging::log(
+        // 摘要可能包含「失败重试 → N 次」，不能靠文案推断级别，仅按实际失败数决定。
+        logging::log_with_level(
             "[Accounts]",
             &format!(
                 "🔀 批量修改 {} 个账号（{}）: 成功 {changed_count} 个{}{}",
@@ -368,6 +369,7 @@ impl AccountStore {
                     format!("，跳过 {} 个", skipped.len())
                 }
             ),
+            if failed.is_empty() { "info" } else { "error" },
         );
         Ok(json!({ "ok": ok, "failed": failed, "skipped": skipped, "list": snapshot }))
     }
@@ -438,7 +440,7 @@ impl AccountStore {
             .filter_map(|item| item.get("name").and_then(Value::as_str))
             .collect::<Vec<_>>()
             .join("、");
-        logging::log(
+        logging::log_with_level(
             "[Accounts]",
             &format!(
                 "🗑️  批量删除 {} 个账号: {}{}",
@@ -450,6 +452,7 @@ impl AccountStore {
                     format!("（{} 个不存在，已跳过）", failed.len())
                 }
             ),
+            "info",
         );
         // 落盘完成后作废这些账号的 CatPaw 会话映射（放锁，见本函数说明）
         drop(_guard);
@@ -457,5 +460,20 @@ impl AccountStore {
             self.invalidate_catpaw_sessions(&id, &provider);
         }
         Ok(json!({ "removed": removed, "failed": failed, "list": snapshot }))
+    }
+
+    /// 清理已由内置 API 模板替代的旧提供商残留账号（由用户在界面明确确认后触发）。
+    pub fn remove_retired_provider(&self, provider: &str) -> Result<Value, AccountStoreError> {
+        let ids: Vec<String> = self
+            .read_state()
+            .accounts
+            .iter()
+            .filter(|record| record.provider() == provider)
+            .map(|record| record.id().to_string())
+            .collect();
+        if ids.is_empty() {
+            return Ok(json!({ "removed": [], "failed": [], "list": self.list_visible_accounts() }));
+        }
+        self.batch_remove(&ids)
     }
 }

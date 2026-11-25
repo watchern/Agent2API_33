@@ -52,19 +52,26 @@ pub const STATUS_SKIPPED: &str = "skipped";
 /// 尝试刷新但失败（结果里带可读的 `message`）
 pub const STATUS_FAILED: &str = "failed";
 
-/// 周期维护的**默认**间隔说明：10 分钟。
+/// 周期维护的**默认**间隔说明：10 分钟（可在定时任务页配置 1–1440 分钟）。
 ///
-/// 为什么默认是 10 分钟（而不是更密）：三家的临期窗口是 2~5 分钟，10 分钟的间隔
-/// 意味着「进入窗口后最多等一轮就被刷」——对「账号页显示得对不对」这个目的
-/// 足够。反过来，绝大多数轮次是空操作（没有临期账号时直接早退），
-/// 间隔调密只是让空转变多，不会让凭证更早恢复；调疏则会让列表上的
-/// 「已过期」停留更久。
-///
-/// ── 间隔是可配的，本模块不再持有它 ────────────────────────────
-/// 调度由 `core::scheduled_tasks` 负责，间隔取自 config.json 的
-/// `scheduledTasks.credentialMaintenance.interval`；默认值（10 分钟）定义在
-/// `config::DEFAULT_CREDENTIAL_MAINTENANCE_MINUTES`，在定时任务页可改。
-/// 本模块因此不再导出间隔常量 —— 留一个没人读的数字只会让人以为改它有效。
+/// ── 临期窗口如何与维护间隔配合 ─────────────────────────────────
+/// 多家提供商自带的临期窗口只有 3～5 分钟，若只按自带窗口判定，在默认 10 分钟
+/// 间隔下经常上一轮因还剩 6～10 分钟跳过、下一轮到点时已跌到 0 分（已过期）。
+/// 因此本模块每次检查都会把「当前维护间隔 + 5 分钟缓冲」作为最小提前量传给
+/// 适配器/插件，与各家原有提前量取较大值；正常对话的按需续期仍走各家原窗口，
+/// 不受维护间隔影响。
+pub const MAINTENANCE_BUFFER_MS: i64 = 5 * 60_000;
+
+/// 本轮凭证维护要求的最小临期提前量（毫秒）：维护间隔 + 5 分钟缓冲。
+pub fn maintenance_lead_ms() -> i64 {
+    let minutes = crate::server::config::scheduled_settings()
+        .credential_maintenance
+        .interval
+        .max(1);
+    minutes
+        .saturating_mul(60_000)
+        .saturating_add(MAINTENANCE_BUFFER_MS)
+}
 
 /// 遍历全部账号，把「该家支持刷新 且 凭证已过期 / 临期」的那些刷新一遍。
 ///
@@ -158,6 +165,7 @@ pub async fn refresh_accounts(store: &AccountStore, selected: Option<&[String]>,
     // 结果按**账号下标**占位（`slots[i]`），刷新那一遍写回各自的位置 ——
     // 于是返回顺序与账号列表一致，而不是「先一堆跳过、后面才是刷新的」。
     // 界面上逐条对照时，顺序一致省掉一次按 id 重排。
+    let min_lead_ms = maintenance_lead_ms();
     let mut slots: Vec<Option<Value>> = vec![None; accounts.len()];
     // 待刷新项带着适配器本身（而不是 `ProviderKind`）：插件家没有枚举值，
     // 而这里已经查过一次表，再查一次是白费
@@ -201,28 +209,42 @@ pub async fn refresh_accounts(store: &AccountStore, selected: Option<&[String]>,
             ));
             continue;
         }
-        // 判不出来（没有过期信息 / 账号不存在 / 没有 refreshToken）一律 false
-        if !forced.iter().any(|account_id| account_id == &id) && !adapter.credentials_expiring_async(store, &id).await {
-            slots[index] = Some(skipped(&id, provider, "凭证未过期或临期"));
-            continue;
+        if !forced.iter().any(|account_id| account_id == &id) {
+            match adapter
+                .check_credentials_expiring_within(store, &id, min_lead_ms)
+                .await
+            {
+                Ok(true) => {}
+                Ok(false) => {
+                    slots[index] = Some(skipped(&id, provider, "凭证未过期或临期"));
+                    continue;
+                }
+                Err(error) => {
+                    slots[index] = Some(json!({
+                        "id": id,
+                        "provider": provider,
+                        "status": STATUS_FAILED,
+                        "message": crate::server::core::maintenance::types::safe_message(&error.message),
+                        "code": error.code,
+                    }));
+                    continue;
+                }
+            }
         }
         pending.push((index, id, provider.to_string(), adapter));
     }
 
     if pending.is_empty() {
-        // 绝大多数轮次走到这里（没有临期账号）：只留一行 verbose，
-        // 不写日志库 —— 每 10 分钟一条「什么都没做」的记录会把日志页淹掉
         logging::verbose(
             "[Accounts]",
-            &format!("凭证自动维护：无需刷新的账号（共 {} 个）", accounts.len()),
+            &format!("凭证自动维护：本轮没有可续期的账号（共 {} 个）", accounts.len()),
         );
-        return slots.into_iter().flatten().collect();
+    } else {
+        logging::verbose(
+            "[Accounts]",
+            &format!("检测到 {} 个临期账号，开始自动刷新凭证…", pending.len()),
+        );
     }
-
-    logging::log(
-        "[Accounts]",
-        &format!("检测到 {} 个临期账号，开始自动刷新凭证…", pending.len()),
-    );
     for (index, id, provider, adapter) in pending {
         if store.needs_relogin(&id) {
             slots[index] = Some(skipped(&id, &provider, "登录授权已失效，需要重新登录该账号"));
@@ -236,33 +258,46 @@ pub async fn refresh_accounts(store: &AccountStore, selected: Option<&[String]>,
         // 串行既避开风控也保证日志顺序稳定；失败被 match 收敛成一条结果，
         // 不会中断循环（见模块头的失败隔离）。
         let started = std::time::Instant::now();
-        slots[index] = Some(match refresh_checked(store, adapter.as_ref(), &id).await {
-            Ok(_) => {
-                // 成功也打一条：用户在日志页能看到「网关自动刷新了谁的凭证」，
-                // 否则「token 怎么自己变新了」是个无法追溯的问题
-                logging::log("[Accounts]", &format!("✅ 已自动刷新账号 {id} 的凭证"));
-                json!({
-                    "id": id,
-                    "provider": provider,
-                    "status": STATUS_REFRESHED,
-                })
-            }
-            Err(error) => {
-                logging::log(
-                    "[Accounts]",
-                    &format!("❌ 账号 {id} 凭证自动刷新失败: {}", error.message),
-                );
-                json!({
-                    "id": id,
-                    "provider": provider,
-                    "status": STATUS_FAILED,
-                    "message": error.message,
-                })
-            }
-        });
-        if let Some(row) = &mut slots[index] {
-            row["durationMs"] = json!(started.elapsed().as_millis().min(i64::MAX as u128) as i64);
-        }
+        let credential_stamp = store.credential_stamp(&id);
+        let result = refresh_checked(store, adapter.as_ref(), &id).await.map(|_| ());
+        let mut row = match &result {
+            Ok(_) => json!({
+                "id": id,
+                "provider": provider,
+                "status": STATUS_REFRESHED,
+            }),
+            Err(error) => json!({
+                "id": id,
+                "provider": provider,
+                "status": STATUS_FAILED,
+                "message": crate::server::core::maintenance::types::safe_message(&error.message),
+            }),
+        };
+        row["durationMs"] = json!(started.elapsed().as_millis().min(i64::MAX as u128) as i64);
+        let message = if result.is_ok() {
+            format!("✅ 已自动刷新账号 {id} 的凭证")
+        } else {
+            format!("❌ 账号 {id} 凭证自动刷新失败: {}", row["message"].as_str().unwrap_or_default())
+        };
+        logging::console_line("[Accounts]", &message);
+        logging::log_event(
+            if result.is_ok() { "info" } else { "error" },
+            "account",
+            &format!("[Accounts] {message}"),
+            Some(json!({
+                "action": "credential.refresh",
+                "accountId": id,
+                "accountName": before.get(&id).filter(|account| account.name != id)
+                    .map(|account| crate::server::core::maintenance::types::safe_message(&account.name)),
+                "provider": provider,
+                "providerLabel": crate::server::core::providers::label_of(&provider),
+                "outcome": row["status"],
+                "code": result.as_ref().err().and_then(|error| error.code.as_deref()),
+                "credentialStamp": credential_stamp,
+                "durationMs": row["durationMs"],
+            })),
+        );
+        slots[index] = Some(row);
     }
 
     let mut results: Vec<Value> = slots.into_iter().flatten().collect();
@@ -274,13 +309,6 @@ pub async fn refresh_accounts(store: &AccountStore, selected: Option<&[String]>,
         row["forced"] = json!(forced.iter().any(|account_id| account_id == &id));
         if row["status"] == STATUS_REFRESHED { row["credentialChanged"] = json!(true); }
     }
-    let (refreshed, skipped_count, failed) = summarize(&results);
-    // 汇总级别跟结果走：「失败 0 个」是正常收尾，不能因文案带「失败」被抬成 error
-    logging::log_with_level(
-        "[Accounts]",
-        &format!("凭证自动维护完成：成功 {refreshed}，跳过 {skipped_count}，失败 {failed}"),
-        if failed > 0 { "error" } else { "info" },
-    );
     results
 }
 
@@ -302,8 +330,8 @@ pub async fn refresh_expiring_report(store: &AccountStore) -> Value {
 
 /// 统计逐条结果里的三档状态：`(refreshed, skipped, failed)`。
 ///
-/// 供路由层拼汇总用（本模块内部打日志也走它）—— 统计口径只写一份，
-/// 免得「日志说成功 2、响应说成功 3」这种对不上的情况。
+/// 供路由层拼汇总用；统计口径只写一份，
+/// 免得响应与维护记录的成功数量对不上。
 pub fn summarize(results: &[Value]) -> (usize, usize, usize) {
     let count = |status: &str| {
         results

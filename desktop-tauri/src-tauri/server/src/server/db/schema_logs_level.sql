@@ -1,4 +1,4 @@
--- v30：日志表补 (level, id) 索引。
+-- v33：日志表补 (level, id) 索引（原为 v30，与上游迁移撞号后顺延）。
 --
 -- 为什么：管理面板每 20 秒拉一次「最新一条 error 日志」（未读失败角标的
 -- 水位查询：WHERE level='error' ORDER BY id DESC LIMIT 1），日志表在长期

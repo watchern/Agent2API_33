@@ -7,20 +7,30 @@ import {
 } from '@ui'
 import { t } from '../i18n'
 import { SearchableSelect } from '../../../ui-shared/searchable-select'
+import { usePageRefreshTimer } from '../../../ui-shared/page-auto-refresh-timer'
+import { providerKeyDrafts, providerKeysPayload, providerReady } from '../../../ui-shared/tools-provider-keys'
+import { ProviderKeyList, ProviderKeysEditor } from '../../../ui-shared/tools-provider-keys-view'
 import { callJson } from './assistant-state'
 import { openExternal } from './update-shared'
 import {
   PROVIDER_KEY_PAGES, clearProviderKey, clearVision, fetchProviders, fetchSelection, fetchVision,
   formatTime, saveProvider, saveSelection, saveVision, testProvider, testVision,
-  type ProviderRow, type ProviderSelection, type ProviderTestResult, type VisionConfig as VisionConfigRow,
-  type VisionKeyOption,
+  type LongQueryPolicy, type ProviderRow, type ProviderSelection, type ProviderTestResult,
+  type VisionConfig as VisionConfigRow, type VisionKeyOption,
 } from './tools-data'
+
+const LONG_QUERY_POLICY_LABEL: Record<LongQueryPolicy, string> = {
+  truncate: t('自动截断后搜索（推荐）'),
+  skip: t('跳过超限提供商'),
+  error: t('保留报错提示'),
+}
 
 /* ─── 网络搜索：上游提供商 ─────────────────────────────────── */
 
 /** 稳定错误码 → 界面文案（代码是后端口径，文案是中文键，便于扫描进词典） */
 const TEST_FAILURE_TEXT: Record<string, string> = {
   invalid_provider_key: t('密钥或账号登录态无效'),
+  quota_exhausted: t('额度已用完'),
   rate_limited: t('触发上游限流'),
   timed_out: t('上游请求超时'),
   no_results: t('上游没有返回结果'),
@@ -32,12 +42,22 @@ const TEST_FAILURE_TEXT: Record<string, string> = {
 
 function testFailureText(result: ProviderTestResult): string {
   const text = result.code ? TEST_FAILURE_TEXT[result.code] : ''
+  if (result.code === 'quota_exhausted' || result.code === 'rate_limited') {
+    return [text, result.reset_at ? t('恢复时间：{time}', { time: formatTime(result.reset_at) })
+      : result.code === 'quota_exhausted' ? t('上游未提供恢复时间') : ''].filter(Boolean).join(' · ')
+  }
   return result.error ? t(result.error) : text || t('连接测试失败')
 }
 
 export function WebSearchConfig() {
   const [providers, setProviders] = React.useState<ProviderRow[]>([])
-  const [selection, setSelection] = React.useState<ProviderSelection>({ search_providers: [], fetch_provider: 'tavily' })
+  const [selection, setSelection] = React.useState<ProviderSelection>({
+    search_providers: [],
+    fetch_provider: 'tavily',
+    max_global_sources: 200,
+    long_query_policy: 'truncate',
+  })
+  const [maxGlobalDraft, setMaxGlobalDraft] = React.useState('200')
   const [loading, setLoading] = React.useState(true)
   const [saving, setSaving] = React.useState(false)
   const [error, setError] = React.useState('')
@@ -58,7 +78,12 @@ export function WebSearchConfig() {
     try {
       const [providersResult, selectionResult] = await Promise.all([fetchProviders(), fetchSelection()])
       setProviders(providersResult || [])
-      setSelection(selectionResult)
+      setSelection({
+        ...selectionResult,
+        max_global_sources: selectionResult.max_global_sources ?? 200,
+        long_query_policy: selectionResult.long_query_policy || 'truncate',
+      })
+      setMaxGlobalDraft(String(selectionResult.max_global_sources ?? 200))
     } catch (failure) {
       setError(t(failure instanceof Error ? failure.message : String(failure)))
     } finally {
@@ -67,24 +92,33 @@ export function WebSearchConfig() {
   }, [])
 
   React.useEffect(() => { void load() }, [load])
+  usePageRefreshTimer(async () => {
+    try { setProviders(await fetchProviders()) } catch {}
+  }, !loading && !testing, 15_000)
 
   const options = providers.map(provider => ({ value: provider.provider, label: provider.display_name }))
   const fetchOptions = providers.filter(provider => provider.supports_fetch !== false)
     .map(provider => ({ value: provider.provider, label: provider.display_name }))
   const selected = new Set(selection.search_providers)
   // 选择范围和可用状态分开：密钥或账号配置失效时，明确显示会跳过哪些来源。
-  const readySelected = providers.filter(provider => selected.has(provider.provider) && provider.enabled && provider.configured)
-  const missing = providers.filter(provider => selected.has(provider.provider) && !(provider.enabled && provider.configured))
+  const readySelected = providers.filter(provider => selected.has(provider.provider) && providerReady(provider))
+  const missing = providers.filter(provider => selected.has(provider.provider) && !providerReady(provider))
   const aggregateReady = readySelected.length > 0
   const readyNames = readySelected.map(provider => provider.display_name).join(', ')
   const missingNames = missing.map(provider => provider.display_name).join(', ')
 
   const saveProviders = async () => {
     if (!selection.search_providers.length) { setError(t('批量网页搜索至少选择一个提供商')); return }
+    const maxGlobal = Number(maxGlobalDraft.trim())
+    if (!Number.isInteger(maxGlobal) || maxGlobal < 20 || maxGlobal > 1000) {
+      setError(t('单次汇总总条数上限需在 20～1000 之间'))
+      return
+    }
     setSaving(true); setError(''); setNotice('')
     try {
-      const next = await saveSelection(selection)
+      const next = await saveSelection({ ...selection, max_global_sources: maxGlobal })
       setSelection(next)
+      setMaxGlobalDraft(String(next.max_global_sources ?? maxGlobal))
       setNotice(t('能力提供商配置已保存'))
     } catch (failure) {
       setError(t(failure instanceof Error ? failure.message : String(failure)))
@@ -115,6 +149,7 @@ export function WebSearchConfig() {
     } catch (failure) {
       setError(t(failure instanceof Error ? failure.message : String(failure)))
     } finally {
+      try { setProviders(await fetchProviders()) } catch {}
       setTesting('')
     }
   }
@@ -150,16 +185,42 @@ export function WebSearchConfig() {
         <Field>
           <FieldLabel>{t('批量网页抓取提供商')}</FieldLabel>
           <SearchableSelect value={selection.fetch_provider} options={fetchOptions} className='w-full'
+            displayValue={fetchOptions.find(option => option.value === selection.fetch_provider)?.label || selection.fetch_provider}
             aria-label={t('批量网页抓取提供商')} searchPlaceholder={t('搜索提供商')}
             onValueChange={fetch_provider => setSelection(current => ({ ...current, fetch_provider }))} />
           <FieldDescription>{t('仅支持单选，默认为 Tavily。')}</FieldDescription>
+        </Field>
+        <Field>
+          <FieldLabel>{t('单次汇总总条数上限')}</FieldLabel>
+          <Input type='number' min={20} max={1000} value={maxGlobalDraft}
+            onChange={event => setMaxGlobalDraft(event.currentTarget.value)} />
+          <FieldDescription>{t('单次调用去重合并后最多保留的来源数（20～1000，默认 200）。')}</FieldDescription>
+        </Field>
+        <Field>
+          <FieldLabel>{t('搜索词超长处理')}</FieldLabel>
+          <Select value={selection.long_query_policy || 'truncate'}
+            onValueChange={value => {
+              if (value === 'truncate' || value === 'skip' || value === 'error') {
+                setSelection(current => ({ ...current, long_query_policy: value }))
+              }
+            }}>
+            <SelectTrigger className='w-full'>
+              <SelectValue>{LONG_QUERY_POLICY_LABEL[selection.long_query_policy || 'truncate']}</SelectValue>
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value='truncate'>{LONG_QUERY_POLICY_LABEL.truncate}</SelectItem>
+              <SelectItem value='skip'>{LONG_QUERY_POLICY_LABEL.skip}</SelectItem>
+              <SelectItem value='error'>{LONG_QUERY_POLICY_LABEL.error}</SelectItem>
+            </SelectContent>
+          </Select>
+          <FieldDescription>{t('超出提供商字数限制（如 Kiro 200 字、Tavily 400 字、Firecrawl 500 字）时的策略。')}</FieldDescription>
         </Field>
       </div>
       <div><Button disabled={saving} onClick={() => void saveProviders()}>{saving ? <Spinner /> : null}{t('保存能力配置')}</Button></div>
 
       {aggregateReady
         ? <Alert variant='success'>{missing.length
-          ? t('批量网页搜索可用：将使用 {ready}，未配置的 {missing} 会自动跳过。', { ready: readyNames, missing: missingNames })
+          ? t('批量网页搜索可用：将使用 {ready}，暂不可用的 {missing} 会自动跳过。', { ready: readyNames, missing: missingNames })
           : t('批量网页搜索可用：所选来源均已启用并配置完成。')}</Alert>
         : <Alert variant='warning'>{t('批量网页搜索不可用：请启用来源并配置密钥或绑定可用账号。')}</Alert>}
       <p className='text-xs text-subtle'>{t('已有账号搜索只支持搜索，不支持网页抓取；请求会使用绑定账号的额度与出网设置。')}</p>
@@ -179,9 +240,12 @@ export function WebSearchConfig() {
             {provider.auth_type === 'account' ? <>
               <div>{t('已有账号')} · {t('仅搜索')}</div>
               <div>{t('搜索账号')}: <span className='text-foreground'>{provider.account_name || t('未选择账号')}</span></div>
-              {provider.max_query_chars ? <div>{t('每条搜索词最多 {count} 字', { count: provider.max_query_chars })}</div> : null}
               {provider.unavailable_reason ? <div className='mt-1 text-warning'>{t(provider.unavailable_reason)}</div> : null}
-            </> : <div>{t('密钥提示')}: <span className='text-foreground'>{provider.key_hint || '-'}</span></div>}
+            </> : <ProviderKeyList provider={provider} />}
+            {provider.supports_max_results && provider.max_results
+              ? <div>{t('单次最多 {count} 条', { count: provider.max_results })}</div>
+              : provider.supports_max_results === false ? <div>{t('固定返回条数')}</div> : null}
+            {provider.max_query_chars ? <div>{t('每条搜索词最多 {count} 字', { count: provider.max_query_chars })}</div> : null}
             <div>{t('更新时间')}: {formatTime(provider.updated_at)}</div>
           </div>
           <div className='mt-auto flex flex-wrap gap-1.5'>
@@ -190,7 +254,7 @@ export function WebSearchConfig() {
               {testing === provider.provider ? <Spinner /> : null}{t('测试连接')}
             </Button>
             {provider.auth_type !== 'account' ? <Button size='sm' variant='ghost' disabled={!provider.configured} onClick={() => {
-              void confirmDialog(t('确定清除提供商 {name} 的 API Key？清除后该提供商将不可用，直到重新保存新密钥。', { name: provider.display_name }), { destructive: true })
+              void confirmDialog(t('确定清除提供商 {name} 的全部 API Key？清除后该提供商将不可用，直到重新保存新密钥。', { name: provider.display_name }), { destructive: true })
                 .then(ok => { if (ok) void clearKey(provider) })
             }}>{t('清除密钥')}</Button> : null}
           </div>
@@ -198,27 +262,73 @@ export function WebSearchConfig() {
         {!providers.length && <Empty>{t('没有可配置的提供商')}</Empty>}
       </div>
     </CardContent>
-    {editing && <ProviderDialog provider={editing} onClose={() => setEditing(null)} onSaved={() => { setEditing(null); void load(true) }} />}
+    {editing && <ProviderDialog provider={providers.find(provider => provider.provider === editing.provider) || editing}
+      onClose={() => setEditing(null)} onSaved={() => { setEditing(null); void load(true) }}
+      onRefresh={async () => { setProviders(await fetchProviders()) }} />}
   </Card>
 }
 
-function ProviderDialog({ provider, onClose, onSaved }: { provider: ProviderRow; onClose: () => void; onSaved: () => void }) {
-  const [apiKey, setApiKey] = React.useState('')
+function ProviderDialog({ provider, onClose, onSaved, onRefresh }: {
+  provider: ProviderRow; onClose: () => void; onSaved: () => void; onRefresh: () => Promise<void>
+}) {
+  const [keyDrafts, setKeyDrafts] = React.useState(() => providerKeyDrafts(provider))
+  const [checking, setChecking] = React.useState('')
+  const [notice, setNotice] = React.useState('')
   const [accountId, setAccountId] = React.useState(provider.account_id || '')
   const isAccount = provider.auth_type === 'account'
   const accounts = (provider.accounts || []).filter(account => account.enabled)
   const accountLabel = accounts.find(account => account.id === accountId)?.name
     || (accountId ? t('已绑定账号不可用，请重新选择') : t('未选择账号'))
   const [enabled, setEnabled] = React.useState(provider.enabled)
+  const [maxResultsDraft, setMaxResultsDraft] = React.useState(provider.max_results != null ? String(provider.max_results) : '')
   const [busy, setBusy] = React.useState(false)
   const [error, setError] = React.useState('')
 
+  React.useEffect(() => {
+    setKeyDrafts(current => current.map(draft => ({ ...draft, row: provider.keys?.find(row => row.id === draft.id) || draft.row })))
+  }, [provider.keys])
+
+  const check = async (id: string, operation: 'search' | 'fetch') => {
+    setChecking(`${id}:${operation}`); setError(''); setNotice('')
+    try {
+      const result = await testProvider(provider.provider, id, operation)
+      if (result.success) setNotice(t('密钥检查成功，额度标记已清除'))
+      else setError(testFailureText(result))
+      await onRefresh()
+    } catch (failure) {
+      setError(t(failure instanceof Error ? failure.message : String(failure)))
+    } finally { setChecking('') }
+  }
+
+  const supportsLimit = provider.supports_max_results !== false && Boolean(provider.max_results_limit)
+  const maxLimit = provider.max_results_limit ?? 100
+  const maxResultsHint = provider.provider === 'firecrawl'
+    ? t('范围 1～{max}（默认 {def}），Firecrawl 按每 10 条结果计费；留空恢复默认。', { max: maxLimit, def: provider.default_max_results ?? 20 })
+    : provider.provider === 'querit'
+      ? t('范围 1～{max}（默认 {def}），免费套餐最高 10 条，付费套餐可调高；留空恢复默认。', { max: maxLimit, def: provider.default_max_results ?? 10 })
+      : t('范围 1～{max}（默认 {def}），外部传 limit 时也会受此上限约束；留空恢复默认。', { max: maxLimit, def: provider.default_max_results ?? 10 })
+
   const save = async () => {
+    if (!isAccount && keyDrafts.some(draft => !draft.id && !draft.apiKey.trim())) { setError(t('新密钥不能为空')); return }
+    let nextMaxResults: number | null | undefined = undefined
+    if (supportsLimit) {
+      const raw = maxResultsDraft.trim()
+      if (!raw) {
+        nextMaxResults = null
+      } else {
+        const parsed = Number(raw)
+        if (!Number.isInteger(parsed) || parsed < 1 || parsed > maxLimit) {
+          setError(t('单次最多返回条数需在 1～{max} 之间', { max: maxLimit }))
+          return
+        }
+        nextMaxResults = parsed
+      }
+    }
     setBusy(true); setError('')
     try {
       await saveProvider(provider.provider, isAccount
-        ? { account_id: accountId || null, enabled }
-        : { api_key: apiKey.trim() || undefined, enabled })
+        ? { account_id: accountId || null, enabled, ...(supportsLimit ? { max_results: nextMaxResults } : {}) }
+        : { keys: providerKeysPayload(keyDrafts), enabled, ...(supportsLimit ? { max_results: nextMaxResults } : {}) })
       onSaved()
     } catch (failure) {
       setError(t(failure instanceof Error ? failure.message : String(failure)))
@@ -227,8 +337,8 @@ function ProviderDialog({ provider, onClose, onSaved }: { provider: ProviderRow;
     }
   }
 
-  return <Dialog open onOpenChange={(open, details) => { if (!open) { if (busy) details.cancel(); else onClose() } }}>
-    <DialogContent className='max-w-lg'>
+  return <Dialog open onOpenChange={(open, details) => { if (!open) { if (busy || checking) details.cancel(); else onClose() } }}>
+    <DialogContent className={isAccount ? 'max-w-lg' : 'max-w-xl'}>
       <DialogHeader><DialogTitle>{t('编辑提供商 {name}', { name: provider.display_name })}</DialogTitle></DialogHeader>
       <DialogBody className='flex flex-col gap-3'>
         {isAccount ? <Field>
@@ -244,23 +354,29 @@ function ProviderDialog({ provider, onClose, onSaved }: { provider: ProviderRow;
           <FieldDescription>{t('复用「账号」页的登录态，不需要额外填写搜索密钥。账号停用或删除后不会自动换号。')}</FieldDescription>
           {!accounts.length ? <Alert variant='warning'>{t('没有可绑定的启用账号，请先到「账号」页添加或启用。')}</Alert> : null}
           {provider.available === false && provider.unavailable_reason ? <Alert variant='warning'>{t(provider.unavailable_reason)}</Alert> : null}
-        </Field> : <Field>
-          <FieldLabel>{t('API Key')}</FieldLabel>
-          <Input type='password' autoComplete='new-password' value={apiKey} placeholder={t('输入新密钥；留空保持不变')} onChange={event => setApiKey(event.currentTarget.value)} />
-          <FieldDescription>{t('空白的 API Key 不会覆盖已保存的密钥。')}</FieldDescription>
-        </Field>}
+        </Field> : <ProviderKeysEditor value={keyDrafts} onChange={setKeyDrafts} maxKeys={provider.max_keys}
+          disabled={busy || Boolean(checking)} testing={checking} onTest={(id, operation) => void check(id, operation)} />}
         {PROVIDER_KEY_PAGES[provider.provider] ? <div>
           <Button variant='link' size='sm' className='h-auto px-0' onClick={() => void openExternal(PROVIDER_KEY_PAGES[provider.provider])}>
             {t('获取 API Key')}
           </Button>
         </div> : null}
+        {supportsLimit ? <Field>
+          <FieldLabel>{t('单次最多返回条数')}</FieldLabel>
+          <Input type='number' min={1} max={maxLimit} disabled={busy || Boolean(checking)}
+            value={maxResultsDraft}
+            placeholder={provider.default_max_results ? t('默认 {count}', { count: provider.default_max_results }) : ''}
+            onChange={event => setMaxResultsDraft(event.currentTarget.value)} />
+          <FieldDescription>{maxResultsHint}</FieldDescription>
+        </Field> : null}
         <div className='flex items-center gap-2'>
           <span className='text-sm'>{t('启用')}</span>
           <Switch checked={enabled} disabled={isAccount && provider.available === false && !enabled} onCheckedChange={checked => setEnabled(checked === true)} aria-label={t('启用')} />
         </div>
         {error && <Alert variant='destructive'>{error}</Alert>}
+        {notice && <Alert variant='success'>{notice}</Alert>}
       </DialogBody>
-      <DialogFooter><Button variant='outline' disabled={busy} onClick={onClose}>{t('取消')}</Button><Button disabled={busy} onClick={() => void save()}>{busy ? <Spinner /> : null}{t('保存')}</Button></DialogFooter>
+      <DialogFooter><Button variant='outline' disabled={busy || Boolean(checking)} onClick={onClose}>{t('取消')}</Button><Button disabled={busy || Boolean(checking)} onClick={() => void save()}>{busy ? <Spinner /> : null}{t('保存')}</Button></DialogFooter>
     </DialogContent>
   </Dialog>
 }

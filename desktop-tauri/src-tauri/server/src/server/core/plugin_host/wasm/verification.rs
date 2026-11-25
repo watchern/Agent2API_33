@@ -1,9 +1,4 @@
 //! 主程序签发的账号验证调用；仅固定模型提交与领取轮询/回传可进入短通道。
-//!
-//! 从上游 3.5.0-beta.4 移植，按 fork 现有设施做了适配：
-//! · 无 runtime_capacity：Permits 只保留本插件并发槽（Semaphore）。
-//! · 无 plugin_verification_snapshot：复用 plugin_account（返回字段兼容）。
-//! · 无 host.activity.retired()/runtime.admission_closed()：用 activity 租约判断。
 pub(super) mod lease;
 mod native;
 pub(in crate::server::core::plugin_host) use native::call as native_claim;
@@ -31,13 +26,13 @@ const MAX_CALLS: u32 = 128;
 const MAX_TTL: i64 = 120_000;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) enum Action { ModelPush, ClaimPoll, ClaimComplete }
+enum Action { ModelPush, ClaimPoll, ClaimComplete }
 
 impl Action {
-    pub(super) fn name(self) -> &'static str {
+    fn name(self) -> &'static str {
         match self { Self::ModelPush => "captcha.push", Self::ClaimPoll => "claim.verification.poll", Self::ClaimComplete => "claim.verification.complete" }
     }
-    pub(super) fn claim(self) -> bool { self != Self::ModelPush }
+    fn claim(self) -> bool { self != Self::ModelPush }
 }
 
 pub(crate) fn guarded_action(action: &str) -> bool {
@@ -46,6 +41,7 @@ pub(crate) fn guarded_action(action: &str) -> bool {
 
 pub(super) struct Permits {
     _local: OwnedSemaphorePermit,
+    _global: crate::server::core::runtime_capacity::Ticket,
 }
 
 fn failure(status: u16, code: &str, message: &str) -> proto::WireError {
@@ -59,7 +55,9 @@ pub(super) fn unavailable() -> proto::WireError {
 pub(super) fn slots(shared: &Shared) -> Result<Arc<Permits>, proto::WireError> {
     let busy = || failure(429, "verification_busy", "验证码提交通道正忙，请稍后重试");
     let local = shared.verification_slots.clone().try_acquire_owned().map_err(|_| busy())?;
-    Ok(Arc::new(Permits { _local: local }))
+    let global = crate::server::core::runtime_capacity::try_acquire(
+        crate::server::core::runtime_capacity::Class::Interactive, &shared.options.provider).map_err(|_| busy())?;
+    Ok(Arc::new(Permits { _local: local, _global: global }))
 }
 
 /// 只标识实际安装的原生执行体；脚本、Wasm、占位适配器都不是旧全局票据池。
@@ -85,25 +83,26 @@ pub(crate) struct VerificationCall {
     shared: Weak<Shared>,
     store: AccountStore,
     generation: u64,
-    pub(super) provider: String,
-    pub(super) account: String,
-    pub(super) identity: String,
-    pub(super) credential_digest: [u8; 32],
-    pub(super) snapshot: Arc<Value>,
-    pub(super) action: Action,
-    pub(super) committed: Arc<AtomicBool>,
-    pub(super) state_slot: Arc<OnceLock<(String, String, u32)>>,
-    pub(super) payload: Value,
+    provider: String,
+    account: String,
+    identity: String,
+    credential_digest: [u8; 32],
+    snapshot: Arc<Value>,
+    action: Action,
+    committed: Arc<AtomicBool>,
+    state_slot: Arc<OnceLock<(String, String, u32)>>,
+    payload: Value,
     deadline: Instant,
+    // 本地快照读取即使超时后仍在退出，也继续占住通道，不堆积无界阻塞任务。
     permits: Arc<Permits>,
 }
 
-pub(super) fn digest(secret: &Value) -> Result<[u8; 32], proto::WireError> {
+fn digest(secret: &Value) -> Result<[u8; 32], proto::WireError> {
     let bytes = serde_json::to_vec(secret).map_err(|_| unavailable())?;
     Ok(Sha256::digest(bytes).into())
 }
 
-pub(super) fn text<'a>(value: &'a Value, key: &str, limit: usize) -> Result<&'a str, proto::WireError> {
+fn text<'a>(value: &'a Value, key: &str, limit: usize) -> Result<&'a str, proto::WireError> {
     value[key].as_str().filter(|value| !value.trim().is_empty() && value.len() <= limit
         && !value.chars().any(char::is_control))
         .ok_or_else(|| failure(400, "bad_params", "验证码提交缺少有效的账号或配置标识"))
@@ -155,15 +154,11 @@ fn check_payload(action: Action, payload: &Value, provider: &str, account: &str)
 }
 
 async fn snapshot(store: AccountStore, provider: String, account: String, permits: Arc<Permits>) -> Result<Value, proto::WireError> {
-    let record = crate::server::core::blocking::run(move || {
+    crate::server::core::blocking::run(move || {
         let _permits = permits;
-        store.plugin_account(&account)
+        store.plugin_verification_snapshot(&provider, &account)
     }).await.map_err(|_| unavailable())?
-        .ok_or_else(|| failure(409, "verification_account_changed", "验证码账号已删除或归属已变化"))?;
-    if record["provider"].as_str() != Some(provider.as_str()) {
-        return Err(failure(409, "verification_account_changed", "验证码账号归属已变化"));
-    }
-    Ok(record)
+        .ok_or_else(|| failure(409, "verification_account_changed", "验证码账号已删除或归属已变化"))
 }
 
 impl VerificationCall {
@@ -181,6 +176,7 @@ impl VerificationCall {
         }
         check_payload(action, payload, provider, account)?;
         if !host.ready() || !host.callbacks.provider_allowed(provider) || !super::super::serves_provider(provider)
+            || super::super::registry::is_switching(provider)
             || super::super::host_for_provider(provider).is_none_or(|current| !Arc::ptr_eq(&current, host)) {
             return Err(unavailable());
         }
@@ -189,6 +185,7 @@ impl VerificationCall {
         if record["public"]["enabled"] == false && !action.claim() {
             return Err(failure(409, "verification_account_changed", "模型验证码账号已停用"));
         }
+        // 沿用普通账号上下文的旧身份形态；未声明 identity.v1 的历史账号允许空身份。
         let identity = record["identity"].as_str().unwrap_or(account);
         if identity.len() > 512 || identity.chars().any(char::is_control) { return Err(unavailable()); }
         let identity = identity.to_string();
@@ -210,12 +207,13 @@ impl VerificationCall {
 
     pub(super) fn remaining(&self) -> Duration { self.deadline.saturating_duration_since(Instant::now()) }
 
-    pub(super) fn check_host(&self) -> Result<(), proto::WireError> {
+    fn check_host(&self) -> Result<(), proto::WireError> {
         if Instant::now() >= self.deadline { return Err(failure(504, "timeout", "验证码提交超时，请重新读取当前账号状态")); }
         let host = self.host.upgrade().ok_or_else(unavailable)?;
         let shared = self.shared.upgrade().ok_or_else(unavailable)?;
         if !host.ready() || host.generation.load(Ordering::Acquire) != self.generation || shared.cancel.is_cancelled()
             || !shared.options.allows(CAPABILITY) || !host.callbacks.provider_allowed(&self.provider)
+            || super::super::registry::is_switching(&self.provider) || host.activity.retired()
             || !super::super::serves_provider(&self.provider)
             || super::super::host_for_provider(&self.provider).is_none_or(|current| !Arc::ptr_eq(&current, &host)) {
             return Err(unavailable());
@@ -253,6 +251,7 @@ impl Context {
         self.identity = call.identity.clone();
         self.proxy = Value::Null;
         self.proxy_selected = true;
+        self.system_proxy_when_unset = false;
         self.verification = Some(call);
     }
 
@@ -274,9 +273,6 @@ impl Context {
                     return Err(failure(400, "bad_params", "验证码账号读取不接受自选参数"));
                 }
                 let mut record = (*call.snapshot).clone();
-                // 上游快照不带出口配置；plugin_account 为普通账号视图附加的
-                // 解析后代理不能借验证通道泄露给插件。
-                if let Some(fields) = record.as_object_mut() { fields.remove("proxy"); }
                 record["accountMaintenanceCall"] = json!(call.action.claim());
                 return Ok(Some(record));
             }

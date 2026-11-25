@@ -62,6 +62,8 @@ pub struct Record {
     /// 该模型**认识的命名档位**（由弱到强，models.dev 原始顺序）。
     /// 空 = 这份数据没给出命名档位（只声明了开关 / 没声明）—— 网关侧回落通用表。
     pub levels: Vec<String>,
+    /// 官方基准单价（USD / 百万 Token），来自 models.dev。
+    pub cost: Option<crate::server::core::model_pricing::ModelPrice>,
 }
 
 /// 一份索引 + 它的来历。
@@ -83,6 +85,10 @@ impl Snapshot {
     pub fn len(&self) -> usize {
         self.models.len()
     }
+
+    pub fn all_records(&self) -> impl Iterator<Item = &Record> {
+        self.models.values()
+    }
 }
 
 /// 进程级快照（懒装载）。`None` 只在「还没读过」时出现；一旦读过就不会退回。
@@ -91,12 +97,19 @@ static SNAPSHOT: OnceLock<RwLock<Option<Arc<Snapshot>>>> = OnceLock::new();
 /// 进程级库句柄（与 `config` / `providers::catalog_cache` 同一模式）。
 static DB: OnceLock<Option<Db>> = OnceLock::new();
 
-/// 装入库句柄。`bootstrap` 里 `Db` 就绪后调用一次；重复调用忽略。
+/// 装入库句柄并立即预热内存快照。`bootstrap` 里 `Db` 就绪后调用一次。
 ///
-/// 收 `Option<Db>` 与 `catalog_cache::install` 同一形态：库打不开时也照常调用，
-/// 那时只读内嵌快照（功能仍在，只是拿不到刷新结果）。
+/// 在启动阶段直接完成 `kv` 缓存读取，使后续任何调用 `snapshot()` / `lookup()` 的读路径
+/// 均为纯内存访问，绝不会在持有数据库连接锁的调用链（如历史费用回填）中重入 `Db` 互斥锁。
 pub fn install(db: Option<Db>) {
+    let cached = db.as_ref().and_then(read_cache_from);
     let _ = DB.set(db);
+    let loaded = cached.unwrap_or_else(load_builtin);
+    let lock = SNAPSHOT.get_or_init(|| RwLock::new(None));
+    match lock.write() {
+        Ok(mut slot) => *slot = Some(Arc::new(loaded)),
+        Err(poisoned) => *poisoned.into_inner() = Some(Arc::new(loaded)),
+    }
 }
 
 fn db() -> Option<Db> {
@@ -143,7 +156,7 @@ pub fn origin() -> (&'static str, i64) {
 }
 
 /// 取当前快照，必要时装载（**cache > builtin**，理由见模块头）。
-fn snapshot() -> Arc<Snapshot> {
+pub fn snapshot() -> Arc<Snapshot> {
     let lock = SNAPSHOT.get_or_init(|| RwLock::new(None));
     if let Some(loaded) = lock.read().ok().and_then(|slot| slot.clone()) {
         return loaded;
@@ -160,11 +173,12 @@ fn snapshot() -> Arc<Snapshot> {
     loaded
 }
 
-/// 首次装载：库里的刷新结果优先，没有（或坏了）才用内嵌快照。
+/// 首次装载（仅在未调用 `install` 的单测环境下触发）：直接使用内嵌快照，不在读路径触碰 `Db`。
 fn load() -> Snapshot {
-    if let Some(cached) = read_cache() {
-        return cached;
-    }
+    load_builtin()
+}
+
+fn load_builtin() -> Snapshot {
     // 内嵌快照是构建产物，解析不了属于「发版坏了」；这时给一份空索引而不是
     // panic —— 模型清单本身照常工作，只是所有键都回到「未声明」。
     match parse(EMBEDDED, "builtin") {
@@ -191,19 +205,58 @@ pub fn replace(snapshot: Snapshot) {
 /// 解析一份快照文本（三份形态共用，见模块头）。
 pub fn parse(text: &str, source: &'static str) -> Option<Snapshot> {
     let root: Value = serde_json::from_str(text).ok()?;
+    parse_value(&root, source)
+}
+
+fn embedded_costs() -> &'static HashMap<String, crate::server::core::model_pricing::ModelPrice> {
+    static COSTS: OnceLock<HashMap<String, crate::server::core::model_pricing::ModelPrice>> = OnceLock::new();
+    COSTS.get_or_init(|| {
+        let Ok(root) = serde_json::from_str::<Value>(EMBEDDED) else {
+            return HashMap::new();
+        };
+        let Some(object) = root.get("models").and_then(Value::as_object) else {
+            return HashMap::new();
+        };
+        let mut out = HashMap::new();
+        for (key, val) in object {
+            let canonical = val.get("canonical").and_then(Value::as_str).unwrap_or(key);
+            if let Some(price) = val
+                .get("cost")
+                .and_then(|c| crate::server::core::model_pricing::ModelPrice::parse_json(c, Some(canonical)))
+            {
+                out.insert(key.clone(), price);
+            }
+        }
+        out
+    })
+}
+
+/// 解析已反序列化的快照 JSON（官网 / CDN 返回的精简索引直接走这里）。
+pub fn parse_value(root: &Value, source: &'static str) -> Option<Snapshot> {
     let object = root.get("models")?.as_object()?;
+    let fallback_costs = (source != "builtin").then(embedded_costs);
     let mut models = HashMap::with_capacity(object.len());
     for (key, value) in object {
-        if let Some(record) = parse_record(value) {
+        if let Some(mut record) = parse_record(value) {
+            if record.cost.is_none() {
+                if let Some(costs) = fallback_costs {
+                    record.cost = costs.get(key).cloned();
+                }
+            }
             models.insert(key.clone(), record);
         }
     }
     if models.is_empty() {
         return None;
     }
+    let generated_at = root
+        .get("generatedAt")
+        .and_then(Value::as_i64)
+        .filter(|&timestamp| timestamp > 0)
+        .unwrap_or_else(logging::now_ms);
     Some(Snapshot {
         models,
-        generated_at: root.get("generatedAt").and_then(Value::as_i64).unwrap_or(0),
+        generated_at,
         source,
     })
 }
@@ -252,6 +305,11 @@ fn record_value(record: &Record) -> Value {
             Value::Array(record.levels.iter().cloned().map(Value::String).collect()),
         );
     }
+    if let Some(cost) = &record.cost {
+        if let Ok(encoded) = serde_json::to_value(cost) {
+            object.insert("cost".to_string(), encoded);
+        }
+    }
     Value::Object(object)
 }
 
@@ -261,6 +319,9 @@ fn parse_record(value: &Value) -> Option<Record> {
     if canonical.is_empty() {
         return None;
     }
+    let cost = object
+        .get("cost")
+        .and_then(|v| crate::server::core::model_pricing::ModelPrice::parse_json(v, Some(&canonical)));
     Some(Record {
         canonical,
         reasoning: object.get("reasoning").and_then(Value::as_bool),
@@ -282,12 +343,12 @@ fn parse_record(value: &Value) -> Option<Record> {
                     .collect()
             })
             .unwrap_or_default(),
+        cost,
     })
 }
 
 /// 读库里的刷新结果（库不可用 / 没写过 / 值坏了 → `None`，由调用方回落地板）。
-fn read_cache() -> Option<Snapshot> {
-    let db = db()?;
+fn read_cache_from(db: &Db) -> Option<Snapshot> {
     // 只读一次库（整份就是一个键），解析放在闭包外做 —— 闭包里不能打日志，
     // 而解析失败的 verbose 要在闭包外补
     let text = db.with(read_text).flatten();

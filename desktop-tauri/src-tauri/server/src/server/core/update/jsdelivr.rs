@@ -101,6 +101,32 @@ pub fn is(value: &str) -> bool {
     })
 }
 
+/// 这是不是一条 GitHub 资源地址（插件/宿主可能需要换线路的那一类）。
+///
+/// 口径与旧的 `core::update::source::is_resource` 一致，但不再依赖「GitHub
+/// 访问方式」设置 —— 那套设置随镜像子系统一起移除了，现在只有一条固定规则：
+/// **GitHub 域的资源地址允许换 jsDelivr 线路，其他站点一律原样访问**。
+pub fn is_github_resource(value: &str) -> bool {
+    let Ok(url) = url::Url::parse(value) else {
+        return false;
+    };
+    if url.scheme() != "https"
+        || url.port_or_known_default() != Some(443)
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
+        return false;
+    }
+    match url.host_str().unwrap_or("") {
+        "api.github.com" => url.path().starts_with("/repos/"),
+        "raw.githubusercontent.com" | "codeload.github.com" => true,
+        "github.com" | "www.github.com" => url.path().contains("/releases/download/"),
+        // jsDelivr 仓库文件：三条线路同形，路径固定 /gh/{owner}/{repo}@{ref}/…
+        _ if is(value) => true,
+        host => host.ends_with(".githubusercontent.com"),
+    }
+}
+
 /// 构造规范形态的 jsDelivr URL（源码里的常量都走这里）。
 ///
 /// `reference` 为空或 `HEAD` 时落到 `main`：jsDelivr 不认 `HEAD` 这个 ref，

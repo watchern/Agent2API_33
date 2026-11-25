@@ -1,9 +1,14 @@
 //! 只做协议转换，不发网络请求；句柄和输入缓冲均归当前 Wasm 调用所有。
 //!
-//! 从上游 3.5.0-beta.4 移植：独立 WASM 插件（如 zcode-intl）用
-//! `protocol.request/open/push/close` 做 chat/anthropic/responses/gemini
-//! 协议互转。底层转换函数由 `script` 层提供（fork 早已具备），这里只负责
-//! WASM 侧的能力校验、句柄登记与大小限制。
+//! 独立 WASM 插件（如 zcode-intl）用 `protocol.request/open/push/close` 做
+//! chat/anthropic/responses/gemini 协议互转。底层转换函数由 `script` 层提供，
+//! 这里只负责 WASM 侧的能力校验、句柄登记与大小限制。
+//!
+//! ── 历史 ─────────────────────────────────────────────────────
+//! 本 fork 最早从上游 3.5.0-beta.4 移植这段（当时上游还没有独立 WASM
+//! 插件能力），后来上游 v3.5.1 也原生带上了同样的实现 —— 两边逻辑现已
+//! 逐行一致，这里保留这段说明是因为独立 WASM 插件（zcode-intl 一类）
+//! 是我们 fork 的核心目标之一。
 
 use agent2api_provider_protocol as proto;
 use base64::Engine;

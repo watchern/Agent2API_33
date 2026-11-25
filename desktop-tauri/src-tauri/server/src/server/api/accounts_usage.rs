@@ -71,8 +71,28 @@ pub fn cancel_usage(body: &Bytes) -> Response {
     ok_json(json!({ "cancelled": usage_query::jobs::cancel(id, request_id) }))
 }
 
+pub fn scoped_usage_snapshot(state: &ServerState, body: &Bytes) -> Response {
+    #[derive(serde::Deserialize)]
+    struct Scope { ids: Vec<String> }
+    let scope = match serde_json::from_slice::<Scope>(body) {
+        Ok(scope) if scope.ids.iter().all(|id| !id.is_empty() && id.len() <= 512) => scope,
+        _ => return management_error(400, "余额快照账号范围无效"),
+    };
+    crate::server::core::blocking::in_place(|| ok_json(super::accounts_usage_snapshot::snapshot(state.store(), &scope.ids)))
+}
+
 /// GET /api/accounts/usage/snapshot：历史读数与当前任务状态分别返回。
-pub async fn accounts_usage_snapshot(state: &ServerState) -> Response {
+///
+/// `?ids=` 是上游新增的**账号范围**参数（JSON 数组字符串）：只投影这些账号的
+/// 读数，用于账号页只看当前分页的读数，不必拉全量。
+pub async fn accounts_usage_snapshot(state: &ServerState, query: &str) -> Response {
+    if let Some(ids) = query_param(query, "ids") {
+        let ids = match serde_json::from_str::<Vec<String>>(&ids) {
+            Ok(ids) if ids.len() <= 3000 && ids.iter().all(|id| id.len() <= 512) => ids,
+            _ => return management_error(400, "余额快照账号范围无效"),
+        };
+        return crate::server::core::blocking::in_place(|| ok_json(super::accounts_usage_snapshot::snapshot(state.store(), &ids)));
+    }
     // 快照构造整条是同步的（账号公开形态 → 限制器投影 → 排序）。旧实现直接
     // 跑在 axum 的 tokio worker 上：一条 6–14 秒的慢请求就占住一个 worker，
     // 几条并发足以让整个管理面板（含 /api/session）停摆。移到 blocking 线程池，

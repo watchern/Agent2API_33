@@ -63,8 +63,14 @@ function groupRatioOf(windows: UsageWindowReading[], rawValue: number | null): G
     }
   })
   const shortReadings = readings.filter(row => row.shortWindow && (row.percent !== null || row.unlimited))
-  const candidates = (shortReadings.length ? shortReadings : readings)
-    .flatMap(row => row.unlimited ? [100] : row.percent === null ? [] : [row.percent])
+  const exhaustedWithoutShort = [...exhaustedGroups].some(group =>
+    !measured.some(row => row.group === group && isShortWindow(row) && (row.percent !== null || row.unlimited)),
+  )
+  const candidates = [
+    ...(shortReadings.length ? shortReadings : readings)
+      .flatMap(row => row.unlimited ? [100] : row.percent === null ? [] : [row.percent]),
+    ...(shortReadings.length && exhaustedWithoutShort ? [0] : []),
+  ]
   if (candidates.length) {
     return {
       percent: Math.min(...candidates),
@@ -93,7 +99,8 @@ export function groupBalanceOf(members: AccountRecord[], scope: 'group' | 'filte
     if (entry === undefined || entry === null) { out.pending++; continue }
     const failure = usageFailureOf(entry)
     if (failure) {
-      if (!failure.notConfigured) out.failed++
+      if (!failure.notice) out.failed++
+      else out.uncountable++
       continue
     }
     if (typeof entry !== 'object' || Array.isArray(entry)) { out.uncountable++; continue }

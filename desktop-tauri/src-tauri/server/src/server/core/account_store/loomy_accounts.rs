@@ -239,9 +239,10 @@ impl AccountStore {
         let saved = StoredAccount::from_map(merged);
         // 单行落地：`put` = DELETE + INSERT（与别家一致）
         self.with_conn(&guard, |conn| sql::put(conn, &saved))?;
-        logging::log(
+        logging::log_with_level(
             "[Accounts]",
             &format!("✅ Loomy 账号已保存: {record_name}（优先级 {priority}）"),
+            "info",
         );
         Ok(self.public_account(&saved))
     }
@@ -251,13 +252,15 @@ impl AccountStore {
     /// 同时摘掉 `expiresAt`：存量记录上那份是历史估算值（登录时刻 + 14 天），
     /// 不是上游给的事实，下发出去只会让界面把仍然可用的账号标成「已过期」。
     /// 失效由 `needsRelogin` 表达（网关在收到 `020002` / `100002` 时落）。
+    /// `available` 只表示持有 session；`enabled` 仅控制转发，不限制签到。
     pub fn to_loomy_public_account(&self, record: &StoredAccount) -> Value {
+        let has_session = record.has_token();
         let mut value = record.to_value();
         if let Some(object) = value.as_object_mut() {
             object.remove("accessToken");
             object.remove("expiresAt");
-            object.insert("available".to_string(), Value::Bool(record.enabled()));
-            object.insert("hasSession".to_string(), Value::Bool(true));
+            object.insert("available".to_string(), Value::Bool(has_session));
+            object.insert("hasSession".to_string(), Value::Bool(has_session));
         }
         value
     }

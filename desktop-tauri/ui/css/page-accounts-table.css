@@ -455,6 +455,9 @@ body.queue-dragging * { cursor: grabbing; }
 /* 控件与把手在自己的地盘上换回各自的光标：一眼就能分出「这几处是控件」 */
 .grp-band .grp-iconbtn { cursor: pointer; }
 .grp-band .queue-grip { cursor: grab; }
+.order-grip.locked,
+.queue-grip.locked,
+.grp-band .queue-grip.locked { opacity: .4; cursor: not-allowed; }
 
 /* 组顺位：与 .order-rank 同色同一档字号 —— 组的先后与组内先后是同一类读数。
    title 里说清「拖动可改」，格子本身不放控件。 */
@@ -1093,14 +1096,14 @@ body.queue-dragging * { cursor: grabbing; }
   gap: 4px;
 }
 
-.acct-actions button {
+.acct-actions > button {
   height: 25px;
   padding: 0 8px;
   border-radius: var(--r-sm);
   font-size: 11.5px;
 }
 
-.acct-actions button:hover:not(:disabled) {
+.acct-actions > button:hover:not(:disabled) {
   border-color: var(--primary-bd);
   background: var(--primary-soft);
   color: var(--primary-fg);

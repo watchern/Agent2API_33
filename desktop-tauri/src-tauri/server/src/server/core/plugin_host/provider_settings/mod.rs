@@ -46,6 +46,17 @@ fn stored(schema: &Schema, provider: &str) -> Map<String, Value> {
     config::with_raw(|raw| stored_from_raw(raw, schema, provider)).unwrap_or_default()
 }
 
+/// 查某个 provider 的某个字段声明的上游版本源 id。
+pub(crate) fn upstream_source(provider: &str, field: &str) -> Option<String> {
+    let host = super::host_for_provider(provider)?;
+    let source = host.provider_settings.lock().ok()?.get(provider).and_then(|schema| {
+        schema.fields.iter()
+            .find(|entry| entry.key == field && entry.kind == "upstream_version")
+            .and_then(|entry| entry.source_id.clone())
+    });
+    source
+}
+
 /// 列出当前已启用插件声明的全部上游版本源（upstream_versions 定时同步用）。
 pub(crate) fn declared_upstream_sources() -> Vec<String> {
     let mut sources = HashSet::new();
@@ -115,7 +126,20 @@ fn render(host: &Host, provider: &str, label: &str, schema: &Schema,
         let scalar = value.is_null() || value.is_boolean() || value.is_number() || value.is_string();
         (key.clone(), if scalar && value.to_string().len() <= 16 * 1024 { value.clone() } else { Value::Null })
     }).collect();
+    let mut upstream_sync = Map::new();
     for field in &schema.fields {
+        if field.kind == "upstream_version" {
+            let source_id = field.source_id.as_deref().unwrap_or("");
+            let interval = crate::server::core::upstream_versions::effective_interval_hours(source_id);
+            effective.insert(field.key.clone(), json!(interval));
+            if !source_id.is_empty() && !upstream_sync.contains_key(source_id) {
+                upstream_sync.insert(
+                    source_id.to_string(),
+                    crate::server::core::upstream_versions::status_json(source_id),
+                );
+            }
+            continue;
+        }
         match field.normalize(values.get(&field.key).unwrap_or(&Value::Null)) {
             Ok(value) => { effective.insert(field.key.clone(), if value.is_null() { field.default.clone() } else { value }); }
             Err(_) => {
@@ -127,7 +151,8 @@ fn render(host: &Host, provider: &str, label: &str, schema: &Schema,
     }
     json!({ "provider": provider, "label": label, "group": group(host, provider, label, schema),
         "schema": schema, "values": public, "effective": effective, "invalid": invalid,
-        "overrides": overrides, "revision": revision(host, provider, schema, &values) })
+        "overrides": overrides, "upstreamSync": upstream_sync,
+        "revision": revision(host, provider, schema, &values) })
 }
 
 async fn row(host: &Arc<Host>, provider: &str, label: &str, schema: &Schema) -> Result<Value, GatewayError> {
@@ -186,10 +211,19 @@ pub(crate) async fn configure(provider: &str, expected: &str, patch: &Value) -> 
     let patch = patch.as_object().filter(|patch| !patch.is_empty() && patch.len() <= schema.fields.len())
         .ok_or_else(|| GatewayError::bad_request("插件设置必须是非空对象"))?;
     let mut normalized = BTreeMap::new();
+    let mut rescheduled = Vec::new();
     for (name, value) in patch {
         let field = schema.fields.iter().find(|field| &field.key == name)
             .ok_or_else(|| GatewayError::bad_request("不能修改插件未声明的设置"))?;
-        normalized.insert(name.clone(), field.normalize(value).map_err(GatewayError::bad_request)?);
+        let next_value = field.normalize(value).map_err(GatewayError::bad_request)?;
+        if field.kind == "upstream_version" {
+            let source_id = field.source_id.as_deref()
+                .ok_or_else(|| GatewayError::bad_request("上游版本设置缺少来源标识"))?;
+            let hours = next_value.as_i64()
+                .unwrap_or(crate::server::core::upstream_versions::DEFAULT_INTERVAL_HOURS);
+            rescheduled.push((source_id.to_string(), hours));
+        }
+        normalized.insert(name.clone(), (field.kind == "upstream_version", field.source_id.clone(), next_value));
     }
     let current = row(&host, provider, provider, &schema).await?;
     if current["revision"].as_str() != Some(expected) {
@@ -197,16 +231,28 @@ pub(crate) async fn configure(provider: &str, expected: &str, patch: &Value) -> 
     }
     let mut changed = false;
     let saved = config::update_raw_fields(|raw| {
-        let values: Map<String, Value> = schema.fields.iter().map(|field| (field.key.clone(),
-            raw.get(&key(schema.owner(provider), &field.key)).cloned().unwrap_or(Value::Null))).collect();
+        let values = stored_from_raw(raw, &schema, provider);
         if !host.ready() || revision(&host, provider, &schema, &values) != expected { return; }
-        for (name, value) in normalized {
-            let path = key(schema.owner(provider), &name);
-            if value.is_null() { raw.remove(&path); } else { raw.insert(path, value); }
+        for (name, (upstream, source_id, value)) in normalized {
+            if upstream {
+                if let Some(source_id) = source_id.as_deref() {
+                    let _ = crate::server::core::upstream_versions::set_interval_in_raw(
+                        raw,
+                        source_id,
+                        value.as_i64(),
+                    );
+                }
+            } else {
+                let path = key(schema.owner(provider), &name);
+                if value.is_null() { raw.remove(&path); } else { raw.insert(path, value); }
+            }
         }
         changed = true;
     });
     if !changed { return Err(GatewayError::with_status(409, "插件或设置已变化，请刷新后再保存")); }
+    for (source_id, hours) in rescheduled {
+        crate::server::core::upstream_versions::reschedule(&source_id, hours);
+    }
     let overrides = current["overrides"].as_object().cloned().unwrap_or_default();
     let mut result = render(&host, provider, provider, &schema, stored(&schema, provider), overrides);
     result["saved"] = json!(saved);

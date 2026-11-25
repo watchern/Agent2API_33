@@ -69,12 +69,18 @@ mod account_sort;
 mod assistant_config;
 pub(crate) mod captcha;
 pub(crate) mod compact_routes;
+pub(crate) mod error_policy;
+mod error_policy_types;
+pub(crate) mod runtime_capacity;
 pub(crate) mod title_routes;
 pub(crate) mod client_identification;
+pub(crate) mod prompt_rules;
 pub(crate) mod vision_compat;
-mod github_access;
+pub(crate) mod web_tools;
+pub(crate) mod model_key_source;
 mod mutations;
-pub(crate) use mutations::try_update_raw_field;
+pub(crate) mod plugin_task_grants;
+pub(crate) use mutations::{try_update_raw_field, try_update_raw_fields};
 pub(crate) mod parse;
 pub(crate) mod routing_groups;
 mod routing_profiles;
@@ -89,10 +95,6 @@ pub use account_sort::{
     AddedSortDirection, BalanceSortDirection, CreditSortDirection,
 };
 pub use assistant_config::*;
-pub use github_access::{
-    github_access, set_github_access, GithubAccessMode, GithubAccessPatch,
-    GithubAccessSettings, DEFAULT_GITHUB_MIRROR,
-};
 pub use sanitize_config::{
     set_sanitize_settings, SanitizePatch, SanitizeSettings, KEY_SANITIZE_PROVIDERS,
     KEY_SANITIZE_RULES, MAX_SANITIZE_PROVIDERS,
@@ -143,6 +145,7 @@ pub struct RuntimeConfig {
     /// 与保留期同一理由：转发层**每次重试判定**都要取它（改完设置下一个
     /// 失败请求就用新值，不重启进程），解析一次存下来最省事。
     retry: RetrySettings,
+    error_policy: std::sync::Arc<error_policy::ErrorPolicySnapshot>,
     /// 上游请求的四项超时（设置页「通用 → 请求超时」区域）。
     ///
     /// 与 retry 同一理由：转发层**每次发送 / 每次分片**都要取它（改完设置
@@ -171,6 +174,7 @@ pub struct RuntimeConfig {
     routing: RoutingSettings,
     routing_profiles: std::sync::Arc<RoutingProfiles>,
     compact_routes: std::sync::Arc<compact_routes::CompactRoutesSnapshot>,
+    runtime_capacity: std::sync::Arc<runtime_capacity::CapacitySnapshot>,
     title_routes: std::sync::Arc<title_routes::TitleRoutesSnapshot>,
     client_identification: std::sync::Arc<client_identification::ClientIdentificationSnapshot>,
     vision_compat: std::sync::Arc<vision_compat::VisionSnapshot>,
@@ -281,17 +285,15 @@ pub struct RuntimeConfig {
     update_proxy: Option<Value>,
     /// 正式版与 beta 的关注策略；与当前安装版本无关。
     update_channels: UpdateChannels,
-    /// GitHub 令牌的**密文信封**（`githubToken`：None = 未在界面保存）。
-    ///
-    /// 注意这里从配置里读出来的就已经是 `enc1:` 信封，**明文永远不进
-    /// config 快照**（加解密都在 `core::update::token` 里），环境变量
-    /// 兜底也不在这里管。与 update_proxy 同为低频字段，存原始字符串即可。
-    github_token: Option<String>,
     /// 磁盘上那份 JSON 对象（含未知字段），写盘时的全量底稿
     raw: Map<String, Value>,
 }
 
 impl RuntimeConfig {
+    pub(crate) fn error_policy_snapshot(&self) -> std::sync::Arc<error_policy::ErrorPolicySnapshot> {
+        self.error_policy.clone()
+    }
+
     /// 当前是否存在启用的 Key 配置（含旧字段和环境变量）；不表示模型可免鉴权。
     pub fn api_key_set(&self) -> bool {
         !self.active_api_keys().is_empty()
@@ -405,6 +407,8 @@ impl RuntimeConfig {
                 source: self.prompt.source,
             },
             &self.prompt.providers,
+            &self.prompt.rules,
+            self.prompt.rules_configured,
         )
     }
 
@@ -594,6 +598,7 @@ fn build(raw: Map<String, Value>) -> RuntimeConfig {
         retention,
         scheduled,
         retry,
+        error_policy: error_policy::from_raw(&raw),
         timeouts,
         queue,
         captcha_pool,
@@ -601,6 +606,7 @@ fn build(raw: Map<String, Value>) -> RuntimeConfig {
         routing,
         routing_profiles: routing_profiles::from_raw(&raw),
         compact_routes: compact_routes::from_raw(&raw),
+        runtime_capacity: runtime_capacity::from_raw(&raw),
         title_routes: title_routes::from_raw(&raw),
         client_identification: client_identification::from_raw(&raw),
         vision_compat: vision_compat::from_raw(&raw),
@@ -691,9 +697,6 @@ fn build(raw: Map<String, Value>) -> RuntimeConfig {
             .filter(|value| !value.is_null())
             .cloned(),
         update_channels: UpdateChannels::from_raw(&raw),
-        // GitHub 令牌信封：空串按未设置处理（手改库写出的空值不该被当成密文）
-        github_token: string_field(&raw, KEY_GITHUB_TOKEN)
-            .filter(|envelope| !envelope.is_empty()),
         raw,
     }
 }
@@ -736,6 +739,7 @@ fn prompt_from(raw: &Map<String, Value>) -> PromptSettings {
     let file = string_field(raw, KEY_PROMPT_FILE);
     let inline = string_field(raw, KEY_PROMPT_TEXT);
     let base = resolve_choice(mode, file, inline);
+    let (rules, rules_configured, rules_error) = prompt_rules::from_raw(raw);
     PromptSettings {
         mode: base.mode,
         file: base.file,
@@ -744,6 +748,9 @@ fn prompt_from(raw: &Map<String, Value>) -> PromptSettings {
         source: base.source,
         file_error: base.file_error,
         providers: providers_from(raw),
+        rules,
+        rules_configured,
+        rules_error,
         gateway: gateway_from(raw),
         gateway_text: gateway_text_from(raw),
     }
@@ -966,18 +973,18 @@ static CONFIG: RwLock<Option<RuntimeConfig>> = RwLock::new(None);
 /// 东西搬进库」，而快照已经从旧文件读到了同样的值（`merge_legacy`），
 /// 重装只是白读一遍库。
 pub fn init(db: Option<Db>) -> RuntimeConfig {
+    let _update = plugin_task_grants::update_lock();
+    if CONFIG_UPDATE_LOCK.is_poisoned() { model_key_source::fail_closed(); }
+    // 先关闭原 Key 权威，再读库；相同内容初始化也不能恢复旧来源。
+    model_key_source::before_reload();
+    plugin_task_grants::before_reload();
     let db = db.filter(|db| {
         // 打不开的库句柄不该装进来（`Db` 只在打开成功时才有值，这里是防御）
         let _ = db;
         true
     });
     let _ = DB.set(db);
-    let snapshot = build(read_raw());
-    crate::server::core::providers::catalog::invalidate();
-    if let Ok(mut guard) = CONFIG.write() {
-        *guard = Some(snapshot.clone());
-    }
-    crate::server::core::providers::catalog::invalidate();
+    let (snapshot, _) = publish_reload_locked(read_raw(), true);
     snapshot
 }
 
@@ -992,12 +999,61 @@ pub fn init(db: Option<Db>) -> RuntimeConfig {
 /// 只在迁移真的产生过结果时才由调用点触发（`db::migrate` 的返回非空）；
 /// 没有任何旧文件时不必多读一次库。
 pub fn reload() -> RuntimeConfig {
-    let snapshot = build(read_raw());
+    let _update = plugin_task_grants::update_lock();
+    let (snapshot, _) = publish_reload_locked(read_raw(), true);
+    snapshot
+}
+
+/// 仅在数据库已初始化且当前可读时从库重载配置并发布全新 Key 代次；
+/// 库不可用时不做任何覆盖，避免回落空旧文件破坏内存配置。
+pub(crate) fn try_reload_from_db() -> bool {
+    let _update = plugin_task_grants::update_lock();
+    let Some(raw) = snapshot_from_db() else {
+        return false;
+    };
+    let (_, published) = publish_reload_locked(raw, true);
+    published
+}
+
+fn snapshot_from_db() -> Option<Map<String, Value>> {
+    let db = db()?;
+    let (raw, migrated) = sql::read_snapshot(&db)?;
+    Some(if migrated { raw } else { merge_legacy(raw) })
+}
+
+fn publish_reload_locked(
+    raw: Map<String, Value>,
+    clear_replacement: bool,
+) -> (RuntimeConfig, bool) {
+    if CONFIG_UPDATE_LOCK.is_poisoned() { model_key_source::fail_closed(); }
+    if clear_replacement {
+        model_key_source::before_reload();
+        plugin_task_grants::before_reload();
+    }
+    let snapshot = build(raw);
     crate::server::core::providers::catalog::invalidate();
-    if let Ok(mut guard) = CONFIG.write() {
-        *guard = Some(snapshot.clone());
+    let published = plugin_task_grants::publish(snapshot.clone());
+    if published {
+        CONFIG_UPDATE_LOCK.clear_poison();
+        model_key_source::republish_from_db(&snapshot, clear_replacement);
+    } else {
+        model_key_source::fail_closed();
     }
     crate::server::core::providers::catalog::invalidate();
+    (snapshot, published)
+}
+
+pub(super) fn write_snapshot_or_recover() -> Option<RuntimeConfig> {
+    if CONFIG_UPDATE_LOCK.is_poisoned() || model_key_source::is_failed() {
+        model_key_source::fail_closed();
+        if let Some(raw) = snapshot_from_db() {
+            let (_, _) = publish_reload_locked(raw, false);
+        }
+    }
+    let snapshot = plugin_task_grants::write_snapshot();
+    if snapshot.is_none() {
+        model_key_source::fail_closed();
+    }
     snapshot
 }
 
@@ -1293,11 +1349,16 @@ where
 {
     let _usage_guard = crate::server::core::usage_query::config::lock();
     // 读改写必须串行，否则两个模型的独立配置会互相覆盖。
-    let _update_guard = CONFIG_UPDATE_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    let mut next = current();
+    let _update_guard = plugin_task_grants::update_lock();
+    let Some(mut next) = write_snapshot_or_recover() else {
+        return false;
+    };
     let previous = next.clone();
     let before = synced_fingerprint(&next.raw);
     mutate(&mut next);
+    // CONFIG 克隆门已释放；本门撤销完成后才允许存储或新的配置发布。
+    model_key_source::before_change(&previous, &next);
+    plugin_task_grants::before_change(&previous.raw, &next.raw);
     if previous.raw().get(crate::server::core::model_rules::KEY_MODEL_RULES)
         != next.raw().get(crate::server::core::model_rules::KEY_MODEL_RULES) {
         next.model_rules = std::sync::Arc::new(crate::server::core::model_rules::ModelRules::from_raw(&next.raw));
@@ -1307,8 +1368,12 @@ where
     let changed = before != synced_fingerprint(&next.raw);
     let catalog_changed = crate::server::core::providers::catalog::config_changed(&previous, &next);
     if catalog_changed { crate::server::core::providers::catalog::invalidate(); }
-    if let Ok(mut guard) = CONFIG.write() {
-        *guard = Some(next);
+    // 只有 CONFIG 确认发布后才能启用新 Key 代；失败永久关闭，不复活旧对象。
+    let key_snapshot = next.clone();
+    if plugin_task_grants::publish(next) {
+        model_key_source::published(&key_snapshot, false);
+    } else {
+        model_key_source::fail_closed();
     }
     if catalog_changed { crate::server::core::providers::catalog::invalidate(); }
     // 云同步的自动上传：只有**同步范围内的键**真的变了才发信号。
@@ -1660,6 +1725,8 @@ pub fn set_retry(patch: RetryPatch) -> bool {
             next.no_retry_codes = std::sync::Arc::from(codes.as_slice());
         }
         config.retry = next;
+        error_policy::sync_legacy(&mut config.raw, patch.no_retry_codes.is_some());
+        config.error_policy = error_policy::from_raw(&config.raw);
     })
 }
 
@@ -1913,6 +1980,8 @@ pub fn set_routing(patch: RoutingPatch) -> bool {
             next.breaker_success_threshold = count;
         }
         config.routing = next;
+        error_policy::sync_legacy(&mut config.raw, false);
+        config.error_policy = error_policy::from_raw(&config.raw);
     })
 }
 
@@ -2199,41 +2268,6 @@ pub fn set_update_proxy(proxy: Option<Value>) -> bool {
                 // 配置里不留没意义的空值（读侧也按缺省 = 直连处理）
                 config.raw.remove(KEY_UPDATE_PROXY);
                 config.update_proxy = None;
-            }
-        }
-    })
-}
-
-// ─── GitHub 令牌信封（githubToken）────────────────────────
-
-/// 只取 GitHub 令牌密文信封的轻量读取（**不克隆整份 raw**）。
-///
-/// 加解密都在 `core::update::token`（这里只存取信封，理由见字段说明）。
-/// 未初始化时给 None（未在界面保存）。
-pub fn github_token_envelope() -> Option<String> {
-    if let Ok(guard) = CONFIG.read() {
-        if let Some(config) = guard.as_ref() {
-            return config.github_token.clone();
-        }
-    }
-    None
-}
-
-/// 写入 GitHub 令牌的密文信封（None = 清除，连键一起删）。
-///
-/// **只收信封不收明文**：调用方（`core::update::token::set_token`）负责加密
-/// 与校验。与 `set_update_proxy` 同一模式：内存立即生效（下一次检查更新就用
-/// 新令牌），写盘时不吃掉其它字段。
-pub fn set_github_token_envelope(envelope: Option<String>) -> bool {
-    update(move |config| {
-        match envelope.clone() {
-            Some(value) => {
-                config.raw.insert(KEY_GITHUB_TOKEN.to_string(), Value::String(value));
-                config.github_token = envelope.clone();
-            }
-            None => {
-                config.raw.remove(KEY_GITHUB_TOKEN);
-                config.github_token = None;
             }
         }
     })
@@ -2706,41 +2740,102 @@ mod auto_continue_tests {
     ///     重启后读侧按「类型不符」回落默认 —— 用户会以为设置没保存住。
     #[test]
     fn the_setters_write_the_backup_and_the_snapshot_together() {
-        let _guard = hold_config();
-        // 起点固定：先回到出厂态，免得别的用例留下的状态改变这里的判据
-        let _ = set_auto_continue_patch(AutoContinuePatch {
-            enabled: Some(false),
-            max_rounds: Some(DEFAULT_AUTO_CONTINUE_MAX_ROUNDS),
-        });
+        crate::test_support::isolated(
+            concat!(module_path!(), "::the_setters_write_the_backup_and_the_snapshot_together"),
+            || {
+                let _guard = hold_config();
+                init(None);
+                // 起点固定：先回到出厂态，免得别的用例留下的状态改变这里的判据
+                let _ = set_auto_continue_patch(AutoContinuePatch {
+                    enabled: Some(false),
+                    max_rounds: Some(DEFAULT_AUTO_CONTINUE_MAX_ROUNDS),
+                });
 
-        let saved = set_auto_continue(true);
-        assert_eq!(saved, db().is_some(), "返回值只该由「落库成不成功」决定（测试进程里没有库）");
-        assert!(auto_continue(), "开关必须能被在线打开（轻量读取走的是解析字段）");
-        assert_eq!(current().raw()[KEY_AUTO_CONTINUE], json!(true), "底稿里必须带上这一项，否则写盘写不出它");
-        assert!(current().auto_continue(), "快照 getter 与轻量读取必须是同一个值");
+                let saved = set_auto_continue(true);
+                assert_eq!(saved, db().is_some(), "返回值只该由「落库成不成功」决定（测试进程里没有库）");
+                assert!(auto_continue(), "开关必须能被在线打开（轻量读取走的是解析字段）");
+                assert_eq!(current().raw()[KEY_AUTO_CONTINUE], json!(true), "底稿里必须带上这一项，否则写盘写不出它");
+                assert!(current().auto_continue(), "快照 getter 与轻量读取必须是同一个值");
+                assert_eq!(
+                    auto_continue_rounds_from(current().raw()),
+                    DEFAULT_AUTO_CONTINUE_MAX_ROUNDS,
+                    "只动开关不许把上限一并固化成默认之外的值"
+                );
+
+                set_auto_continue_max_rounds(AUTO_CONTINUE_MAX_ROUNDS);
+                assert_eq!(auto_continue_max_rounds(), AUTO_CONTINUE_MAX_ROUNDS, "上限必须能被在线收到边界值");
+                assert_eq!(current().raw()[KEY_AUTO_CONTINUE_MAX_ROUNDS], json!(8), "底稿里要落成一个 JSON 数字");
+                assert!(auto_continue(), "改上限时开关必须保持原样（部分更新不是整份替换）");
+
+                // 两项一起写（PUT 的形状）：一次 update 就该把两项都对齐
+                set_auto_continue_patch(AutoContinuePatch {
+                    enabled: Some(false),
+                    max_rounds: Some(AUTO_CONTINUE_MIN_ROUNDS),
+                });
+                assert!(!auto_continue());
+                assert_eq!(auto_continue_max_rounds(), AUTO_CONTINUE_MIN_ROUNDS);
+
+                // 复位出厂态：别把「开着 + 1 轮」留给后面的用例（尤其留给续写那条链）
+                let _ = set_auto_continue_patch(AutoContinuePatch {
+                    enabled: Some(false),
+                    max_rounds: Some(DEFAULT_AUTO_CONTINUE_MAX_ROUNDS),
+                });
+            },
+        );
+    }
+}
+
+#[cfg(test)]
+mod retry_and_error_policy_tests {
+    use super::*;
+    use super::error_policy_types::{ErrorAction, ErrorKind, ErrorSettings, MAX_SWITCHES};
+    use serde_json::json;
+
+    #[test]
+    fn defaults_keep_transient_resends_and_raise_switch_limit() {
+        let retry = RetrySettings::default();
+        assert_eq!(retry.count, 3);
+        assert_eq!(retry.account_switch_count, 32);
+
+        let settings = ErrorSettings::default();
+        assert_eq!(settings.resends, 3);
+        assert_eq!(settings.switches, 32);
         assert_eq!(
-            auto_continue_rounds_from(current().raw()),
-            DEFAULT_AUTO_CONTINUE_MAX_ROUNDS,
-            "只动开关不许把上限一并固化成默认之外的值"
+            settings.resolve(ErrorKind::Transient, 502, "", "*", "*").action,
+            ErrorAction::RetryThenSwitch,
         );
 
-        set_auto_continue_max_rounds(AUTO_CONTINUE_MAX_ROUNDS);
-        assert_eq!(auto_continue_max_rounds(), AUTO_CONTINUE_MAX_ROUNDS, "上限必须能被在线收到边界值");
-        assert_eq!(current().raw()[KEY_AUTO_CONTINUE_MAX_ROUNDS], json!(8), "底稿里要落成一个 JSON 数字");
-        assert!(auto_continue(), "改上限时开关必须保持原样（部分更新不是整份替换）");
+        assert_eq!(MAX_SWITCHES, 100);
+        let mut at_max = ErrorSettings::default();
+        at_max.switches = MAX_SWITCHES;
+        assert!(at_max.validate().is_ok());
+        let mut over_max = at_max;
+        over_max.switches = MAX_SWITCHES + 1;
+        assert!(over_max.validate().is_err());
+    }
 
-        // 两项一起写（PUT 的形状）：一次 update 就该把两项都对齐
-        set_auto_continue_patch(AutoContinuePatch {
-            enabled: Some(false),
-            max_rounds: Some(AUTO_CONTINUE_MIN_ROUNDS),
-        });
-        assert!(!auto_continue());
-        assert_eq!(auto_continue_max_rounds(), AUTO_CONTINUE_MIN_ROUNDS);
+    #[test]
+    fn user_configured_switch_limit_is_preserved_and_bounded_to_100() {
+        let empty = build(Map::new());
+        assert_eq!(empty.retry.account_switch_count, 32);
+        assert_eq!(empty.error_policy.settings.switches, 32);
 
-        // 复位出厂态：别把「开着 + 1 轮」留给后面的用例（尤其留给续写那条链）
-        let _ = set_auto_continue_patch(AutoContinuePatch {
-            enabled: Some(false),
-            max_rounds: Some(DEFAULT_AUTO_CONTINUE_MAX_ROUNDS),
-        });
+        let mut custom = Map::new();
+        custom.insert(KEY_RETRY_ACCOUNT_SWITCH_COUNT.to_string(), json!(5));
+        let kept = build(custom);
+        assert_eq!(kept.retry.account_switch_count, 5);
+        assert_eq!(kept.error_policy.settings.switches, 5);
+
+        let mut at_100 = Map::new();
+        at_100.insert(KEY_RETRY_ACCOUNT_SWITCH_COUNT.to_string(), json!(100));
+        let max_cfg = build(at_100);
+        assert_eq!(max_cfg.retry.account_switch_count, 100);
+        assert_eq!(max_cfg.error_policy.settings.switches, 100);
+
+        let mut over_100 = Map::new();
+        over_100.insert(KEY_RETRY_ACCOUNT_SWITCH_COUNT.to_string(), json!(101));
+        let fallback_cfg = build(over_100);
+        assert_eq!(fallback_cfg.retry.account_switch_count, 32);
+        assert_eq!(fallback_cfg.error_policy.settings.switches, 32);
     }
 }

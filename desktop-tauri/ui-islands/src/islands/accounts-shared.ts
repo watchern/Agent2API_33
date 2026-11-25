@@ -1,8 +1,11 @@
+import { credentialRefreshMessage } from '../../../ui-shared/plugin-login-refresh-message'
 import type { UsageQueryTask, UsageQueryStart } from '../../../ui-shared/usage-query-task'
+import type { AccountListQuery, AccountListPage, AccountListSummary } from '../../../ui-shared/accounts-list'
 import { t } from '../i18n'
 import { type ProxyUsage } from '../../../ui-shared/proxy-usage'
 import type { BalanceQueryPublic } from './balance-query'
 import type { HiddenAccountProvider } from '../../../ui-shared/plugins'
+import type { ZcodeCaptchaPoolStats } from '../../../ui-shared/zcode-captcha-binding'
 import type { UsageQuerySettings } from '../../../ui-shared/usage-query-settings'
 import type { LimiterGroup, LimiterSnapshot } from './accounts-limiter-types'
 import type { AccountSorting, AccountSortRule as GroupSortRule } from '../../../ui-shared/account-sorting'
@@ -66,6 +69,9 @@ export type RateLimitInfo = {
    * （`progress: null`），其余读数照旧。
    */
   at?: number
+  timeSource?: 'upstream' | 'fallback'
+  kind?: import('../../../ui-shared/routing-errors-types').ErrorKind
+  ruleId?: string
   message?: string
 }
 
@@ -150,16 +156,15 @@ export type TokenReading = {
  */
 export type AccountRecord = {
   id: string
+  detailsLoaded?: boolean
   provider?: string
   name?: string
   nickname?: string
   /** 用户显式设置过备注名（后端在 update_account 真正改到 name 时打的标，见 apply_patch） */
   nameCustom?: boolean
-  /**
-   * 账号级自定义 User-Agent（空串 / 缺省 = 没设置，用该家自己的默认值）。
-   * 后端 `public_account` 对**所有家**统一注入，PATCH 时传空串即清除。
-   */
+  /** 当前生效的账号覆盖值；固定身份提供商返回空串，不改变其原有请求标识。 */
   userAgent?: string
+  userAgentOverridable?: boolean
   email?: string
   priority?: number
   enabled?: boolean
@@ -169,6 +174,7 @@ export type AccountRecord = {
   available?: boolean
   /** 桌面端实时登录态（凭证每次从客户端登录态文件读取） */
   desktop?: boolean
+  desktopLaunchAvailable?: boolean
   /**
    * 后端注入的**跨家事实**：这条账号有没有可用凭证（`has_token || desktop ||
    * apiKey || jwt || noAuth`，见后端 `state::has_credentials`）。
@@ -187,6 +193,7 @@ export type AccountRecord = {
   hasAccessToken?: boolean
   accessTokenExpiresAt?: number | null
   canRefresh?: boolean
+  canSyncCredentials?: boolean
   hasRefreshToken?: boolean
   refreshTokenLongLived?: boolean
   refreshExpiresAt?: number | null
@@ -257,6 +264,8 @@ export type AccountRecord = {
   source?: string
   proxy?: ProxyConfig | null
   rateLimits?: Record<string, RateLimitInfo>
+  routingCooldowns?: Record<string, RateLimitInfo>
+  providerCooldown?: RateLimitInfo
   upstreamCooldownUntil?: number | null
   upstreamBlockedReason?: string
   [key: string]: unknown
@@ -267,6 +276,12 @@ export type { HiddenAccountReason, HiddenAccountProvider, HiddenAccountsSummary 
 /** `wbApp.getState()?.accounts` 的形状（providers 摘要 + 账号清单） */
 export type AccountsSnapshot = {
   accounts?: AccountRecord[]
+  indexOnly?: boolean
+  total?: number
+  summary?: AccountListSummary
+  accountFeatures?: Record<string, unknown>
+  providerIcons?: Record<string, string>
+  desktopLaunch?: unknown
   providers?: Array<{ id?: string; label?: string; count?: number }>
   sorting?: AccountSorting
   /** 插件未就绪而隐藏的账号，只含数量与提供商元数据，不含账号记录。 */
@@ -315,6 +330,10 @@ export type AccountExportResult = {
 
 export type AccountsBridge = {
   platform?: string
+  getAccounts(query?: Record<string, string | number>): Promise<AccountsSnapshot>
+  queryAccounts(query: AccountListQuery): Promise<AccountListPage<AccountRecord>>
+  getAccountSelection(query: AccountListQuery): Promise<{ ids: string[]; total: number }>
+  getAccount(id: string): Promise<AccountRecord>
   exportAccountFiles(selection: AccountExportSelection): Promise<AccountExportResult | null | undefined>
   getAccountConnections(): Promise<{ counts?: Record<string, unknown> } | null | undefined>
   updateAccount(id: string, patch: Record<string, unknown>): Promise<AccountUpdateResult | null | undefined>
@@ -323,7 +342,7 @@ export type AccountsBridge = {
   getAccountSorting(): Promise<AccountSorting>
   saveAccountSorting(payload: { provider: string; rules: GroupSortRule[] | null; onlyIfUnset?: boolean }): Promise<AccountSorting>
   moveAccount(id: string, direction: 'up' | 'down'): Promise<unknown>
-  clearRateLimits(id: string, model?: string | null): Promise<unknown>
+  clearRateLimits(id: string, model?: string | null, includeProvider?: boolean): Promise<unknown>
   /**
    * 账号路由（策略 / 粘性 / 退避 / 垫底 / 熔断）与候选队列可见化。
    * `setRoutingConfig` 收**部分**补丁、返回生效后的全量值（与 /api/timeouts
@@ -352,12 +371,14 @@ export type AccountsBridge = {
    * 按它判断要不要应用），`tokenUsage` 按账号给启用中的每个 Token 周期一条
    * `{period, windowStart, used}`（没配规则的账号不出现）。
    */
-  getBalancesSnapshot(): Promise<LimiterSnapshot & {
+  getBalancesSnapshot(ids?: string[]): Promise<LimiterSnapshot & {
+    partial?: boolean
     at?: number
     queries?: UsageQueryTask[]
     results?: Array<Record<string, unknown>>
     tokenAt?: number
     tokenUsage?: Record<string, unknown>
+    listLimited?: Record<string, boolean>
     sorting?: AccountSorting
   } | null | undefined>
   getProxies(): Promise<{ clash?: import('../../../ui-shared/clash-proxy').ClashProxySnapshot } | null | undefined>
@@ -382,22 +403,7 @@ export type AccountsBridge = {
   refreshAccountToken(id: string): Promise<{ refreshedId?: string; list?: AccountsSnapshot } | null | undefined>
   removeAccount(id: string): Promise<unknown>
   /** 套餐池模型请求的验证状态与库存；读取不发起验证码。 */
-  zcodeCaptchaStats?(): Promise<{
-    ready?: number
-    target?: number
-    required?: boolean
-    needsTokens?: boolean
-    demandActive?: boolean
-    lastSyncAt?: number
-    configError?: string
-    captchaAccountId?: string
-    error?: string
-    startPlanAccounts?: number
-    rejected?: number
-    minted?: number
-    consumed?: number
-    ttlMs?: number
-  } | null | undefined>
+  zcodeCaptchaStats?(accountId?: string, provider?: string): Promise<ZcodeCaptchaPoolStats | null | undefined>
 }
 
 /**
@@ -429,15 +435,15 @@ export function poolItemAddress(item: PoolItem): string {
 
 export function poolItemLabel(item: PoolItem): string {
   const name = item.name || item.id
-  const parts = [item.source === 'clash' ? 'Clash Verge' : '', item.resolveError ? t('解析失败') : poolItemAddress(item), item.enabled === false ? t('已禁用') : ''].filter(Boolean)
+  const parts = [item.source === 'clash' ? 'EasyClash' : '', item.resolveError ? t('解析失败') : poolItemAddress(item), item.enabled === false ? t('已禁用') : ''].filter(Boolean)
   return parts.length ? t('{name}（{parts}）', { name, parts: parts.join(' · ') }) : name
 }
 
 /**
  * 代理下拉里「池条目」这一类的值前缀：`pool:<proxyId>`。
  *
- * 为什么需要前缀而不是直接用 proxyId：同一个下拉里还列着 Clash 的出口 uid
- * （来自 verge.yaml，形态不受我们控制，`px_...` 撞上它不是不可能），
+ * 为什么需要前缀而不是直接用 proxyId：同一个下拉里还列着 EasyClash 的出口 uid
+ * （来自 store.json，形态不受我们控制，`px_...` 撞上它不是不可能），
  * 以及几个 `__proxy_*__` 占位值。前缀把三类值域彻底分开，判定只看开头即可。
  * 两个消费方（账号页代理列 / 更新设置的出网线路）读的是同一个常量 ——
  * 一边改了前缀、另一边没改，症状是「选了代理池条目却报不支持」，很难查。
@@ -456,6 +462,7 @@ export type SharedWindow = {
     formatTime?: (value: unknown) => string
     showPage?: (page: string) => void
     refresh?: () => Promise<boolean>
+    applyAccounts?: (snapshot: AccountsSnapshot) => boolean
     getRefreshStatus?: () => { pending: boolean; error: string }
     subscribeRefresh?: (listener: () => void) => () => void
     runAccountAction?: (action: string, id: string) => void
@@ -463,6 +470,7 @@ export type SharedWindow = {
       accounts?: AccountsSnapshot
       /** 插件申报的账号行渲染参数（`/api/session` 的 `accountFeatures`，键为 provider id） */
       accountFeatures?: Record<string, unknown>
+      desktopLaunch?: unknown
     } | null | undefined
     /** 顶栏状态区重画：余额结论会翻转「已限流」计数，应用完读数后调它跟上 */
     renderTopbarStatus?: () => void
@@ -519,8 +527,11 @@ export type SharedWindow = {
   /** ZCode 套餐明细弹窗（zcode-plans-modal.tsx）：可领取 + 名下已有的套餐，逐份领取 */
   wbZcodePlans?: { open?: (options: { id: string; name?: string }) => void }
   wbZcodeCaptchaPool?: {
-    status?(): { state: 'idle' | 'verifying' | 'paused' | 'error' | 'disabled' | 'needs_verification'; error: string }
-    refresh?(): ReturnType<NonNullable<AccountsBridge['zcodeCaptchaStats']>>
+    status?(accountId?: string): {
+      state: 'idle' | 'verifying' | 'paused' | 'error' | 'disabled' | 'needs_verification'
+      error: string; accountId?: string; provider?: string
+    }
+    refresh?(accountId?: string, provider?: string, signal?: AbortSignal): ReturnType<NonNullable<AccountsBridge['zcodeCaptchaStats']>>
     verify?(accountId: string, signal?: AbortSignal, onPhase?: (phase: string) => void): Promise<boolean>
   }
   /** CodeArts「领福利」流程（ui/codearts-welfare.js：只读探测 → 确认 → 领取 → 回读） */
@@ -577,7 +588,7 @@ export function formatTime(value: unknown): string {
 }
 
 export function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error)
+  return credentialRefreshMessage(error instanceof Error ? error.message : String(error), t)
 }
 
 /**

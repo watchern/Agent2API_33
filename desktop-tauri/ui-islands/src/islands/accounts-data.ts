@@ -1,4 +1,6 @@
+import { confirmDialog } from '@ui'
 import { invalidateUsageTasks } from './accounts-usage-tasks'
+import { ensureAccountDetails, ensureAccountsDetails, pruneAccountDetails } from './accounts-list-api'
 import {
   errorMessage, POOL_VALUE_PREFIX, shared, toast,
   type AccountRecord,
@@ -40,7 +42,14 @@ export {
 
 export function openSettingsDialog(id: string): void {
   if (!findAccount(id)) { toast(t('账号不存在，请刷新后重试'), 'err'); return }
-  patch({ dialog: { kind: 'settings', id } })
+  const loading = { kind: 'settings-loading' as const, id }
+  patch({ dialog: loading })
+  void ensureAccountDetails(id).then(() => {
+    if (getStore().dialog === loading) patch({ dialog: { kind: 'settings', id } })
+  }).catch(error => {
+    if (getStore().dialog === loading) patch({ dialog: null })
+    toast(t('读取账号详情失败：{message}', { message: errorMessage(error) }), 'err')
+  })
 }
 
 export function closeDialog(): void {
@@ -50,7 +59,14 @@ export function closeDialog(): void {
 export function openBatchDialog(ids: string[], action = 'enable'): void {
   const selected = (Array.isArray(ids) ? ids : []).filter(id => findAccount(id))
   if (!selected.length) { toast(t('请先勾选要操作的账号'), 'err'); return }
-  patch({ dialog: { kind: 'batch', ids: selected, action } })
+  const loading = { kind: 'batch-loading' as const, ids: selected, action }
+  patch({ dialog: loading })
+  void ensureAccountsDetails(selected).then(() => {
+    if (getStore().dialog === loading) patch({ dialog: { kind: 'batch', ids: selected, action } })
+  }).catch(error => {
+    if (getStore().dialog === loading) patch({ dialog: null })
+    toast(t('读取账号详情失败：{message}', { message: errorMessage(error) }), 'err')
+  })
 }
 
 /**
@@ -69,6 +85,7 @@ export function openGroupDialog(provider: string): void {
 
 /** 清掉已删除账号的本地缓存（app.js 每次 refresh 后调用） */
 export function refreshCaches(validIds: Set<string>): void {
+  pruneAccountDetails(validIds)
   let touched = pruneUsageCache(validIds)
   const connections = new Map(getStore().connections)
   for (const id of [...connections.keys()]) if (!validIds.has(id)) { connections.delete(id); touched = true }
@@ -84,7 +101,6 @@ export function refreshCaches(validIds: Set<string>): void {
  * （一个请求在账号间轮换时计数跟着走，见后端 core::upstream::connections）。
  * 连接数走独立轻量接口（只回写各账号实时连接数，不重拉整张账号表）而不是跟着 app.js 那 20 秒一轮：连接数的全部意义就在「现在」。
  * 后端那边是进程内计数（不读盘、不出网），所以这条链路的代价足够低。 */
-
 
 export function connectionsOf(id: string): number {
   return getStore().connections.get(id) || 0
@@ -105,7 +121,6 @@ export function connectionsOf(id: string): number {
  * 走的是同一段代码，所以「key 集合 + 每个值」全等都等价于「这份读数与上一份相同」。
  */
 let connectionsInFlight = false
-
 export async function syncConnections(): Promise<boolean> {
   // 防重入：上一轮还没回来就跳过本轮（慢环境下定时器会堆叠出请求洪峰）
   if (connectionsInFlight) return true
@@ -223,7 +238,9 @@ export async function setGroupEnabled(ids: string[], enabled: boolean): Promise<
 /** 清除限流标记：单条（model）或全部。后端返回新快照，交给全局刷新对齐。 */
 export async function clearLimits(id: string, model?: string): Promise<void> {
   try {
-    await shared().workbuddyDesktop?.clearRateLimits?.(id, model || null)
+    const includeProvider = !model && Number(findAccount(id)?.providerCooldown?.resetAt) > Date.now()
+    if (includeProvider && !await confirmDialog(t('这条冷却由同一提供商的账号共用。清除后这些账号都会重新参与；上游仍受限时会再次冷却。'), { title: t('清除提供商共享冷却') })) return
+    await shared().workbuddyDesktop?.clearRateLimits?.(id, model || null, includeProvider)
     toast(model ? t('✅ 已清除 {model} 的限流标记', { model }) : t('✅ 已清除该账号全部限流标记'))
     await shared().wbApp?.refresh?.()
   } catch (error) {
@@ -329,6 +346,9 @@ export function rowContext(
 
 export type AccountsViewApi = {
   render(): void
+  findAccount: typeof findAccount
+  refreshFailureMessage: typeof errorMessage
+  ensureAccountDetails: typeof ensureAccountDetails
   refreshList: typeof refreshList
   refreshCaches(validIds: Set<string>): void
   invalidateUsageTasks(ids: string[]): void
@@ -451,6 +471,9 @@ export function installAccountsApi(): void {
   installListRefresh()
   window.wbAccountsView = {
     render: () => { syncAccountSorting(); bump() },
+    findAccount,
+    refreshFailureMessage: errorMessage,
+    ensureAccountDetails,
     refreshList,
     refreshCaches,
     invalidateUsageTasks,

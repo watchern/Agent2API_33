@@ -46,6 +46,9 @@ use serde_json::{Map, Value};
 
 mod attempt;
 mod vision;
+mod model_key;
+mod prompt;
+mod catpaw_output;
 pub use attempt::{
     AttemptDetail, RetryEvent, MAX_ATTEMPT_DETAILS, MAX_ATTEMPT_ERROR_CHARS,
     MAX_ATTEMPT_ACCOUNT_CHARS, MAX_ATTEMPT_RETRY_REASON_CHARS, MAX_ATTEMPT_NOTICE_CHARS,
@@ -66,6 +69,8 @@ pub struct UsageTokens {
     pub completion: i64,
     pub total: i64,
     pub cache_read: i64,
+    pub cache_creation: i64,
+    pub cache_creation_1h: i64,
     pub credit: Option<f64>,
 }
 
@@ -108,6 +113,8 @@ pub fn extract_usage(usage: &Value) -> Option<UsageTokens> {
         completion: tokens.completion.unwrap_or(0).saturating_add(tokens.deferred_completion.unwrap_or(0)),
         total: tokens.total_tokens().saturating_add(tokens.deferred_prompt.unwrap_or(0)).saturating_add(tokens.deferred_completion.unwrap_or(0)),
         cache_read: tokens.cache_read.unwrap_or(0).saturating_add(tokens.deferred_cache_read.unwrap_or(0)),
+        cache_creation: tokens.cache_creation.unwrap_or(0).saturating_add(tokens.deferred_cache_write.unwrap_or(0)),
+        cache_creation_1h: tokens.cache_creation_1h.unwrap_or(0),
         credit: usage.as_object().and_then(|object| first_amount(object, CREDIT_KEYS)),
     })
 }
@@ -264,6 +271,8 @@ pub struct TelemetrySnapshot {
     pub completion_tokens: i64,
     pub total_tokens: i64,
     pub cache_read_tokens: i64,
+    pub cache_creation_tokens: i64,
+    pub cache_creation_1h_tokens: i64,
     /// 上游按请求上报的**积分消耗**（WorkBuddy 的 `usage.credit`；`None` = 这一家
     /// 不提供该读数，落库为 NULL，前端显示「—」而不是 0）。
     ///
@@ -481,6 +490,12 @@ struct LiveWrite {
 /// 只能靠一个双方都能拿到的句柄传话。槽位只在一条请求内共享，不存在争用。
 pub struct RequestTelemetry {
     inner: Mutex<TelemetrySnapshot>,
+    /// 请求安全状态独立于统计快照；attempt、首响及用量清理均不能替换或解除它。
+    replay_guard: Arc<super::replay_guard::ReplayGuard>,
+    model_key: Option<Arc<crate::server::config::model_key_source::Source>>,
+    prompt_request: Mutex<Option<crate::server::core::prompt::rules::Request>>,
+    catpaw_output: Mutex<Option<Arc<crate::server::core::plugin_host::wasm::CatPawOutputSlot>>>,
+    catpaw_output_taken: std::sync::atomic::AtomicBool,
     vision_enabled: std::sync::atomic::AtomicBool,
     vision_continuation: Mutex<Option<Arc<super::vision_compat::VisionContinuation>>>,
     /// 调试模式的原始报文采集器（`core::debug_traffic`；None = 未开启调试模式）。
@@ -511,8 +526,17 @@ impl Default for RequestTelemetry {
 
 impl RequestTelemetry {
     pub fn new() -> Self {
+        Self::with_replay_guard(Arc::new(super::replay_guard::ReplayGuard::new()))
+    }
+
+    fn with_replay_guard(replay_guard: Arc<super::replay_guard::ReplayGuard>) -> Self {
         Self {
             inner: Mutex::new(TelemetrySnapshot::default()),
+            replay_guard,
+            model_key: None,
+            prompt_request: Mutex::new(None),
+            catpaw_output: Mutex::new(None),
+            catpaw_output_taken: std::sync::atomic::AtomicBool::new(false),
             vision_enabled: std::sync::atomic::AtomicBool::new(false),
             vision_continuation: Mutex::new(None),
             capture: Mutex::new(None),
@@ -530,6 +554,21 @@ impl RequestTelemetry {
         let telemetry = Self::new();
         telemetry.ensure_id(&super::request::new_request_id());
         telemetry
+    }
+
+    /// 子调用只继承请求安全对象，关联 id、用量、首响和取消令牌仍各自独立。
+    /// 仅供构造新子遥测，不能把一份已在使用的遥测改绑到另一请求。
+    pub(crate) fn child_with_id(&self) -> Self {
+        let mut telemetry = Self::with_replay_guard(Arc::clone(&self.replay_guard));
+        telemetry.model_key = self.model_key.clone();
+        telemetry.prompt_request = Mutex::new(self.prompt_request());
+        telemetry.ensure_id(&super::request::new_request_id());
+        telemetry
+    }
+
+    /// 不进入统计快照或插件参数；调用方只能借用现有对象，不能替换它。
+    pub(crate) fn replay_guard(&self) -> &Arc<super::replay_guard::ReplayGuard> {
+        &self.replay_guard
     }
 
     /// 装入调试模式的采集器（转发层即将发送前调一次）。
@@ -570,6 +609,10 @@ impl RequestTelemetry {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
+    }
+
+    pub(super) fn response_started(&self) -> bool {
+        self.lock().first_response_at.is_some()
     }
 
     /// 本条请求是否已被手动终止（循环顶的同步判据；令牌缺省时恒 false）
@@ -909,6 +952,8 @@ impl RequestTelemetry {
         guard.completion_tokens = tokens.completion;
         guard.total_tokens = tokens.total;
         guard.cache_read_tokens = tokens.cache_read;
+        guard.cache_creation_tokens = tokens.cache_creation;
+        guard.cache_creation_1h_tokens = tokens.cache_creation_1h;
         guard.credit = tokens.credit;
     }
 

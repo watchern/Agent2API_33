@@ -161,21 +161,10 @@ pub fn is_rate_limited(account: &Value, keys: &CooldownKeys<'_>, now: i64) -> bo
 /// 冷却键按 [`CooldownKeys`] 解析（真名，不是请求名）。
 pub fn rate_limit_reset_at(account: &Value, keys: &CooldownKeys<'_>, now: i64) -> i64 {
     let key = keys.for_account(account);
-    let Some(limit) = account
-        .get("rateLimits")
-        .and_then(|limits| limits.get(key.as_str()))
-    else {
-        return 0;
-    };
-    let reset_at = limit
-        .get("resetAt")
-        .and_then(js_number)
-        .unwrap_or(0.0);
-    if reset_at > now as f64 {
-        reset_at as i64
-    } else {
-        0
-    }
+    let keys = [account.pointer("/routingCooldowns/@account/resetAt"), account.pointer("/providerCooldown/resetAt"),
+        account.get("rateLimits").and_then(|limits| limits.get(key.as_str())).and_then(|limit| limit.get("resetAt"))];
+    keys.into_iter().flatten().filter_map(js_number).filter(|reset| *reset > now as f64)
+        .map(|reset| reset as i64).max().unwrap_or(0)
 }
 
 /// 账号是否可用于转发：启用 + 未被该模型限额。
@@ -229,11 +218,7 @@ pub fn max_concurrent_of(account: &Value) -> u64 {
 /// 其他账号。没有运行时计数可拿的调用方传**空表** = 不做并发过滤（见
 /// `pick_for_model` / `describe_route_decision` 的说明）。
 ///
-/// ── 并发上限是**软上限**（选路与 rebind 之间的微小窗口）────────
-/// 两个并发请求可能在同一瞬间选中同一个账号、然后各自 +1 —— 期间谁都还
-/// 读不到对方的计数。为此引入额外加锁不值得：超出的那 1-2 个请求只意味着
-/// 短暂超载（请求结束计数立刻回落），而选路必须是「读一次快照、立刻决策」
-/// 的廉价操作。把这个口径写明：**允许短暂超 1-2 个，不做强一致**。
+/// 在途快照用于快速筛选；实际发送前还会原子预占账号名额，不能超额发送。
 ///
 /// 排序取首位即为唯一答案（优先级唯一由写入侧保证）；并列属手工编辑出来的
 /// 异常数据，按加入时间兜底，结果依旧稳定。
@@ -486,6 +471,8 @@ pub struct PlanEntry {
     pub provider: String,
     /// 状态码：`usable` / `tried` / `disabled` / `cooldown` / `concurrency` /
     /// `limiter` / `no-credentials`
+    ///
+    /// `concurrency` 在 `ordered` 末尾时表示「并发已满、排队等槽位」。
     pub state: &'static str,
     /// 一句「为什么排这 / 为什么跳过」（队列面板与请求详情直接展示）
     pub reason: String,
@@ -493,7 +480,7 @@ pub struct PlanEntry {
     pub reset_at: i64,
 }
 
-/// 一份选路计划：可用候选（排好序）+ 被跳过的候选（各带原因）。
+/// 一份选路计划：可用候选（排好序，末尾接着「并发满、排队等槽位」的候选）+ 被跳过的候选（各带原因）。
 pub struct RoutePlan {
     pub ordered: Vec<PlanEntry>,
     pub blocked: Vec<PlanEntry>,
@@ -646,6 +633,7 @@ pub fn plan_route(
     meta: &PlanMeta<'_>,
 ) -> RoutePlan {
     let mut ordered: Vec<Value> = Vec::new();
+    let mut queued: Vec<Value> = Vec::new();
     let mut blocked: Vec<PlanEntry> = Vec::new();
     for account in accounts {
         let Some(id) = account_id(account) else { continue };
@@ -679,22 +667,12 @@ pub fn plan_route(
         }
         let reset_at = rate_limit_reset_at(account, keys, now);
         if reset_at > 0 {
+            let scope = if account.pointer("/providerCooldown/resetAt").and_then(Value::as_i64).unwrap_or(0) == reset_at { "提供商" }
+                else if account.pointer("/routingCooldowns/@account/resetAt").and_then(Value::as_i64).unwrap_or(0) == reset_at { "账号" }
+                else { "该账号的当前模型" };
             blocked.push(entry(
                 "cooldown",
-                format!(
-                    "对该模型限流冷却中，{} 恢复（恢复后自动回来）",
-                    clock_text(reset_at, now)
-                ),
-            ));
-            continue;
-        }
-        if at_concurrency_limit(account, &id, counts) {
-            blocked.push(entry(
-                "concurrency",
-                format!(
-                    "并发已满（{}/上限），等一个在途回落再参与",
-                    counts.get(&id).copied().unwrap_or(0)
-                ),
+                format!("{scope}冷却中，{} 恢复（恢复后自动回来）", clock_text(reset_at, now)),
             ));
             continue;
         }
@@ -704,6 +682,16 @@ pub fn plan_route(
         }
         if matches!(account.get("hasCredentials"), Some(Value::Bool(false))) {
             blocked.push(entry("no-credentials", "没有可用凭证，登录后才能接请求".to_string()));
+            continue;
+        }
+        if meta.open.contains(&id) {
+            blocked.push(entry("breaker", "连续失败保护中，到保护结束后才允许重新尝试".to_string()));
+            continue;
+        }
+        // 并发已满 ≠ 不可用：先确认账号本身可用（有凭证/权限/未熔断/未冷却），
+        // 再把当前满员的账号收入队尾排队等槽位，不再直接当作不可用丢弃。
+        if at_concurrency_limit(account, &id, counts) {
+            queued.push(account.clone());
             continue;
         }
         ordered.push(account.clone());
@@ -818,10 +806,13 @@ pub fn plan_route(
                     }
                 }
             };
-            if meta.sunk.contains_key(&id) {
-                // 文案跟着 `route_state::SINK_TTL_MS` 走：垫底现在有 30 分钟寿命，
-                // 不再是「轮一圈才回来」（那句是上游原实现的说法，那时垫底永不失效）。
-                reason.push_str("；曾还有额度时被 429（垫底中，30 分钟后自动回到队列）");
+            if let Some(&until) = meta.sunk.get(&id) {
+                let text = clock_text(until, now);
+                if text.is_empty() {
+                    reason.push_str("；优先级已调至最低（成功一次自动恢复）");
+                } else {
+                    reason.push_str(&format!("；优先级已调至最低（{text} 后自动恢复，成功一次提前恢复）"));
+                }
             }
             if let Some(until) = meta.resting.get(&id) {
                 reason.push_str(&format!("；转发失败休息至 {}", clock_text(*until, now)));
@@ -841,8 +832,30 @@ pub fn plan_route(
         })
         .collect();
 
+    queued.sort_by(compare_by_priority);
+    queued.sort_by_key(|account| rank_of(account, meta.sunk));
+    queued.sort_by_key(|account| rank_of(account, meta.resting));
+    let queued_entries: Vec<PlanEntry> = queued
+        .into_iter()
+        .map(|account| {
+            let id = account_id(&account).unwrap_or("").to_string();
+            let busy = counts.get(&id).copied().unwrap_or(0);
+            PlanEntry {
+                name: account_name(&account, &id),
+                provider: provider_of(&account).to_string(),
+                account,
+                id,
+                state: "concurrency",
+                reason: format!(
+                    "并发已满（{busy} 个在途已达上限），排队等一个槽位空出来 —— 前面的候选都发不出去时它接着上"
+                ),
+                reset_at: 0,
+            }
+        })
+        .collect();
+
     RoutePlan {
-        ordered: ordered_entries,
+        ordered: ordered_entries.into_iter().chain(queued_entries).collect(),
         blocked,
         sticky_hit,
     }
@@ -1168,6 +1181,46 @@ mod tests {
         let plan = plan_route(&accounts, &keys, &counts, &[], 1_700_000_000_000, &meta);
         let order: Vec<&str> = plan.ordered.iter().map(|entry| entry.id.as_str()).collect();
         assert_eq!(order, vec!["a1", "a2", "b1", "b2"]);
+    }
+
+    #[test]
+    fn busy_usable_account_queues_at_tail_while_unusable_busy_account_stays_blocked() {
+        let mut busy_ok = account("busy_ok", "A", 100);
+        busy_ok["maxConcurrent"] = serde_json::json!(1);
+        let idle = account("idle", "A", 110);
+        let mut busy_no_cred = account("busy_no_cred", "A", 90);
+        busy_no_cred["maxConcurrent"] = serde_json::json!(1);
+        busy_no_cred["hasCredentials"] = serde_json::json!(false);
+        let mut busy_breaker = account("busy_breaker", "A", 95);
+        busy_breaker["maxConcurrent"] = serde_json::json!(1);
+
+        let accounts = vec![busy_ok, idle, busy_no_cred, busy_breaker];
+        let keys = CooldownKeys::new("");
+        let counts = std::collections::HashMap::from([
+            ("busy_ok".to_string(), 1usize),
+            ("busy_no_cred".to_string(), 1usize),
+            ("busy_breaker".to_string(), 1usize),
+        ]);
+        let empty_numbers = Default::default();
+        let open = std::collections::HashSet::from(["busy_breaker".to_string()]);
+        let limiter_blocked = Default::default();
+        let meta = PlanMeta {
+            strategy: RouteStrategy::Provider,
+            sunk: &empty_numbers,
+            resting: &empty_numbers,
+            open: &open,
+            limiter_blocked: &limiter_blocked,
+            cursor: None,
+            provider_cursors: None,
+            sticky_account: None,
+        };
+        let plan = plan_route(&accounts, &keys, &counts, &[], 1_700_000_000_000, &meta);
+        let ordered_ids: Vec<&str> = plan.ordered.iter().map(|entry| entry.id.as_str()).collect();
+        assert_eq!(ordered_ids, vec!["idle", "busy_ok"]);
+        assert_eq!(plan.ordered[1].state, "concurrency");
+        let blocked_ids: Vec<&str> = plan.blocked.iter().map(|entry| entry.id.as_str()).collect();
+        assert!(blocked_ids.contains(&"busy_no_cred"));
+        assert!(blocked_ids.contains(&"busy_breaker"));
     }
 }
 

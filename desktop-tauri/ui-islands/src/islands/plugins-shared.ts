@@ -1,5 +1,6 @@
 import { t } from '../i18n'
-import { githubErrorMessage } from '../../../ui-shared/updates'
+import { summarizeNetworkError, updateErrorMessage } from '../../../ui-shared/updates'
+import { pluginPackName } from '../../../ui-shared/plugins'
 import type { PluginMutation } from './plugins-types'
 
 export type PluginBridge = {
@@ -19,18 +20,18 @@ export function bridge(): PluginBridge {
 }
 
 export function errorMessage(error: unknown): string {
-  return githubErrorMessage(error, t, 'plugin')
+  return updateErrorMessage(error, t)
 }
 
 export function toast(message: string, kind?: 'err' | 'ok'): void {
-  bridge().wbApp?.toast?.(errorMessage(message), kind)
+  bridge().wbApp?.toast?.(kind === 'err' ? summarizeNetworkError(message, t).summary : errorMessage(message), kind)
 }
 
-export async function api<T>(method: string, path: string, body?: unknown): Promise<T> {
+export async function api<T>(method: string, path: string, body?: unknown, options?: { retry: 'never' }): Promise<T> {
   const invoke = bridge().__TAURI_INTERNALS__?.invoke
   if (!invoke) throw new Error(t('桌面运行时不可用（Tauri 未初始化）'))
   const result = await invoke('api_request', {
-    request: { method, path, body: body === undefined ? null : body },
+    request: { method, path, body: body === undefined ? null : body, ...(options ? { retry: options.retry } : {}) },
   })
   if (result && typeof result === 'object' && 'success' in result) {
     const envelope = result as { success?: boolean; data?: unknown; error?: string }
@@ -77,9 +78,7 @@ export function readBase64(file: File): Promise<string> {
 }
 
 export function pluginName(id: string, name?: string | null): string {
-  if (id === 'agent2api-providers') return t('提供商增强')
-  if (id === 'agent2api-web-providers') return t('网页提供商')
-  return name || id
+  return pluginPackName(id, name, t)
 }
 
 export function pluginDescription(id: string, description?: string | null): string {

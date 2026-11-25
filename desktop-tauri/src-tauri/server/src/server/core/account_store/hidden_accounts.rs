@@ -6,6 +6,23 @@ use serde_json::{json, Value};
 use crate::server::core::plugin_host::{startup, PackRegistry};
 use crate::server::core::providers;
 
+impl super::AccountStore {
+    pub(crate) fn plugin_account_summary(&self) -> Value {
+        let snapshot = self.routing_snapshot();
+        let booting = startup::booting();
+        let mut counts = BTreeMap::new();
+        let mut hidden = BTreeMap::new();
+        for account in &snapshot.public_accounts {
+            let provider = crate::server::core::routing::provider_of(account);
+            *counts.entry(provider.to_string()).or_insert(0usize) += 1;
+            if !super::store_view::account_list_visible(provider, booting) {
+                *hidden.entry(provider.to_string()).or_insert(0usize) += 1;
+            }
+        }
+        json!({ "counts": counts, "hidden": summary(hidden) })
+    }
+}
+
 #[derive(Clone, Copy, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum HiddenReason {
@@ -16,9 +33,17 @@ enum HiddenReason {
     LoadFailed,
     LoadTimeout,
     NotLoaded,
+    LegacyUnsupported,
+    ReplacedByTemplate,
 }
 
+/// `scripts` 是**一次性读全量**的 provider 状态表（见
+/// [`crate::server::core::plugin_host::script::provider_states`]）——账号列表是
+/// 首屏热路径，逐个 provider 重读 registry.json 会把磁盘读放大成 N 次。
 fn reason_of(provider: &str, registry: &PackRegistry, scripts: &HashMap<String, &'static str>) -> HiddenReason {
+    if providers::availability::is_replaced_by_template(provider) {
+        return HiddenReason::ReplacedByTemplate;
+    }
     if let Some(state) = startup::provider(provider) {
         if !state.pack_enabled { return HiddenReason::PackDisabled; }
         if !state.enabled { return HiddenReason::ProviderDisabled; }
@@ -36,8 +61,21 @@ fn reason_of(provider: &str, registry: &PackRegistry, scripts: &HashMap<String, 
             _ => HiddenReason::NotLoaded,
         };
     }
+    if registry.packs.iter().any(|pack| {
+        pack.manifest_providers.iter().any(|item| item.id.as_str() == provider)
+            && crate::server::core::plugin_host::support_state(pack)
+                == crate::server::core::plugin_host::PackSupportState::LegacyUnsupported
+    }) && !registry.packs.iter().any(|pack| {
+        pack.manifest_providers.iter().any(|item| item.id.as_str() == provider)
+            && crate::server::core::plugin_host::support_state(pack)
+                == crate::server::core::plugin_host::PackSupportState::Supported
+    }) { return HiddenReason::LegacyUnsupported; }
     let mut reason = HiddenReason::NotInstalled;
     for pack in &registry.packs {
+        if crate::server::core::plugin_host::support_state(pack)
+            != crate::server::core::plugin_host::PackSupportState::Supported {
+            continue;
+        }
         if !pack
             .manifest_providers
             .iter()
@@ -67,14 +105,18 @@ pub(super) fn summary(counts: BTreeMap<String, usize>) -> Value {
         let scripts = crate::server::core::plugin_host::script::provider_states();
         for (provider, count) in &counts {
             let state = startup::provider(provider);
-            details.push(json!({
+            let mut row = json!({
                 "id": provider,
                 "label": providers::label_of(provider),
                 "count": count,
                 "reason": reason_of(provider, &registry, &scripts),
                 "packId": state.as_ref().map(|state| &state.pack_id),
                 "startup": state.as_ref().map(|state| &state.startup),
-            }));
+            });
+            if let Some(template_key) = providers::availability::replaced_template_key(provider) {
+                row["templateKey"] = json!(template_key);
+            }
+            details.push(row);
         }
     }
     json!({

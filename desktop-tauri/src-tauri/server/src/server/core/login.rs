@@ -12,6 +12,8 @@
 //! 15 秒的 authUrl，拿到就把任务按 state 登记进表供 `/wait` 查询；拿不到就回
 //! 502（任务本身继续在后台跑，与 Node 版一致）。
 //!
+//! 原有等待 authUrl 的说明仅适用于非托管流程：托管登录先登记 flow 并立即返回，
+//! 由 `managed` 持有动态步骤、期限和回调资源。
 //! 取消不走 AbortController 而是置任务上的 `canceled` 标记 —— 轮询循环每一拍
 //! 检查一次，语义等价（Node 的 signal.aborted 也是循环里检查）。
 //! 任务完成后保留 10 分钟，清理在「取任务时顺手做过期检查」里完成，
@@ -19,14 +21,16 @@
 
 mod callback;
 mod lobsterai;
+mod persistence;
 
 pub use callback::LoginCallbackResult;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use serde_json::{json, Value};
+use tokio_util::sync::CancellationToken;
 
 use crate::server::core::account_store::AccountStore;
 use crate::server::core::endpoints::DEFAULT_EDITION;
@@ -34,6 +38,14 @@ use crate::server::core::providers::adapter::{adapter_for, ProviderAdapter};
 use crate::server::core::providers::{kind_from_id, kind_id, ProviderKind};
 use crate::server::errors::GatewayError;
 use crate::server::logging;
+
+pub(crate) mod callback_page;
+pub(crate) mod sms;
+pub(crate) mod sms_contract;
+pub(crate) mod managed;
+mod diagnostic;
+pub use diagnostic::LoginDiagnostic;
+pub(crate) use diagnostic::fail_with_error as fail_plugin_login_with_error;
 
 /// 登录总超时（桌面端 SIGN_IN_PENDING_TIMEOUT；轮询型插件登录也用它）
 pub const LOGIN_TIMEOUT_MS: u64 = 5 * 60 * 1000;
@@ -46,6 +58,7 @@ const TASK_RETENTION_MS: i64 = 10 * 60 * 1000;
 #[derive(Clone, Debug, Default)]
 pub struct LoginTaskState {
     pub state: Option<String>,
+    pub request_id: Option<String>,
     pub auth_url: Option<String>,
     pub allowed_hosts: Vec<String>,
     pub validates_callback: bool,
@@ -56,8 +69,12 @@ pub struct LoginTaskState {
     pub polling: bool,
     /// 有值表示走动态方法，旧 AutoClaw 专用回调不应截走这条链。
     pub method_index: Option<u64>,
+    pub sms: bool,
+    pub managed: bool,
+    persistence: persistence::SaveState,
     pub done: bool,
     pub error: Option<String>,
+    pub diagnostic: Option<LoginDiagnostic>,
     /// 成功后的会话摘要 `{ accountUid, nickname, edition }`
     pub session: Option<Value>,
     pub edition: String,
@@ -79,6 +96,7 @@ impl LoginTaskState {
     /// `/api/session/login/wait` 的三分支响应：
     /// `{pending:true}` / `{done:true,error}` / `{done:true,session}`
     pub fn to_wait_response(&self) -> Value {
+        if self.managed { return persistence::wait_response(self); }
         if !self.done {
             let mut response = json!({ "pending": true });
             if let Some(instructions) = &self.instructions { response["instructions"] = json!(instructions); }
@@ -86,7 +104,9 @@ impl LoginTaskState {
             return response;
         }
         if let Some(error) = &self.error {
-            return json!({ "done": true, "error": error });
+            let mut response = json!({ "done": true, "error": error });
+            if let Some(diagnostic) = &self.diagnostic { response["diagnostic"] = json!(diagnostic); }
+            return response;
         }
         json!({ "done": true, "session": self.session.clone().unwrap_or(Value::Null) })
     }
@@ -97,6 +117,7 @@ impl LoginTaskState {
 pub(crate) struct LoginProxySelection {
     pub(crate) config: Value,
     pub(crate) resolved: Value,
+    pub(crate) selected: crate::server::core::proxies::chain::SelectedPath,
 }
 
 struct LoginTaskContext {
@@ -105,6 +126,8 @@ struct LoginTaskContext {
     provider: &'static str,
     store: AccountStore,
     proxy: Option<LoginProxySelection>,
+    sms: Mutex<Option<sms::Session>>,
+    managed: Mutex<Option<Arc<managed::Session>>>,
 }
 
 /// 任务句柄：登录流程与 `/start`、`/wait`、`/cancel` 共享同一个状态。
@@ -164,11 +187,28 @@ impl LoginTaskHandle {
 
     /// 不持任务的同步锁 await；与 poll/callback 使用同一操作锁串行清理。
     pub(crate) async fn cancel_provider_flow(&self, flow: &str) {
+        managed::interrupt(self);
         let _operation = self.operation.lock().await;
         self.cancel_provider_flow_locked(flow).await;
     }
 
     pub(crate) async fn cancel_provider_flow_locked(&self, flow: &str) {
+        if self.snapshot().managed {
+            managed::interrupt(self);
+            if let Some(context) = &self.context {
+                context.managed.lock().unwrap_or_else(|error| error.into_inner()).take();
+                context.adapter.lock().unwrap_or_else(|error| error.into_inner()).take();
+            }
+            // 托管资源由任务拥有并已撤销，不再按 provider id 向新一代执行体发送取消。
+            return;
+        }
+        if self.snapshot().sms {
+            if let Some(context) = &self.context {
+                context.sms.lock().unwrap_or_else(|error| error.into_inner()).take();
+                context.adapter.lock().unwrap_or_else(|error| error.into_inner()).take();
+            }
+            return;
+        }
         let Some(adapter) = self.adapter() else { return };
         if let Err(error) = adapter.login_cancel_async(flow).await {
             if error.status_code != 404 {
@@ -259,6 +299,17 @@ impl LoginTasks {
         table.by_state.get(state).cloned()
     }
 
+    pub fn find_by_request_id(&self, request_id: &str) -> Option<String> {
+        if request_id.is_empty() {
+            return None;
+        }
+        let mut table = self.lock();
+        Self::sweep(&mut table);
+        table.by_state.iter().find_map(|(state, handle)| {
+            (handle.lock().request_id.as_deref() == Some(request_id)).then(|| state.clone())
+        })
+    }
+
     /// 登记任务（`/start` 拿到 state 后调用）
     pub fn register(&self, state: &str, handle: LoginTaskHandle) -> bool {
         if state.is_empty() {
@@ -283,9 +334,12 @@ impl LoginTasks {
         let Some(handle) = self.get(state) else {
             return false;
         };
-        {
+        let remove_from_table = {
             let mut task = handle.lock();
             if task.done {
+                return false;
+            }
+            if task.managed && task.persistence != persistence::SaveState::NotEntered {
                 return false;
             }
             task.canceled = true;
@@ -297,8 +351,9 @@ impl LoginTasks {
             task.auth_url = None;
             task.error = Some("登录已取消".to_string());
             task.finished_at = Some(logging::now_ms());
-        }
-        {
+            !task.managed
+        };
+        if remove_from_table {
             let mut table = self.lock();
             // 按 state 或按句柄（state 未入表时用 ticket 兜底，两者必居其一）
             let ticket = handle.ticket();
@@ -306,6 +361,8 @@ impl LoginTasks {
                 .by_state
                 .retain(|_, item| item.ticket() != ticket);
         }
+        sms::interrupt(&handle);
+        managed::interrupt(&handle);
         logging::log("[Login]", "登录任务已取消（用户放弃等待）");
         true
     }
@@ -330,10 +387,30 @@ impl Default for LoginTasks {
 /// 它原来只服务 WorkBuddy 的登录链（拉 `login/account` / `accounts`、
 /// 续期），那条链已随实现搬到插件。现在这里只剩「任务表 + 落库 + 各家
 /// 自己的回调收尾」，不再需要会话服务。
+#[derive(Default)]
+struct PendingStarts {
+    active: HashMap<String, CancellationToken>,
+    canceled: VecDeque<String>,
+}
+
+pub(crate) struct PendingStartGuard {
+    pending: Arc<Mutex<PendingStarts>>,
+    request_id: String,
+}
+
+impl Drop for PendingStartGuard {
+    fn drop(&mut self) {
+        if let Ok(mut guard) = self.pending.lock() {
+            guard.active.remove(&self.request_id);
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct LoginService {
     store: AccountStore,
     tasks: LoginTasks,
+    pending_starts: Arc<Mutex<PendingStarts>>,
 }
 
 impl LoginService {
@@ -341,6 +418,7 @@ impl LoginService {
         Self {
             store,
             tasks: LoginTasks::new(),
+            pending_starts: Arc::new(Mutex::new(PendingStarts::default())),
         }
     }
 
@@ -348,24 +426,72 @@ impl LoginService {
         &self.tasks
     }
 
+    pub(crate) fn register_pending(&self, request_id: Option<&str>) -> (CancellationToken, Option<PendingStartGuard>) {
+        let token = CancellationToken::new();
+        let Some(id) = request_id.map(str::trim).filter(|value| !value.is_empty()) else {
+            return (token, None);
+        };
+        if let Ok(mut guard) = self.pending_starts.lock() {
+            if let Some(pos) = guard.canceled.iter().position(|item| item == id) {
+                guard.canceled.remove(pos);
+                token.cancel();
+                return (token, None);
+            }
+            guard.active.insert(id.to_string(), token.clone());
+        }
+        let guard = PendingStartGuard { pending: self.pending_starts.clone(), request_id: id.to_string() };
+        (token, Some(guard))
+    }
+
+    pub(crate) fn cancel_pending(&self, key: &str) -> bool {
+        let id = key.trim();
+        if id.is_empty() {
+            return false;
+        }
+        let Ok(mut guard) = self.pending_starts.lock() else {
+            return false;
+        };
+        if let Some(token) = guard.active.remove(id) {
+            token.cancel();
+            return true;
+        }
+        if id.starts_with("req-") && !guard.canceled.iter().any(|item| item == id) {
+            if guard.canceled.len() >= 32 {
+                guard.canceled.pop_front();
+            }
+            guard.canceled.push_back(id.to_string());
+        }
+        false
+    }
+
     /// 取消一次登录：先清本体任务，再通知对应适配器释放插件侧会话与端口。
     /// 保留同步签名（已有调用方无需改动），HTTP 入口用 cancel_async 等清理完成。
     pub fn cancel(&self, state: &str) -> bool {
-        let Some(handle) = self.cancel_task(state) else { return false };
-        let flow = state.to_string();
+        if self.cancel_pending(state) {
+            return true;
+        }
+        let Some((flow, handle)) = self.cancel_task(state) else { return false };
         crate::spawn_task(async move { handle.cancel_provider_flow(&flow).await; });
         true
     }
 
     pub async fn cancel_async(&self, state: &str) -> bool {
-        let Some(handle) = self.cancel_task(state) else { return false };
-        handle.cancel_provider_flow(state).await;
+        if self.cancel_pending(state) {
+            return true;
+        }
+        let Some((flow, handle)) = self.cancel_task(state) else { return false };
+        handle.cancel_provider_flow(&flow).await;
         true
     }
 
-    fn cancel_task(&self, state: &str) -> Option<LoginTaskHandle> {
-        let handle = self.tasks.get(state)?;
-        self.tasks.cancel(state).then_some(handle)
+    fn cancel_task(&self, key: &str) -> Option<(String, LoginTaskHandle)> {
+        let actual_state = if self.tasks.get(key).is_some() {
+            key.to_string()
+        } else {
+            self.tasks.find_by_request_id(key)?
+        };
+        let handle = self.tasks.get(&actual_state)?;
+        self.tasks.cancel(&actual_state).then_some((actual_state, handle))
     }
 
     /// OAuth 明确失败：保留可读终态供 /wait 读取，清理仍使用启动 flow 的实例。
@@ -377,6 +503,9 @@ impl LoginService {
         let Some(handle) = self.tasks.get(state.trim()) else {
             return GatewayError::with_status(404, "登录任务不存在或已过期，请重新发起网页登录");
         };
+        if handle.snapshot().managed {
+            return GatewayError::bad_request("托管登录的授权错误必须通过当前步骤或真实回调监听校验");
+        }
         let message = oauth_callback_error_message(error);
         {
             let mut task = handle.lock();
@@ -408,6 +537,7 @@ impl LoginService {
         LoginTaskHandle {
             inner: Arc::new(Mutex::new(LoginTaskState {
                 state: None,
+                request_id: None,
                 auth_url: None,
                 allowed_hosts: Vec::new(),
                 validates_callback: false,
@@ -415,8 +545,12 @@ impl LoginService {
                 hint: None,
                 polling: false,
                 method_index: None,
+                sms: false,
+                managed: false,
+                persistence: Default::default(),
                 done: false,
                 error: None,
+                diagnostic: None,
                 session: None,
                 edition: edition.to_string(),
                 provider: provider.to_string(),
@@ -439,7 +573,7 @@ impl LoginService {
         let mut handle = self.new_handle_for_provider(edition, adapter.provider_id());
         handle.context = Some(Arc::new(LoginTaskContext {
             provider: adapter.provider_id(), adapter: Mutex::new(Some(adapter)),
-            store: self.store.clone(), proxy,
+            store: self.store.clone(), proxy, sms: Mutex::new(None), managed: Mutex::new(None),
         }));
         handle
     }
@@ -635,6 +769,12 @@ impl LoginService {
                 "登录任务不存在或已过期，请重新发起网页登录",
             ));
         };
+        if handle.snapshot().managed {
+            return Err(GatewayError::bad_request("托管登录请在当前步骤提交完整回调，不接受旧回调入口"));
+        }
+        if handle.snapshot().sms {
+            return Err(GatewayError::bad_request("短信登录请在当前步骤提交验证码，不接受网页回调"));
+        }
         let parsed_callback = url::Url::parse(callback_url).ok();
         if !handle.snapshot().validates_callback {
             if let Some(error) = parsed_callback.as_ref().and_then(|url| {
@@ -698,7 +838,7 @@ impl LoginService {
                 }
                 Ok(None) => None,
                 Err(error) => {
-                    finish_task_error(&handle, &error.message);
+                    fail_plugin_login_with_error(&handle, &error);
                     handle.cancel_provider_flow_locked(state).await;
                     return Err(error);
                 }
@@ -940,28 +1080,14 @@ pub(crate) fn persist_plugin_login(
     adapter: &dyn ProviderAdapter,
     account: &agent2api_provider_protocol::NormalizedAccount,
 ) -> Result<Option<String>, GatewayError> {
-    let mut task = handle.lock();
-    if task.canceled { return Ok(None); }
-    if task.done {
-        return match &task.error {
-            Some(error) => Err(GatewayError::bad_request(error)),
-            None => Ok(None),
-        };
-    }
-    if handle.adapter().is_some_and(|owner| !std::ptr::eq(owner.as_ref(), adapter)) {
-        return Err(GatewayError::with_status(500, "登录流程执行体不匹配，已拒绝保存账号"));
-    }
-    let proxy = handle.context.as_ref().and_then(|context| context.proxy.as_ref());
-    let account_id = match adapter.persist_login_account_with_proxy(account, proxy.map(|proxy| &proxy.config)) {
-        Ok(id) => id,
-        Err(error) => { mark_task_error(&mut task, &error.message); return Err(error); }
-    };
-    mark_adapter_login_done(&mut task, &account_id, proxy.is_some());
-    Ok(Some(account_id))
+    persistence::persist(handle, adapter, account)
 }
 
 fn finish_adapter_login(handle: &LoginTaskHandle, account_id: &str) -> Result<bool, GatewayError> {
     let mut task = handle.lock();
+    if task.managed {
+        return Err(GatewayError::with_status(409, "托管登录必须由本次保存回执确认完成"));
+    }
     if task.canceled { return Ok(false); }
     if task.done {
         return match &task.error {
@@ -982,6 +1108,7 @@ fn mark_adapter_login_done(task: &mut LoginTaskState, account_id: &str, proxy_sa
     task.done = true;
     task.polling = false;
     task.error = None;
+    task.diagnostic = None;
     task.hint = None;
     task.session = Some(json!({
         "accountUid": account_id, "nickname": Value::Null,
@@ -1027,6 +1154,7 @@ fn mark_task_error(task: &mut LoginTaskState, message: &str) {
     task.session = None;
     task.hint = None;
     task.error = Some(login_text(message));
+    task.diagnostic = None;
     task.finished_at = Some(logging::now_ms());
 }
 

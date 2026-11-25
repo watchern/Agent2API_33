@@ -17,7 +17,7 @@ use crate::server::core::model_meta;
 use crate::server::core::model_rules;
 use crate::server::core::models::model_id;
 use crate::server::core::providers::adapter::adapter_by_id;
-use crate::server::core::providers::{kind_from_id, kind_id, ProviderKind, PROVIDERS};
+use crate::server::core::providers::{kind_from_id, kind_id, ProviderKind};
 
 pub(crate) use routing::entry_id_in_manifest;
 pub use routing::{
@@ -96,6 +96,7 @@ fn build_manifest_for_provider(provider: &str) -> Vec<Value> {
     }
     for item in models.iter_mut() {
         model_meta::apply(item);
+        crate::server::core::upstream::web_tools::advertise(item);
     }
     let meta_at = started.elapsed();
     model_rules::apply_capability_overrides(provider, &mut models);
@@ -148,9 +149,15 @@ pub(crate) fn cached_manifest_len(kind: ProviderKind) -> usize {
         .unwrap_or(0)
 }
 
-/// 旧内置目录已迁入插件，网关不再持有按 kind 划分的刷新元数据。
-pub(crate) fn refresh_meta(_kind: ProviderKind) -> (bool, i64) {
-    (false, 0)
+/// 旧内置目录已迁入插件，网关不再持有按 kind 划分的刷新元数据；
+/// 只有三类订阅渠道自带刷新元数据。
+pub(crate) fn refresh_meta(kind: ProviderKind) -> (bool, i64) {
+    match kind {
+        ProviderKind::ClaudeSubscription => super::claude_subscription::refresh_meta(),
+        ProviderKind::ChatgptSubscription => super::chatgpt_subscription::refresh_meta(),
+        ProviderKind::CodexSubscription => super::codex_subscription::refresh_meta(),
+        _ => (false, 0),
+    }
 }
 
 pub(crate) fn refresh_meta_for_provider(provider: &str) -> (bool, i64) {
@@ -161,14 +168,11 @@ pub(crate) fn refresh_meta_for_provider(provider: &str) -> (bool, i64) {
     kind_from_id(provider).map(refresh_meta).unwrap_or_default()
 }
 
+/// 模型目录与路由解析只枚举当前有真实执行体的提供商（已加载的插件 + 内置订阅），
+/// 与 `accounts::store_view` 及 `providers::summary_json` 口径一致：缺插件或已停用的
+/// 提供商保留数据库中的账号与映射规则，但不以空目录「待获取」形态混入模型管理或标成悬空下线。
 fn all_provider_ids() -> Vec<String> {
-    let mut ids = super::executable_provider_ids();
-    for provider in PROVIDERS {
-        if !ids.iter().any(|id| id.eq_ignore_ascii_case(provider.id)) {
-            ids.push(provider.id.to_string());
-        }
-    }
-    ids
+    super::executable_provider_ids()
 }
 
 pub fn provider_available(store: &AccountStore, provider: &str) -> bool {

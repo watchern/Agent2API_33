@@ -42,13 +42,14 @@ fn lock() -> std::sync::MutexGuard<'static, State> {
 fn load(state: &mut State) {
     let root = super::super::root();
     if state.root == root { return; }
-    let mut cache = std::fs::metadata(root.join("catalog.json")).ok().filter(|meta| meta.len() <= 16 * 1024 * 1024)
-        .and_then(|_| std::fs::read(root.join("catalog.json")).ok())
+    let mut cache = std::fs::metadata(root.join("website-catalog.json")).ok().filter(|meta| meta.len() <= 16 * 1024 * 1024)
+        .and_then(|_| std::fs::read(root.join("website-catalog.json")).ok())
         .and_then(|bytes| serde_json::from_slice::<Cache>(&bytes).ok())
         .filter(|cache| cache.version == 1).unwrap_or_default();
     if cache.github.iter().any(|entry| !entry.is_provider()) {
+        // 旧版本可能留下非提供商条目，直接丢弃即可；
+        // 但不要顺带把 github_at 清零，否则升级后的第一次启动会立刻重扫全部仓库。
         cache.github.retain(Entry::is_provider);
-        cache.github_at = 0;
     }
     let entries = Arc::new(types::merge(&cache.market, &cache.github));
     *state = State { root, cache, entries, ..State::default() };
@@ -79,7 +80,7 @@ pub(super) fn persist() {
     load(&mut state);
     let Ok(bytes) = serde_json::to_vec(&state.cache) else { return; };
     if bytes.len() > 16 * 1024 * 1024 { return; }
-    if let Err(error) = super::super::storage::atomic_write(&state.root.join("catalog.json"), &bytes) {
+    if let Err(error) = super::super::storage::atomic_write(&state.root.join("website-catalog.json"), &bytes) {
         crate::server::logging::verbose("[PluginCatalog]", &format!("插件清单缓存保存失败：{error}"));
     }
 }
@@ -100,6 +101,6 @@ pub(super) fn status() -> Value {
         "marketCheckedAt": state.cache.market_at, "githubCheckedAt": state.cache.github_at,
         "marketError": state.cache.market_error, "githubError": state.cache.github_error,
         "marketRetryAt": state.cache.market_retry, "githubRetryAt": state.cache.github_retry,
-        "githubMissing": state.cache.github_missing, "topic": super::github::TOPIC,
+        "githubMissing": state.cache.github_missing, "topic": "magpie-plugin",
     })
 }

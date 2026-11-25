@@ -91,23 +91,34 @@ pub fn display_label(schedule: &Schedule) -> &str {
 
 /// 条目键是否存在（哪怕 `[]`）：存在即以存储为准，不再从旧字段合成
 fn stored_key_exists() -> bool {
-    match config::current().raw().get(auto_checkin::CONFIG_KEY) {
-        Some(Value::Object(map)) => map.contains_key("schedules"),
-        _ => false,
-    }
+    config::with_raw(|raw| {
+        matches!(
+            raw.get(auto_checkin::CONFIG_KEY),
+            Some(Value::Object(map)) if map.contains_key("schedules")
+        )
+    })
+    .unwrap_or(false)
 }
 
 /// 存储里的条目数组（原文；键不存在给 None）
 fn stored_entries() -> Option<Vec<Value>> {
-    auto_checkin::raw_object()
-        .get("schedules")
-        .and_then(Value::as_array)
-        .cloned()
+    config::with_raw(|raw| {
+        raw.get(auto_checkin::CONFIG_KEY)
+            .and_then(|value| value.get("schedules"))
+            .and_then(Value::as_array)
+            .cloned()
+    })
+    .flatten()
 }
 
 /// 单条的归一化：id / label / enabled / time / providers 逐个兜底。
 /// time 坏了回落 DEFAULT_TIME（调度起不来比时刻错更糟，与 auto_checkin 同）。
 fn normalize_schedule(raw: &Value) -> Schedule {
+    let known = auto_checkin::checkin_providers();
+    normalize_schedule_with(raw, &known)
+}
+
+fn normalize_schedule_with(raw: &Value, known: &[String]) -> Schedule {
     let id = raw
         .get("id")
         .and_then(Value::as_str)
@@ -129,7 +140,7 @@ fn normalize_schedule(raw: &Value) -> Schedule {
         .and_then(|value| auto_checkin::normalize_time(Some(value)).ok())
         .filter(|end| times::valid_range(&time, end))
         .unwrap_or_else(|| times::default_time_end(&time));
-    let providers = auto_checkin::normalize_providers(raw.get("providers"));
+    let providers = auto_checkin::normalize_providers_with(raw.get("providers"), known);
     Schedule {
         id,
         label,
@@ -137,7 +148,7 @@ fn normalize_schedule(raw: &Value) -> Schedule {
         time,
         time_end,
         providers,
-        provider_times: times::normalize_overrides(raw.get("providerTimes")),
+        provider_times: times::normalize_overrides_with(raw.get("providerTimes"), known),
         retry_time: times::normalize_retry_time(raw.get("retryTime")),
         retry_gap_minutes: retry_number(raw, "retryGapMinutes", 10, MAX_RETRY_GAP_MINUTES),
         retry_limit: retry_number(raw, "retryLimit", 3, MAX_RETRY_LIMIT),
@@ -180,7 +191,12 @@ fn legacy_schedule() -> Schedule {
 }
 
 fn legacy_schedule_of(raw: &Map<String, Value>) -> Schedule {
-    normalize_schedule(&json!({
+    let known = auto_checkin::checkin_providers();
+    legacy_schedule_of_with(raw, &known)
+}
+
+fn legacy_schedule_of_with(raw: &Map<String, Value>, known: &[String]) -> Schedule {
+    normalize_schedule_with(&json!({
         "id": DEFAULT_SCHEDULE_ID,
         "enabled": raw.get("enabled").cloned().unwrap_or(Value::Null),
         "time": raw.get("time").cloned().unwrap_or(Value::Null),
@@ -195,16 +211,30 @@ fn legacy_schedule_of(raw: &Map<String, Value>) -> Schedule {
         "lastFiredProviders": raw.get("lastFiredProviders").cloned().unwrap_or(Value::Null),
         "lastRetriedProviders": raw.get("lastRetriedProviders").cloned().unwrap_or(Value::Null),
         "lastResult": raw.get("lastResult").cloned().unwrap_or(Value::Null),
-    }))
+    }), known)
 }
 
 /// 全部条目（调度循环与快照的组装原料）。
 /// `schedules` 键缺失 → 旧字段合成的默认条目；存在（含 `[]`）→ 存储为准。
 pub fn list() -> Vec<Schedule> {
-    match stored_entries() {
-        Some(items) if !items.is_empty() => items.iter().map(normalize_schedule).collect(),
-        Some(_) => Vec::new(),
-        None => vec![legacy_schedule()],
+    let known = auto_checkin::checkin_providers();
+    let stored = config::with_raw(|raw| {
+        let Some(Value::Object(obj)) = raw.get(auto_checkin::CONFIG_KEY) else {
+            return (None, None);
+        };
+        match obj.get("schedules").and_then(Value::as_array) {
+            Some(items) => (Some(items.clone()), None),
+            None => (None, Some(obj.clone())),
+        }
+    });
+    match stored {
+        Some((Some(items), _)) if !items.is_empty() => items
+            .iter()
+            .map(|raw| normalize_schedule_with(raw, &known))
+            .collect(),
+        Some((Some(_), _)) => Vec::new(),
+        Some((None, Some(obj))) => vec![legacy_schedule_of_with(&obj, &known)],
+        _ => vec![legacy_schedule_of_with(&Map::new(), &known)],
     }
 }
 
@@ -575,6 +605,7 @@ fn record_providers_version() {
 }
 
 /// 插件首次声明每日签到时仅补一次；用户之后取消的范围不能被重新勾选。
+/// 对已上线且明确声明不支持每日签到的插件，清理其历史留存标记以免下架后继续占位。
 pub fn extend_plugin_providers_once() -> bool {
     let available: Vec<String> = auto_checkin::checkin_providers()
         .into_iter()
@@ -584,8 +615,22 @@ pub fn extend_plugin_providers_once() -> bool {
         .get("pluginProvidersSeen")
         .and_then(Value::as_array)
         .into_iter().flatten().filter_map(Value::as_str).map(str::to_string).collect();
-    let added: Vec<String> = available.into_iter().filter(|id| !known.contains(id)).collect();
-    if added.is_empty() { return false; }
+    let retained: Vec<String> = known
+        .iter()
+        .filter(|id| {
+            !crate::server::core::plugin_host::serves_provider(id)
+                || auto_checkin::plugin_supports_daily_checkin(id)
+        })
+        .cloned()
+        .collect();
+    let pruned = retained.len() != known.len();
+    let added: Vec<String> = available.into_iter().filter(|id| !retained.contains(id)).collect();
+    if added.is_empty() {
+        if pruned {
+            auto_checkin::write_state(json!({ "pluginProvidersSeen": retained }));
+        }
+        return false;
+    }
     let mut changed = false;
     match stored_entries() {
         Some(mut entries) => {
@@ -615,7 +660,7 @@ pub fn extend_plugin_providers_once() -> bool {
             if changed { auto_checkin::write_state(json!({ "providers": providers })); }
         }
     }
-    let mut seen = known;
+    let mut seen = retained;
     seen.extend(added);
     auto_checkin::write_state(json!({ "pluginProvidersSeen": seen }));
     changed

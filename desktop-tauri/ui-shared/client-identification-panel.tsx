@@ -121,13 +121,13 @@ export function ClientIdentificationPanel({ api, t, active = true }: { api: Clie
               <div className='flex items-center gap-3 px-4 py-3'>
                 <Switch checked={view.config.acceptDeclarations} disabled={busy} aria-label={t('接受调用方来源声明')} onCheckedChange={enabled => {
                   if (!enabled) { void save({ ...view.config, acceptDeclarations: false }); return }
-                  setConfirmation({ revision: view.revision, title: t('开启来源声明'), message: t('开启后，调用方可以用专用请求头声明已登记的客户端名称。这不是身份认证，只用于日志和统计，不会获得额外权限。'), config: { ...view.config, acceptDeclarations: true } })
+                  setConfirmation({ revision: view.revision, title: t('开启来源声明'), message: t('开启后，调用方可声明已登记的客户端名称，用于日志、统计和提示词规则。这不是身份认证，不会获得额外权限。'), config: { ...view.config, acceptDeclarations: true } })
                 }} />
                 <span className='text-[13px]'>{t('接受调用方来源声明')}</span>
                 <span className='ml-auto text-[12px] text-muted-foreground'>{view.config.acceptDeclarations ? t('已开启') : t('已关闭')}</span>
               </div>
               <div className='px-4 py-3'>
-                <p className='max-w-[64ch] text-[12px] leading-[1.7] text-muted-foreground'>{t('开启后，调用方可以用专用请求头声明已登记的客户端名称。这不是身份认证，只用于日志和统计，不会获得额外权限。')}</p>
+                <p className='max-w-[64ch] text-[12px] leading-[1.7] text-muted-foreground'>{t('开启后，调用方可声明已登记的客户端名称，用于日志、统计和提示词规则。这不是身份认证，不会获得额外权限。')}</p>
                 <div className='mt-2.5 flex flex-wrap items-center gap-2 text-[12px] text-muted-foreground'>
                   <span>{t('示例请求头')}</span>
                   <code className={CHIP}>{view.declarationHeader}: hermes</code>
@@ -223,7 +223,10 @@ export function ClientIdentificationPanel({ api, t, active = true }: { api: Clie
     {editor && view ? <ClientRuleEditor api={api} view={view} rule={editor.rule} t={t} onClose={() => setEditor(null)} onSaved={next => { setView(next); setEditor(null) }} /> : null}
     <Dialog open={Boolean(rename)} onOpenChange={open => { if (!open && !busy) setRename(null) }}><DialogContent>
       <DialogHeader><DialogTitle>{t('重命名客户端分类')}</DialogTitle></DialogHeader>
-      <DialogBody><Input value={rename?.name || ''} maxLength={80} disabled={busy} onChange={event => setRename(previous => previous ? { ...previous, name: event.currentTarget.value } : null)} aria-label={t('客户端名称')} />{error ? <Alert variant='destructive'>{error}</Alert> : null}</DialogBody>
+      <DialogBody><Input value={rename?.name || ''} maxLength={80} disabled={busy} onChange={event => {
+        const name = event.currentTarget.value
+        setRename(previous => previous ? { ...previous, name } : null)
+      }} aria-label={t('客户端名称')} />{error ? <Alert variant='destructive'>{error}</Alert> : null}</DialogBody>
       <DialogFooter><Button variant='ghost' disabled={busy} onClick={() => setRename(null)}>{t('取消')}</Button><Button disabled={busy || !rename?.name.trim()} onClick={() => { if (view && rename) void save({ ...view.config, clients: view.config.clients.map(client => client.id === rename.id ? { ...client, name: rename.name.trim() } : client) }) }}>{t('保存')}</Button></DialogFooter>
     </DialogContent></Dialog>
     <Dialog open={Boolean(confirmation)} onOpenChange={open => { if (!open && !busy) setConfirmation(null) }}><DialogContent>

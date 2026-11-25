@@ -12,16 +12,18 @@
 use serde_json::{json, Value};
 
 use super::normalize::{
-    dedupe_strings, deduplicate_sources, normalize_fetch_urls, web_source_dedup_key,
-    SourceDraft, FETCH_NOTICE, MAX_BATCH_ITEMS, MAX_GLOBAL_SOURCES, SEARCH_NOTICE,
+    dedupe_strings, deduplicate_sources, normalize_fetch_urls, truncate_query, web_source_dedup_key,
+    SourceDraft, FETCH_NOTICE, MAX_BATCH_ITEMS, MAX_QUERY_RESULT_LIMIT, SEARCH_NOTICE,
 };
 use super::{account_search, providers};
 use crate::server::core::account_store::AccountStore;
 use crate::server::core::key_scope::{self, KeyScope};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SearchErrorCode {
     InvalidProviderKey,
+    QuotaExhausted,
     RateLimited,
     TimedOut,
     NoResults,
@@ -35,6 +37,7 @@ impl SearchErrorCode {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::InvalidProviderKey => "invalid_provider_key",
+            Self::QuotaExhausted => "quota_exhausted",
             Self::RateLimited => "rate_limited",
             Self::TimedOut => "timed_out",
             Self::NoResults => "no_results",
@@ -49,6 +52,7 @@ impl SearchErrorCode {
         match self {
             Self::InvalidInput => 400,
             Self::PermissionDenied => 403,
+            Self::QuotaExhausted => 402,
             Self::RateLimited => 429,
             Self::Configuration => 503,
             Self::TimedOut => 504,
@@ -61,11 +65,12 @@ impl SearchErrorCode {
 pub struct SearchError {
     pub code: SearchErrorCode,
     pub message: String,
+    pub reset_at: Option<i64>,
 }
 
 impl SearchError {
     pub fn new(code: SearchErrorCode, message: impl Into<String>) -> Self {
-        Self { code, message: message.into() }
+        Self { code, message: message.into(), reset_at: None }
     }
 }
 
@@ -110,6 +115,89 @@ fn source_json(number: usize, source: &SourceDraft) -> Value {
     })
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LongQueryPolicy {
+    Truncate,
+    Skip,
+    Error,
+}
+
+impl LongQueryPolicy {
+    pub fn parse(value: &str) -> Self {
+        match value {
+            "skip" => Self::Skip,
+            "error" => Self::Error,
+            _ => Self::Truncate,
+        }
+    }
+}
+
+pub(super) fn apply_query_policy(
+    query: &str,
+    max_chars: Option<usize>,
+    policy: LongQueryPolicy,
+) -> Result<String, SearchError> {
+    let Some(max_chars) = max_chars else {
+        return Ok(query.to_string());
+    };
+    if query.chars().count() <= max_chars {
+        return Ok(query.to_string());
+    }
+    match policy {
+        LongQueryPolicy::Truncate => Ok(truncate_query(query, max_chars)),
+        LongQueryPolicy::Skip => Err(SearchError::new(
+            SearchErrorCode::InvalidInput,
+            format!("搜索词超过 {max_chars} 个字符上限，已跳过"),
+        )),
+        LongQueryPolicy::Error => Err(SearchError::new(
+            SearchErrorCode::InvalidInput,
+            format!("该搜索来源最多接受 {max_chars} 个字符"),
+        )),
+    }
+}
+
+fn parse_positive_limit(value: &Value, field: &str) -> Result<usize, SearchError> {
+    let Some(number) = value.as_u64() else {
+        return Err(SearchError::new(
+            SearchErrorCode::InvalidInput,
+            format!("{field} must be an integer between 1 and {MAX_QUERY_RESULT_LIMIT}"),
+        ));
+    };
+    let Ok(limit) = usize::try_from(number) else {
+        return Err(SearchError::new(
+            SearchErrorCode::InvalidInput,
+            format!("{field} must be an integer between 1 and {MAX_QUERY_RESULT_LIMIT}"),
+        ));
+    };
+    if !(1..=MAX_QUERY_RESULT_LIMIT).contains(&limit) {
+        return Err(SearchError::new(
+            SearchErrorCode::InvalidInput,
+            format!("{field} must be an integer between 1 and {MAX_QUERY_RESULT_LIMIT}"),
+        ));
+    }
+    Ok(limit)
+}
+
+/// 解析搜索请求体中的单条结果上限（支持 `limit` 及别名 `max_results`）。
+pub fn extract_limit(payload: &Value) -> Result<Option<usize>, SearchError> {
+    let limit = match payload.get("limit") {
+        None | Some(Value::Null) => None,
+        Some(value) => Some(parse_positive_limit(value, "limit")?),
+    };
+    let alias = match payload.get("max_results") {
+        None | Some(Value::Null) => None,
+        Some(value) => Some(parse_positive_limit(value, "max_results")?),
+    };
+    match (limit, alias) {
+        (Some(a), Some(b)) if a != b => Err(SearchError::new(
+            SearchErrorCode::InvalidInput,
+            "limit and max_results must match when both are provided",
+        )),
+        (Some(a), _) => Ok(Some(a)),
+        (None, b) => Ok(b),
+    }
+}
+
 /// 校验 queries / urls 的批量入参（1~10 条非空字符串）
 pub fn batch_items(values: Option<&Value>, field: &str) -> Result<Vec<String>, SearchError> {
     let Some(items) = values.and_then(Value::as_array) else {
@@ -149,10 +237,12 @@ async fn search_one_query(
     query: String,
     sources_to_use: &[account_search::SearchSource],
     timeout: u64,
+    limit: Option<usize>,
+    policy: LongQueryPolicy,
     skipped: &[String],
 ) -> QueryOutcome {
     let calls = sources_to_use.iter().map(|source| async {
-        (source.provider(), source.search(store, &query, timeout).await)
+        (source.provider(), source.search(store, &query, timeout, limit, policy).await)
     });
     let outcomes = futures::future::join_all(calls).await;
     let mut warnings = skipped.to_vec();
@@ -201,7 +291,12 @@ pub struct SearchRun {
 }
 
 /// 执行一次批量搜索
-pub async fn run_search(store: &AccountStore, scope: Option<&KeyScope>, queries: Vec<String>) -> Result<SearchRun, SearchError> {
+pub async fn run_search(
+    store: &AccountStore,
+    scope: Option<&KeyScope>,
+    queries: Vec<String>,
+    limit: Option<usize>,
+) -> Result<SearchRun, SearchError> {
     let queries: Vec<String> = queries.into_iter().map(|query| query.trim().to_string()).collect();
     if queries.iter().any(String::is_empty) {
         return Err(SearchError::new(SearchErrorCode::InvalidInput, "Query strings must not be empty"));
@@ -209,6 +304,8 @@ pub async fn run_search(store: &AccountStore, scope: Option<&KeyScope>, queries:
     let queries = dedupe_strings(queries);
 
     let config = super::load();
+    let max_global_sources = config.max_global_sources;
+    let policy = LongQueryPolicy::parse(&config.long_query_policy);
     let timeout = config.timeouts.get(super::WEB_SEARCH_SERVICE_ID).copied().unwrap_or(30)
         .clamp(super::TIMEOUT_MIN_SECONDS, super::TIMEOUT_MAX_SECONDS);
     let mut sources = Vec::new();
@@ -216,6 +313,10 @@ pub async fn run_search(store: &AccountStore, scope: Option<&KeyScope>, queries:
     let mut denied = false;
     // 一批请求只取一次配置与能力快照。账号引用失效时不改选其他账号。
     for provider in &config.selection.search {
+        if !super::is_search_provider(provider) {
+            skipped.push(format!("{provider}: 搜索提供商插件未安装或未启用"));
+            continue;
+        }
         let entry = config.providers.get(provider).cloned().unwrap_or_default();
         if !entry.enabled { continue; }
         if super::is_account_provider(provider) && !key_scope::allows_provider(scope, provider) {
@@ -236,7 +337,7 @@ pub async fn run_search(store: &AccountStore, scope: Option<&KeyScope>, queries:
     }
     let active: Vec<String> = sources.iter().map(|source| source.provider().to_string()).collect();
     let outcomes = futures::future::join_all(
-        queries.iter().cloned().map(|query| search_one_query(store, query, &sources, timeout, &skipped)),
+        queries.iter().cloned().map(|query| search_one_query(store, query, &sources, timeout, limit, policy, &skipped)),
     ).await;
 
     let mut index: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
@@ -244,7 +345,7 @@ pub async fn run_search(store: &AccountStore, scope: Option<&KeyScope>, queries:
     let mut searches = Vec::new();
     let mut successful = 0usize;
 
-    for item in outcomes {
+    for mut item in outcomes {
         if let Some(error) = item.error {
             let mut entry = json!({
                 "query": item.query,
@@ -260,11 +361,14 @@ pub async fn run_search(store: &AccountStore, scope: Option<&KeyScope>, queries:
         successful += 1;
         let mut results = Vec::new();
         let mut duplicates = Vec::new();
+        let mut truncated = 0usize;
         for draft in item.sources {
             let key = web_source_dedup_key(&draft.url);
             let existing = if key.is_empty() { None } else { index.get(&key).copied() };
-            if existing.is_some() || next_number > MAX_GLOBAL_SOURCES {
+            if existing.is_some() {
                 duplicates.push(draft);
+            } else if next_number > max_global_sources {
+                truncated += 1;
             } else {
                 let number = next_number;
                 next_number += 1;
@@ -274,10 +378,16 @@ pub async fn run_search(store: &AccountStore, scope: Option<&KeyScope>, queries:
                 results.push((number, draft));
             }
         }
+        if truncated > 0 {
+            item.warnings.push(format!("单次汇总来源已达 {max_global_sources} 条上限，已截断其余 {truncated} 条新结果"));
+        }
         let mut entry = json!({
             "query": item.query,
             "results": results.iter().map(|(number, source)| source_json(*number, source)).collect::<Vec<_>>(),
         });
+        if truncated > 0 {
+            entry["truncatedCount"] = json!(truncated);
+        }
         if !item.warnings.is_empty() {
             entry["warnings"] = json!(item.warnings);
         }
@@ -318,7 +428,7 @@ pub struct FetchRun {
 /// 执行一次批量抓取
 pub async fn run_fetch(urls: Vec<String>) -> Result<FetchRun, SearchError> {
     let provider = super::load().selection.fetch;
-    if !super::is_fetch_provider(&provider) || !super::ready_providers().contains(&provider.as_str()) {
+    if !super::is_fetch_provider(&provider) || !super::configured_provider(&provider) {
         return Err(SearchError::new(
             SearchErrorCode::Configuration,
             format!(
@@ -326,12 +436,6 @@ pub async fn run_fetch(urls: Vec<String>) -> Result<FetchRun, SearchError> {
             ),
         ));
     }
-    let Some(key) = super::provider_key(&provider) else {
-        return Err(SearchError::new(
-            SearchErrorCode::Configuration,
-            format!("Configured fetch provider \"{provider}\" is not configured with an API key"),
-        ));
-    };
 
     let (accepted, rejected) = normalize_fetch_urls(urls);
     if accepted.is_empty() {
@@ -342,7 +446,7 @@ pub async fn run_fetch(urls: Vec<String>) -> Result<FetchRun, SearchError> {
     }
     let normalized: Vec<String> = accepted.iter().map(|(_, normalized)| normalized.clone()).collect();
     let timeout = super::timeout_seconds(super::WEB_SEARCH_SERVICE_ID);
-    let (pages, mut errors) = providers::fetch(&provider, &key, &normalized, timeout).await?;
+    let (pages, mut errors) = providers::fetch(&provider, &normalized, timeout).await?;
     let by_normalized: std::collections::HashMap<&str, &str> = accepted
         .iter()
         .map(|(input, normalized)| (normalized.as_str(), input.as_str()))

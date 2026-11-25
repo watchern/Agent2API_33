@@ -46,10 +46,9 @@ function labelOf(account: AccountLike | null | undefined): string {
   return displayNameOf(account) || account?.id || ''
 }
 
-export function AccountSettingsDialog({ id, onClose, initialAccount, initialPane = 'basic', routeContext }: {
+export function AccountSettingsDialog({ id, onClose, initialAccount, routeContext }: {
   id: string; onClose: () => void
   initialAccount?: AccountRecord
-  initialPane?: PaneId
   routeContext?: React.ReactNode
 }) {
   const [account, setAccount] = React.useState(() => initialAccount || findAccount(id))
@@ -59,8 +58,7 @@ export function AccountSettingsDialog({ id, onClose, initialAccount, initialPane
   /** 账号级自定义 User-Agent 草稿（空串 = 用该家自己的默认值） */
   const [userAgent, setUserAgent] = React.useState(account?.userAgent || '')
   const uaPresets = useUserAgentPresets()
-  // 会话式家由插件自己拼出站头，网关覆盖不到 —— 整段不渲染
-  const uaEditable = userAgentEditable(providerOf(account || { id }))
+  const uaEditable = account?.userAgentOverridable ?? userAgentEditable(providerOf(account || { id }))
   const [proxyDraft, setProxyDraft] = React.useState<ProxyDraft>(() => draftOfProxy(account?.proxy))
   const [balanceToken, setBalanceToken] = React.useState('')
   // ZCode 的「使用哪个套餐」草稿（非 ZCode 账号恒为空串，那一段也不渲染）
@@ -87,7 +85,7 @@ export function AccountSettingsDialog({ id, onClose, initialAccount, initialPane
   // 「限制器」段的草稿（余额 / Token 规则列表）：与查询设置同一 gating
   const [limiterDraft, setLimiterDraft] = React.useState<LimiterGroup[]>(() => limiterDraftOf(account))
   // 分组导航的当前页（弹窗按账号 id 挂载，切账号自然回到「基本」）
-  const [pane, setPane] = React.useState<PaneId>(initialPane)
+  const [pane, setPane] = React.useState<PaneId>('basic')
   // 并发上限草稿（原列表 ⋯ 菜单的 conc-dialog 迁入「基本」分组）：0~999，0 = 不限
   const [concDraft, setConcDraft] = React.useState(() => String(Number(account?.maxConcurrent) || 0))
   const [confirming, setConfirming] = React.useState(false)
@@ -461,7 +459,7 @@ export function AccountSettingsDialog({ id, onClose, initialAccount, initialPane
       const nextUserAgent = userAgent.trim()
       const saved = await updateAccountConfirmed(id, {
         ...(nextName !== target.name ? { name: nextName } : {}),
-        ...(nextUserAgent !== (target.userAgent || '').trim() ? { userAgent: nextUserAgent } : {}),
+        ...(uaEditable && nextUserAgent !== (target.userAgent || '').trim() ? { userAgent: nextUserAgent } : {}),
         enabled,
         allowRouteSkip,
         proxy,
@@ -600,7 +598,7 @@ export function AccountSettingsDialog({ id, onClose, initialAccount, initialPane
                 </span>
               </div>
               <div ref={paneScroll} className='acct-dlg-scroll' aria-busy={busy}>
-                <div className='acct-dlg-pane' inert={interactionBusy ? true : undefined}>
+                <div className='acct-dlg-pane' inert={busy || confirming ? true : undefined}>
                   {pane === 'basic' ? (
                     <>
                       <SettingGroup title={t('账号信息')}>

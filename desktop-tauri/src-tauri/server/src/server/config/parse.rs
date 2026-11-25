@@ -308,6 +308,12 @@ pub(super) fn scheduled_from(map: &Map<String, Value>) -> ScheduledSettings {
             INTERVAL_MIN_MINUTES,
             INTERVAL_MAX_MINUTES,
         ),
+        magpie_plugin_check: task(
+            KEY_MAGPIE_PLUGIN_CHECK,
+            defaults.magpie_plugin_check.interval,
+            INTERVAL_MIN_MINUTES,
+            INTERVAL_MAX_MINUTES,
+        ),
     }
 }
 
@@ -329,7 +335,7 @@ pub(super) fn retry_from(map: &Map<String, Value>) -> RetrySettings {
             KEY_RETRY_ACCOUNT_SWITCH_COUNT,
             defaults.account_switch_count,
             RETRY_MIN_COUNT,
-            RETRY_MAX_COUNT,
+            RETRY_MAX_SWITCH_COUNT,
         ),
         interval_seconds: bounded_int_field(
             map,

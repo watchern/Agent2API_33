@@ -80,6 +80,8 @@ mod record;
 // 对外暴露面收敛在这一层。
 mod report;
 mod cache_report;
+mod counts;
+mod filters_cache;
 mod model_recency;
 mod routing;
 mod trace;
@@ -117,8 +119,11 @@ use retention::RetentionBounds;
 pub use retention::Retention;
 // 拆到子模块的三样，这里引回：record / usage_summary 的折算入口、
 // remap 的库操作体、报表装配（均为 `pub(super)`，见 aggregate.rs 的模块头）
-use aggregate::{fold_into_daily, remap_model_days, summarize};
-use report::{entry_json, provider_label, CACHE_WINDOWS};
+use aggregate::{
+    compute_day_reprice, fold_into_daily, mark_pricing_backfilled, pricing_candidate_days,
+    read_day_for_reprice, remap_model_days, summarize, write_day_reprice,
+};
+use report::{entry_json, list_entry_json, provider_label, CACHE_WINDOWS};
 
 // CompactStart 在此 re-export：api::stats_api 的 compact 路由按它分派响应。
 // VacuumStatus 只在本模块内（字段类型 / maintenance 的方法）可见。
@@ -226,6 +231,8 @@ pub struct RequestStats {
     /// 上次做保留期裁剪的毫秒时间戳；低流量时用它兜底。
     last_maintenance_ms: AtomicI64,
     model_recency: Arc<model_recency::ModelRecency>,
+    counts: counts::CountsCache,
+    filters_cache: filters_cache::FilterOptionsCache,
 }
 
 impl RequestStats {
@@ -266,6 +273,8 @@ impl RequestStats {
             maintenance_writes: AtomicU64::new(0),
             last_maintenance_ms: AtomicI64::new(0),
             model_recency: Arc::new(model_recency::ModelRecency::default()),
+            counts: counts::CountsCache::default(),
+            filters_cache: filters_cache::FilterOptionsCache::new(),
         }
     }
 
@@ -475,10 +484,24 @@ impl RequestStats {
                 if let Some(key) = entry { row["label"] = json!(key.name); }
             }
         }
+        let pricing = crate::server::core::model_pricing::settings();
+        let fx_snap = crate::server::core::model_pricing::fx::current_rate_soon();
+        if let Some(target) = summary.as_object_mut() {
+            target.insert("currency".to_string(), json!(pricing.currency));
+            target.insert("exchangeRate".to_string(), json!(fx_snap.rate));
+            target.insert("fx".to_string(), fx_snap.to_json(now));
+        }
         if let (Some(target), Some(sources)) = (summary.as_object_mut(), sources.as_object()) {
             target.extend(sources.clone());
         }
         summary
+    }
+
+    pub fn today_request_count(&self) -> Value {
+        let date = date_key(today());
+        let guard = self.guard();
+        let requests = self.with_conn(&guard, |conn| daily::request_count(conn, &date)).unwrap_or(0);
+        json!({ "range": "today", "startDate": date, "endDate": date, "overview": { "requests": requests } })
     }
 
     /// 明细查询：倒序（新在前）分页。
@@ -503,66 +526,107 @@ impl RequestStats {
         // limit 夹在 [1, MAX_LIMIT]：前端传 0 或十万都不该让接口躺平
         let limit = filter.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
         let plan = sql::FilterPlan::of(filter);
+        enum PageRows {
+            Full(Vec<RequestEntry>),
+            List(Vec<record::RequestListRow>),
+        }
         let loaded = {
             let guard = self.guard();
-            self.with_conn(&guard, |conn| {
-                // 三个计数共用一次扫描（见 `sql::counts` 的说明）。
-                let (total, matched, running) = sql::counts(conn, &plan)?;
-                let entries = sql::select_page_desc(conn, &plan, filter.offset, limit)?;
-                Ok((total, matched, running, entries))
+            self.with_conn_mut(&guard, |conn| {
+                let tx = conn.transaction()?;
+                let page_rows = if filter.list_only {
+                    PageRows::List(sql::select_page_list_desc(&tx, &plan, filter.offset, limit)?)
+                } else {
+                    PageRows::Full(sql::select_page_desc(&tx, &plan, filter.offset, limit)?)
+                };
+                let external = tx.pragma_query_value(None, "data_version", |row| row.get(0))?;
+                let version = counts::Version {
+                    requests: self.db.as_ref().map_or(0, Db::request_revision),
+                    database: crate::server::db::query_cache_generation(),
+                    external,
+                };
+                let (total, matched, running) = self.counts.read(&tx, version, &plan)?;
+                tx.commit()?;
+                Ok((total, matched, running, page_rows))
             })
         };
-        let (total, matched, running, entries) = loaded.unwrap_or((0, 0, 0, Vec::new()));
-        // 每行经 `entry_json` 补两个派生字段：`providerLabel`（id → label 的换算；
-        // 换算处与汇总的 providers 数组同一个函数，两处名字必然一致）与
-        // `phaseElapsedMs`（在途行「当前阶段已持续多久」，读取那一刻现算 ——
-        // 理由见那个函数的说明）。汇总是**反序列化回 Value**，不是另一套结构：
-        // 契约字段仍由 record.rs 的 serde 注解决定，这里只加不删
-        let rows: Vec<Value> = entries.iter().map(entry_json).collect();
+        let (total, matched, running, page_rows) = loaded.unwrap_or((0, 0, 0, PageRows::Full(Vec::new())));
+        let pricing = crate::server::core::model_pricing::settings();
+        let fx_snap = crate::server::core::model_pricing::fx::current_rate_soon();
+        let rows: Vec<Value> = match page_rows {
+            PageRows::List(entries) => entries.iter().map(|row| list_entry_json(row, &pricing)).collect(),
+            PageRows::Full(entries) => entries.iter().map(|entry| entry_json(entry, &pricing)).collect(),
+        };
         json!({
             "entries": rows,
             "total": total,
             "matched": matched,
             "running": running,
+            "currency": pricing.currency,
+            "exchangeRate": fx_snap.rate,
         })
     }
 
-    /// 筛选下拉的候选清单：明细里出现过的模型名与 provider（各按出现次数降序）。
-    ///
-    /// 形状 `{models: ["…"], providers: [{id, label}]}` —— provider 带 label 是
-    /// 为了让前端不必维护第二份 id → 展示名映射（与明细行的 `providerLabel`
-    /// 同一个换算函数，见 `report::provider_label`）。
-    ///
-    /// ── 为什么是独立端点而不是塞进列表响应 ──────────────────────
-    /// 候选清单与「这一页显示什么」无关：它只在进页面时拉一次，之后翻页 / 换筛选
-    /// 都不该重算（一次全表 GROUP BY 挂到每个分页请求上，是白烧）。反过来，
-    /// 列表响应里塞一份清单会让每页多背几百个字符串，而消费方一个都用不上。
-    ///
-    /// 降级：库不可用时给空清单（`{models: [], providers: []}`）——
-    /// 前端据此只保留「全部」选项，筛选器退化成不可用但界面不报错；
-    /// 与 `query_requests` 的空表降级同一取向（少一个功能好过整页失败）。
-    pub fn filter_options(&self) -> Value {
+    /// 按 `rowId` 或 `id` (+ 可选 `ts`) 读取单条请求的完整详情（含选路快照 / 尝试明细 / 敏感词 / 识别证据）。
+    pub fn request_detail(&self, row_id: Option<i64>, id: Option<&str>, ts: Option<i64>) -> Option<Value> {
         let loaded = {
             let guard = self.guard();
-            self.with_conn(&guard, |conn| {
-                let (models, providers) = sql::select_filter_options(conn, MAX_FILTER_OPTIONS)?;
-                let sources = sql::source_filter_options(conn, MAX_FILTER_OPTIONS)?;
-                Ok((models, providers, sources))
+            self.with_conn(&guard, |conn| match row_id.filter(|value| *value > 0) {
+                Some(row_id) => sql::select_detail_by_row_id(conn, row_id),
+                None => match id.map(str::trim).filter(|value| !value.is_empty()) {
+                    Some(id) => sql::select_detail_by_id(conn, id, ts),
+                    None => Ok(None),
+                },
             })
-        };
-        let (models, providers, mut sources) = loaded.unwrap_or((Vec::new(), Vec::new(), json!({})));
-        if let Some(clients) = sources["clients"].as_array_mut() {
-            for client in clients {
-                client["label"] = json!(crate::server::core::client::display_name(
-                    client["value"].as_str().unwrap_or(""), client["label"].as_str().unwrap_or(""),
-                ));
-            }
+        }?;
+        let (row_id, entry) = loaded?;
+        let pricing = crate::server::core::model_pricing::settings();
+        let mut value = entry_json(&entry, &pricing);
+        if let Some(object) = value.as_object_mut() {
+            object.insert("rowId".to_string(), json!(row_id));
+            object.insert("detailsLoaded".to_string(), Value::Bool(true));
         }
-        let providers: Vec<Value> = providers
-            .into_iter()
-            .map(|id| json!({ "id": id, "label": provider_label(&id) }))
-            .collect();
-        json!({ "models": models, "providers": providers, "clients": sources["clients"], "apiKeys": sources["apiKeys"] })
+        Some(value)
+    }
+
+    /// 筛选下拉的候选清单：明细里出现过的模型名与 provider（各按出现次数降序）。
+    pub fn filter_options(&self) -> Value {
+        let database = crate::server::db::query_cache_generation();
+        let requests = self.db.as_ref().map_or(0, Db::request_revision);
+        if let Some(cached) = self.filters_cache.read_fast(database, requests) {
+            return cached;
+        }
+        let guard = self.guard();
+        let database = crate::server::db::query_cache_generation();
+        let requests = self.db.as_ref().map_or(0, Db::request_revision);
+        if let Some(cached) = self.filters_cache.read_fast(database, requests) {
+            return cached;
+        }
+        let loaded = self.with_conn(&guard, |conn| {
+            self.filters_cache.read_or_compute(conn, database, requests, MAX_FILTER_OPTIONS, |conn| {
+                let (models, providers) = sql::select_filter_options(conn, MAX_FILTER_OPTIONS)?;
+                let mut sources = sql::source_filter_options(conn, MAX_FILTER_OPTIONS)?;
+                if let Some(clients) = sources["clients"].as_array_mut() {
+                    for client in clients {
+                        client["label"] = json!(crate::server::core::client::display_name(
+                            client["value"].as_str().unwrap_or(""),
+                            client["label"].as_str().unwrap_or(""),
+                        ));
+                    }
+                }
+                let providers: Vec<Value> = providers
+                    .into_iter()
+                    .map(|id| json!({ "id": id, "label": provider_label(&id) }))
+                    .collect();
+                Ok(json!({
+                    "models": models,
+                    "providers": providers,
+                    "clients": sources["clients"],
+                    "apiKeys": sources["apiKeys"],
+                }))
+            })
+        });
+        loaded.unwrap_or_else(|| json!({ "models": [], "providers": [], "clients": [], "apiKeys": [] }))
     }
 
     /// 存储概况（排障与报表页脚用）
@@ -581,13 +645,17 @@ impl RequestStats {
     pub fn prune(&self) {
         let bounds = self.retention_bounds();
         let guard = self.guard();
-        let _ = self.with_conn_mut(&guard, |conn| {
+        let ok = self.with_conn_mut(&guard, |conn| {
             let tx = conn.transaction()?;
             sql::delete_expired_requests(&tx, bounds.requests_ms)?;
             retention::trim_requests(&tx, bounds.request_count)?;
             daily::delete_daily_before(&tx, &bounds.daily_key)?;
             tx.commit()
-        });
+        }).is_some();
+        if ok {
+            self.filters_cache.invalidate();
+            crate::server::core::panel_events::notify_requests();
+        }
         // 显式裁剪（启动 / 改保留期）之后重置节拍：下一次记账从新的一批开始。
         self.maintenance_writes.store(0, Ordering::Relaxed);
         self.last_maintenance_ms.store(now_ms(), Ordering::Relaxed);
@@ -699,18 +767,81 @@ impl RequestStats {
             self.with_conn_mut(&guard, remap_model_days)
         };
         match outcome {
-            Some(changed) if !changed.is_empty() => logging::log(
+            Some(changed) if !changed.is_empty() => {
+                self.filters_cache.invalidate();
+                crate::server::core::panel_events::notify_requests();
+                logging::log(
                 "[Stats]",
                 &format!(
                     "🔁 已按上游真名重算 {} 天的模型用量（此前按请求名 / 映射别名累计）：{}",
                     changed.len(),
                     changed.join("、")
                 ),
-            ),
+            );
+            }
             Some(_) => {}
             // Err（已由 with_conn_mut 打控制台日志）与库不可用都在这一支：
             // 标记没写，下次启动自然再试，订正不会因此丢
             None => {}
+        }
+    }
+
+    pub fn backfill_pricing_once(&self) {
+        self.reprice_days_chunked(true);
+    }
+
+    pub fn reprice_recent_days(&self) {
+        self.reprice_days_chunked(false);
+    }
+
+    fn reprice_days_chunked(&self, only_if_unmarked: bool) {
+        let days = {
+            let guard = self.guard();
+            self.with_conn(&guard, |conn| pricing_candidate_days(conn, only_if_unmarked))
+        };
+        let Some(Some(days)) = days else {
+            return;
+        };
+        let settings = crate::server::core::model_pricing::settings();
+        let mut all_ok = true;
+        let mut any_updated = false;
+        for day in days {
+            let loaded = {
+                let guard = self.guard();
+                self.with_conn(&guard, |conn| read_day_for_reprice(conn, day))
+            };
+            let Some((key, items, aggregate_requests)) = loaded else {
+                all_ok = false;
+                break;
+            };
+            if items.is_empty() {
+                continue;
+            }
+            let (updates, rebuilt) =
+                compute_day_reprice(key, items, aggregate_requests, &settings);
+            if updates.is_empty() && rebuilt.is_none() {
+                continue;
+            }
+            let written = {
+                let guard = self.guard();
+                self.with_conn_mut(&guard, |conn| {
+                    write_day_reprice(conn, &updates, rebuilt.as_ref())
+                })
+            };
+            if written.is_none() {
+                all_ok = false;
+                break;
+            }
+            if rebuilt.is_some() || !updates.is_empty() {
+                any_updated = true;
+            }
+        }
+        if only_if_unmarked && all_ok {
+            let guard = self.guard();
+            let _ = self.with_conn(&guard, mark_pricing_backfilled);
+        }
+        if any_updated || (only_if_unmarked && all_ok) {
+            crate::server::core::panel_events::notify_requests();
         }
     }
 }

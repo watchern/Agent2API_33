@@ -21,6 +21,14 @@ fn zcode_claimed_today(provider: &str, claim_at: i64) -> bool {
             .is_some_and(|date| date == beijing::today_key())
 }
 
+/// DoubaoWork 的「每日确认」不走 `dailyCheckin` 台账，而是落在插件状态
+/// `host:doubaowork:daily-confirmation` 里；统一由 SQL 层投影成公开形态。
+pub(super) fn doubao_status(record: &StoredAccount) -> Option<Value> {
+    if record.provider() != "doubaowork" { return None; }
+    let entry = record.get("pluginState")?.get("host:doubaowork:daily-confirmation")?;
+    super::sql::credential_version::doubao_state::public_status(entry)
+}
+
 pub(super) fn record_status(record: &StoredAccount) -> Option<&Value> {
     record.get(LEDGER_KEY).filter(|value| {
         (rolling_until(value).is_some() || value.get("at").and_then(Value::as_i64)
@@ -40,6 +48,10 @@ pub(super) fn completed(record: &StoredAccount) -> bool {
     // 否则手动领了套餐之后，台账仍停在未完成，签到中心会一直显示「待签」。
     if zcode_claimed_today(record.provider().as_str(), record.claim_at()) {
         return true;
+    }
+    // DoubaoWork 的每日确认状态只认插件投影，与台账口径互斥。
+    if let Some(status) = doubao_status(record) {
+        return status.get("completed").and_then(Value::as_bool) == Some(true);
     }
     if let Some(status) = record_status(record) {
         if let Some(until) = rolling_until(status) {

@@ -157,7 +157,7 @@ pub struct RequestEntry {
     /// 「重试」列只能显示一个没有信息量的「重试」标记。本字段就是那段历史。
     ///
     /// 条数上限：采集侧保证 `attempt_details.len() <= attempts`，而 `attempts`
-    /// 的上界是 `MAX_ROUTE_ATTEMPTS + 1`（32+1）。采集侧另有
+    /// 的上界是 `MAX_ROUTE_ATTEMPTS + 1`（100+1）。采集侧另有
     /// `MAX_ATTEMPT_DETAILS`（24）的体积闸 —— 截断时明细会比 `attempts` 短，
     /// 前端据此显示「只保留前 N 条」（见 requests-panel）。
     ///
@@ -255,6 +255,12 @@ pub struct RequestEntry {
     /// 请求发生时的统计分类与识别依据；旧行没有依据，不重新猜测来源。
     #[serde(flatten)]
     pub source: RequestSource,
+    #[serde(rename = "cacheCreationTokens", default)]
+    pub cache_creation_tokens: i64,
+    #[serde(rename = "cacheCreation1hTokens", default)]
+    pub cache_creation_1h_tokens: i64,
+    #[serde(rename = "costUsd", default)]
+    pub cost_usd: Option<f64>,
 }
 
 /// 一个被命中的敏感词及其次数（存储契约）。
@@ -327,6 +333,8 @@ pub struct AttemptDetail {
     /// 「只记体积不记内容」的口径见 `core::upstream::usage::AttemptDetail::body_bytes`。
     #[serde(rename = "bodyBytes", default)]
     pub body_bytes: Option<i64>,
+    #[serde(rename = "errorPolicy", default, skip_serializing_if = "Option::is_none")]
+    pub error_policy: Option<Value>,
 }
 
 /// 一次尝试内部的退避重试（存储契约，与采集侧同形各自定义）。
@@ -388,8 +396,18 @@ impl RequestEntry {
         copy.completion_tokens = 0;
         copy.total_tokens = 0;
         copy.cache_read_tokens = 0;
+        copy.cache_creation_tokens = 0;
+        copy.cache_creation_1h_tokens = 0;
         copy.credit = None;
+        copy.cost_usd = None;
         copy
+    }
+
+    pub fn has_billable_tokens(&self) -> bool {
+        self.prompt_tokens > 0
+            || self.completion_tokens > 0
+            || self.cache_read_tokens > 0
+            || self.cache_creation_tokens > 0
     }
 }
 
@@ -417,6 +435,8 @@ pub struct NewRequestEntry {
     pub completion_tokens: i64,
     pub total_tokens: i64,
     pub cache_read_tokens: i64,
+    pub cache_creation_tokens: i64,
+    pub cache_creation_1h_tokens: i64,
     /// 上游按请求上报的积分消耗（可空：`None` = 没上报，不是 0；见
     /// `RequestEntry::credit`）
     pub credit: Option<f64>,
@@ -468,6 +488,8 @@ impl NewRequestEntry {
             completion_tokens: 0,
             total_tokens: 0,
             cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            cache_creation_1h_tokens: 0,
             credit: None,
             provider: None,
             client_model: String::new(),
@@ -526,6 +548,29 @@ impl NewRequestEntry {
             .map(|id| id.trim().to_string())
             .filter(|id| !id.is_empty())
             .unwrap_or_default();
+        let cw = token(self.cache_creation_tokens);
+        let cw1h = token(self.cache_creation_1h_tokens);
+        let prompt_norm = token(self.prompt_tokens);
+        let completion_norm = token(self.completion_tokens);
+        let cache_read_norm = token(self.cache_read_tokens);
+        let cost_usd = if discard_usage {
+            None
+        } else {
+            let um = self.upstream_model.trim();
+            crate::server::core::model_pricing::calc_request_cost_usd(
+                &crate::server::core::model_pricing::settings(),
+                &provider,
+                &self.model,
+                um,
+                ts,
+                prompt_norm,
+                completion_norm,
+                cache_read_norm,
+                cw,
+                cw1h,
+            )
+            .flatten()
+        };
         RequestEntry {
             ts,
             // 关联 id 透传（trim 的理由同 provider）：空串 = 没生成 / 旧行
@@ -601,6 +646,7 @@ impl NewRequestEntry {
                     notice: item.notice.filter(|text| !text.is_empty()),
                     // 体字节数原样透传（None = 这一轮没发出去；采集侧的理由见 usage 的字段说明）
                     body_bytes: item.body_bytes,
+                    error_policy: item.error_policy,
                 })
                 .collect(),
             sensitive_hits: self
@@ -622,6 +668,9 @@ impl NewRequestEntry {
             is_test: self.is_test,
             // 分类在入口定稿，收尾时不因设置变动重新归类。
             source: self.source.normalized(),
+            cache_creation_tokens: cw,
+            cache_creation_1h_tokens: cw1h,
+            cost_usd,
         }
     }
 }
@@ -741,6 +790,10 @@ pub struct DailyEntry {
     /// 来源维度回填版本，旧行默认 0；用于一次性修正历史回填口径。
     #[serde(rename = "sourceStatsVersion", default)]
     pub source_stats_version: i64,
+    #[serde(rename = "costUsd", default)]
+    pub cost_usd: f64,
+    #[serde(rename = "unpricedRequests", default)]
+    pub unpriced_requests: i64,
 }
 
 impl DailyEntry {
@@ -759,6 +812,8 @@ impl DailyEntry {
             client_stats: Vec::new(),
             api_key_stats: Vec::new(),
             source_stats_version: SOURCE_STATS_VERSION,
+            cost_usd: 0.0,
+            unpriced_requests: 0,
         }
     }
 }
@@ -771,6 +826,10 @@ pub struct ModelAccum {
     pub requests: i64,
     #[serde(default)]
     pub tokens: i64,
+    #[serde(rename = "costUsd", default)]
+    pub cost_usd: f64,
+    #[serde(rename = "unpricedRequests", default)]
+    pub unpriced_requests: i64,
 }
 
 /// 单个 provider 在某天的累计（聚合行的组成部分，W4 新增）。
@@ -791,6 +850,10 @@ pub struct ProviderAccum {
     pub successful: i64,
     #[serde(default)]
     pub tokens: i64,
+    #[serde(rename = "costUsd", default)]
+    pub cost_usd: f64,
+    #[serde(rename = "unpricedRequests", default)]
+    pub unpriced_requests: i64,
 }
 
 /// 单个账号在某天的累计（聚合行的组成部分）。
@@ -819,6 +882,10 @@ pub struct AccountAccum {
     pub successful: i64,
     #[serde(default)]
     pub tokens: i64,
+    #[serde(rename = "costUsd", default)]
+    pub cost_usd: f64,
+    #[serde(rename = "unpricedRequests", default)]
+    pub unpriced_requests: i64,
 }
 
 /// 明细查询条件（「模型请求日志」页用）——
@@ -848,4 +915,49 @@ pub struct RequestQuery {
     pub start: Option<i64>,
     /// 结束毫秒时间戳（**开**区间上界）
     pub end: Option<i64>,
+    /// `view=list` 时仅查询表格展示列与轻量标记，大字段（路由回放 / 重试链 / 脱敏词 / 证据）点开详情再查。
+    pub list_only: bool,
+}
+
+/// 列表页轻量行结构：不解码 `route` / `attempt_details` / `sensitive_hits` / `client_evidence` 大字段，只保留摘要标记。
+pub(super) struct RequestListRow {
+    pub row_id: i64,
+    pub id: String,
+    pub ts: i64,
+    pub model: String,
+    pub account_id: String,
+    pub account_name: String,
+    pub status: i64,
+    pub duration_ms: i64,
+    pub first_response_ms: Option<i64>,
+    pub attempts: i64,
+    pub error: Option<String>,
+    pub prompt_tokens: i64,
+    pub completion_tokens: i64,
+    pub total_tokens: i64,
+    pub cache_read_tokens: i64,
+    pub cache_creation_tokens: i64,
+    pub cache_creation_1h_tokens: i64,
+    pub cost_usd: Option<f64>,
+    pub provider: String,
+    pub client_model: String,
+    pub upstream_model: String,
+    pub client_reasoning: String,
+    pub upstream_reasoning: String,
+    pub phase: String,
+    pub phase_started_at: Option<i64>,
+    pub is_test: bool,
+    pub client: String,
+    pub api_key_id: String,
+    pub api_key_name: String,
+    pub api_key_source: String,
+    pub credit: Option<f64>,
+    pub has_route: bool,
+    pub vision_mode: String,
+    pub has_sensitive_hits: bool,
+    pub has_process_facts: bool,
+    pub internal_retries: i64,
+    pub has_client_evidence: bool,
+    pub recorded_client_name: String,
+    pub client_user_agent: String,
 }

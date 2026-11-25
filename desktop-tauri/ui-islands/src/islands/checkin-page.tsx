@@ -3,7 +3,7 @@ import { mountOnPage } from '../island-lazy'
 import { createRoot } from 'react-dom/client'
 import { Badge, Button, SegmentedControl, Spinner } from '@ui'
 import {
-  loadCenter, loadRecords, patch, store, subscribe,
+  invalidateCenter, loadCenter, loadCenterIfStale, loadRecords, patch, store, subscribe,
 } from './checkin-store'
 import { CenterTab, CheckinStats } from './checkin-center-tab'
 import { CHECKIN_SECTION_OPTIONS, type CheckinSection } from './checkin-types'
@@ -11,6 +11,7 @@ import { ScheduleTab } from './checkin-schedule-tab'
 import { MakeupTab } from './checkin-makeup-tab'
 import { t } from '../i18n'
 import { RecordsTab } from './checkin-records-tab'
+import { pluginTaskRunning } from '../../../ui-shared/plugin-task-types'
 
 /**
  * Agent2API · 签到中心（页面岛）。
@@ -70,18 +71,18 @@ function CheckinPage(): React.ReactElement {
   useStore()
   const [tab, setTab] = React.useState<Tab>(activeTab)
 
-  // 首屏拉快照 + 记录（记录页要显示总数，进页面就拉一次）
+  // 首屏只拉聚合快照；「签到记录」总数已随快照返回，明细切到记录标签再按需加载
   React.useEffect(() => {
     if (!store.loaded) void loadCenter()
-    if (!store.recordsLoaded) void loadRecords()
   }, [])
 
   // 自动签到执行中短轮询：那是唯一「后台会自己变」的场景（与旧实现同一取舍）
   React.useEffect(() => {
     const timer = window.setInterval(() => {
       const page = (window as unknown as { wbApp?: { currentPage?: string } }).wbApp?.currentPage
-      if (document.hidden || page !== 'checkin') return
-      if (store.center?.auto?.running || activeTab === 'schedule' && store.center?.auto?.enabled) void loadCenter()
+      if (document.hidden || page !== 'checkin' || store.saving) return
+      if (store.center?.auto?.running || store.center?.travel?.running || store.center?.pluginTasks?.some(pluginTaskRunning)
+        || activeTab === 'schedule' && (store.center?.auto?.enabled || store.center?.pluginTasks?.some(row => row.task.enabled))) void loadCenter()
     }, 3000)
     return () => window.clearInterval(timer)
   }, [])
@@ -110,6 +111,11 @@ function CheckinPage(): React.ReactElement {
   const center = store.center
   const error = store.loadError
   const view: CheckinView = tab === 'center' ? store.centerSection : tab
+  const refreshActive = () => {
+    void loadCenter(true)
+    if (tab === 'records') void loadRecords()
+    else patch({ recordsStale: true })
+  }
 
   return (
     <div className={`ck-page${tab === 'records' ? ' ck-page-records' : ''}`}>
@@ -126,7 +132,7 @@ function CheckinPage(): React.ReactElement {
         </div>
         <div className="ck-task-actions">
           <AutoBadge />
-          <Button size='default' variant='ghost' type="button" className="ck-refresh" onClick={() => { void loadCenter(); void loadRecords() }}>
+          <Button size='default' variant='ghost' type="button" className="ck-refresh" onClick={refreshActive}>
             刷新
           </Button>
         </div>
@@ -135,7 +141,7 @@ function CheckinPage(): React.ReactElement {
       {error ? (
         <div className="ck-page-error">
           <span>{error}</span>
-          <Button size='default' variant='ghost' type="button" className="ck-error-retry" onClick={() => { void loadCenter(); void loadRecords() }}>
+          <Button size='default' variant='ghost' type="button" className="ck-error-retry" onClick={refreshActive}>
             重试
           </Button>
         </div>
@@ -204,12 +210,20 @@ declare global {
      */
     wbCheckin?: {
       load(): Promise<void>
+      enter(): Promise<void>
+      invalidate(): void
       refresh(): void
     }
   }
 }
 
 window.wbCheckin = {
-  load: loadCenter,
-  refresh: () => { void loadCenter(); void loadRecords() },
+  load: () => loadCenter(true),
+  enter: loadCenterIfStale,
+  invalidate: invalidateCenter,
+  refresh: () => {
+    void loadCenter(true)
+    if (activeTab === 'records') void loadRecords()
+    else patch({ recordsStale: true })
+  },
 }

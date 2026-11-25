@@ -247,6 +247,7 @@ const COLUMNS: ColumnDecl[] = [
   { key: 'check', label: t('选择'), align: 'center' },
   { key: 'model', label: t('上游模型') },
   { key: 'rate', label: t('倍率') },
+  { key: 'pricing', label: t('计价') },
   // 「可见性」紧挨「来源」：两者回答的是同一类问题（这条记录哪来的 / 上游
   // 认不认它），并排放读起来才连贯。没判据的家显示 `—`（见 models-page 的
   // `visibilityCell`）—— 那是「这家没这个信息」，不是「确认可见」。
@@ -555,6 +556,16 @@ export function customRailItems(): Map<string, { label: string; n: number }> {
 function builtinProviders(): string[] {
   return [...builtinRailCounts().keys()]
 }
+
+/** 当前 manage 视图里内置提供商的 `{id, label}` 摘要；用于在会话状态尚未刷新时补齐弹窗展示。 */
+function builtinProviderMetas(): Array<{ id: string; label: string }> {
+  return (snapshot.data?.providers || [])
+    .filter(provider => Boolean(provider?.provider))
+    .map(provider => ({
+      id: provider.provider,
+      label: provider.providerLabel || provider.provider,
+    }))
+}
 /**
  * 某家清单的最近拉取时刻（毫秒；0 = 未知 / 从未成功过）。
  * 给「获取模型」弹窗的「更新日期」列用（那个弹窗打开时不自动拉取，第一屏只能靠这个值说明
@@ -802,13 +813,18 @@ export async function writeRemoveMapping(provider: string, alias: string, target
   return enqueueWrite(() => api.removeModelMapping(alias, target, provider))
 }
 
-export async function writeAddModel(provider: string, id: string): Promise<unknown> {
+export async function writeAddModel(provider: string, id: string, protocol?: string): Promise<unknown> {
   const error = addModelError(provider, id)
   if (error) throw new Error(error)
-  if (customSource.isCustom(provider)) return customSource.addModel(provider, id)
+  if (customSource.isCustom(provider)) return customSource.addModel(provider, id, protocol)
   const api = shared().workbuddyDesktop
   if (!api) throw new Error(t('后端桥不可用'))
   return enqueueWrite(() => api.addCustomModel(provider, id))
+}
+
+export async function writeModelProtocol(provider: string, id: string, protocol: string | null): Promise<unknown> {
+  if (!customSource.isCustom(provider)) throw new Error(t('仅自定义提供商支持按模型设置请求协议'))
+  return customSource.setModelProtocol(provider, id, protocol)
 }
 
 export async function writeRemoveModel(provider: string, id: string): Promise<unknown> {
@@ -1085,7 +1101,7 @@ export function refreshModels(): void {
  */
 window.wbModelsPanel = {
   render, load, refreshAll, refreshModels, visibleColumns, selectProvider, builtinProviders,
-  providerRefreshedAt,
+  builtinProviderMetas, providerRefreshedAt,
 }
 
 declare global {
@@ -1099,6 +1115,7 @@ declare global {
       visibleColumns(): ColumnView[]
       selectProvider(id: string): void
       builtinProviders(): string[]
+      builtinProviderMetas(): Array<{ id: string; label: string }>
       providerRefreshedAt(providerId: string): number
     }
   }

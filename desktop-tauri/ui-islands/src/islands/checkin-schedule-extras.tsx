@@ -6,6 +6,7 @@ import { t } from '../i18n'
 import { callJson } from './assistant-state'
 import { ModelApiKeyField } from '../../../ui-shared/model-api-key-field'
 import { useModelApiKeys } from '../../../ui-shared/use-model-api-keys'
+import { CheckinPluginTasks } from './checkin-plugin-tasks'
 
 /* ─── 保活模型链（国际版）──────────────────── */
 
@@ -177,7 +178,7 @@ function KeepalivePanel({ center }: { center: CheckinCenter }): React.ReactEleme
                 </div>
               ))}
               {models.length === 0
-                ? <Empty className="ck-chain-empty">清单为空 —— 保存后恢复缺省链</Empty>
+                ? <Empty className="ck-chain-empty">{defaults.length ? '清单为空 —— 保存后恢复缺省链' : '清单为空 —— 当前无默认模型，保活需至少添加一个可用对话模型'}</Empty>
                 : null}
             </div>
             <div className="ck-chain-add">
@@ -203,8 +204,9 @@ function KeepalivePanel({ center }: { center: CheckinCenter }): React.ReactEleme
         </div>
         <div className="ck-note">
           「保活模型链」是 WorkBuddy 国际版领日活时用来保活的免费模型，按顺序逐个尝试、
-          第一个成功即止；清空清单并保存 = 恢复缺省链（当前缺省：
-          {defaults.length ? defaults.join('、') : '（无）'}）。
+          第一个成功即止；{defaults.length
+            ? `清空清单并保存 = 恢复缺省链（当前缺省：${defaults.join('、')}）。`
+            : '当前不设默认模型，请手动添加（建议优先使用非推理型免费对话模型，如 deepseek-v4.1-flash-sg）。'}
           当天去重 + 幂等领取：重复执行只会拿到「已领取」，不会重复加分。
         </div>
       </div>
@@ -314,10 +316,11 @@ function TravelPanel({ center }: { center: CheckinCenter }): React.ReactElement 
 export function CheckinScheduleExtras({ center }: { center: CheckinCenter }): React.ReactElement | null {
   const panels = new Set(center.adminPanels ?? [])
   const keepalive = panels.has('daily_keepalive') ? <KeepalivePanel center={center} /> : null
-  const travel = panels.has('growth_tasks') ? <TravelPanel center={center} /> : null
-  if (!keepalive && !travel) return null
+  const travel = panels.has('growth_tasks') && center.travel.engine !== 'wasm_tasks' ? <TravelPanel center={center} /> : null
+  if (!keepalive && !travel && !center.pluginTasks?.length) return null
   return <section className='ck-schedule-extras'>
     <div className='ck-schedule-heading'><div><h2>{t('其他自动任务')}</h2><p>{t('保活模型链为全局配置，猫猫旅行有独立的开关与时刻。')}</p></div></div>
-    <div className='ck-region-row'>{keepalive}{travel}</div>
+    {keepalive || travel ? <div className='ck-region-row'>{keepalive}{travel}</div> : null}
+    <CheckinPluginTasks center={center} expanded />
   </section>
 }

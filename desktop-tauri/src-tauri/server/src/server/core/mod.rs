@@ -9,7 +9,7 @@
 //!   auth_http.rs         上游请求发送与解包、鉴权错误   （workbuddy-auth.mjs 的 api/unwrap）
 //!   auth.rs              会话、getStatus、鉴权头、刷新（workbuddy-auth.mjs 会话部分）
 //!   login.rs             无头登录与登录任务表          （auth.mjs 登录部分 + server.mjs 任务表）
-//!   clash.rs             Clash Verge 配置读取与快照缓存（workbuddy-proxy.mjs 的 Clash 部分）
+//!   clash.rs             EasyClash 配置读取与快照缓存
 //!   proxies.rs           账号级代理归一/解析/描述       （workbuddy-proxy.mjs 的代理部分）
 //!   egress.rs            出网点（按出口缓存 Client）+ 连通性（workbuddy-proxy.mjs 的 dispatch 部分）
 //!   billing/             积分 / 签到 / 运营活动         （workbuddy-billing.mjs）
@@ -61,7 +61,10 @@
 //! 约定：core 里的模块只做纯逻辑 + 文件读写 + 上游 HTTP，不认识 axum；
 //! api/ 里的 handler 负责把 HTTP 输入转成 core 调用、再把结果转成响应。
 
+pub(crate) mod panel_events;
 pub mod account_order;
+pub mod advertisements;
+pub mod accounts_list;
 mod account_order_balance;
 pub mod account_store;
 // 本机 AI 客户端的接管注册表（「Agent」页）：客户端定义 + 配置读写
@@ -104,8 +107,11 @@ pub mod limiter;
 pub mod login;
 pub mod maintenance;
 pub mod model_meta;
+pub mod model_pricing;
 pub mod model_rules;
 pub mod models;
+pub mod notifications;
+pub mod panel_oauth;
 /// 提供商插件宿主：子进程监管 + RPC 客户端 + 包安装。
 ///
 /// 这是「提供商实现外置到用户安装的插件包」那条路在网关侧的入口，见模块头。
@@ -123,6 +129,7 @@ pub mod routing;
 pub(crate) mod routing_groups;
 pub mod routing_order;
 pub mod routing_scope;
+pub(crate) mod runtime_capacity;
 pub mod sanitize;
 pub mod scheduled_tasks;
 // 侧边栏布局（分组 / 顺序 / 显隐）的持久化：整份 JSON 存 kv 一个键。
@@ -142,6 +149,7 @@ pub mod update;
 /// 插件声明的上游客户端版本同步（beta.6 schema 的 upstream_version 类型依赖）。
 pub mod upstream_versions;
 pub mod upstream;
+pub mod upstream_versions;
 pub(crate) mod user_agent;
 pub mod usage_query;
 pub mod usage_records;

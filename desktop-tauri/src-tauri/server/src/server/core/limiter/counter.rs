@@ -112,6 +112,20 @@ pub fn facts() -> Facts {
     facts.clone()
 }
 
+/// 找出「下一次事实会变」的最近时刻：滚动窗口里最早过期的那条事件，或
+/// 固定/总量窗口的结束时刻。面板事件用它排下一次唤醒，避免漏掉窗口翻转。
+pub(crate) fn next_change(now: i64) -> Option<i64> {
+    let facts = slot().lock().ok()?;
+    facts.values().flat_map(|count| {
+        if count.window.reset == Reset::Rolling {
+            count.events.iter().map(|event| event.ts.saturating_add(count.window.seconds.saturating_mul(1000)).saturating_add(1))
+                .filter(|at| *at > now).min()
+        } else {
+            (count.end > now).then_some(count.end)
+        }
+    }).min()
+}
+
 pub fn invalidate() {
     if let Ok(mut facts) = slot().lock() { facts.clear(); }
     // 规则变了：把节流戳归零，sweeper 下一轮 tick 立即全量重算，不用等满间隔。
@@ -316,4 +330,5 @@ pub(crate) fn update_facts(
             count.add(Event { ts, model: model.to_string(), tokens: tokens.max(0), requests: 1 });
         }
     }
+    crate::server::core::panel_events::notify(crate::server::core::panel_events::Change::Usage);
 }

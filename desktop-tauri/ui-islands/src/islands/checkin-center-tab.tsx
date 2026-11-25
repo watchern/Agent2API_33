@@ -17,11 +17,12 @@ import { OfficeaceSubscriptionRow } from './checkin-officeace-row'
 import { ProviderRail, type ProviderOption } from './checkin-provider-rail'
 import { DailyAccountList } from './checkin-daily-panel'
 import { DetailLine, TaskTick, byStatus, filterOptions, type StatusFilter } from './checkin-shared'
-import { claimOnboarding, claimOnboardingBatch, onboardingClaimable, onboardingOf, queryOnboarding } from './checkin-onboarding'
+import { claimOnboarding, claimOnboardingBatch, onboardingClaimable, onboardingOf, queryOnboarding, queryOnboardingBatch } from './checkin-onboarding'
 import { onboardingSummary } from './checkin-onboarding-cache'
 import { t } from '../i18n'
 import { growthTaskCompleted, growthTaskRunnable } from '../../../ui-shared/checkin'
 import { accountCheckinStatus } from '../../../ui-shared/checkin-result'
+import { CheckinPluginTasks } from './checkin-plugin-tasks'
 
 /**
  * 「签到中心」标签页：总览卡 + 每日签到 + 新手福利 + 活动套餐 + 成长任务。
@@ -168,7 +169,9 @@ export function CheckinStats({ center }: { center: CheckinCenter }): React.React
       />
       <MetricCell
         label={t('累计签到记录')}
-        value={store.recordsLoaded ? store.recordsTotal : <span className='ck-pending'>—</span>}
+        value={typeof center.recordsTotal === 'number'
+          ? center.recordsTotal
+          : store.recordsLoaded ? store.recordsTotal : <span className='ck-pending'>—</span>}
         foot={t('每账号一条明细')}
         onClick={() => goTab('records')}
       />
@@ -508,6 +511,12 @@ export function CenterTab({ center }: { center: CheckinCenter }): React.ReactEle
         }))
         : planGroups.map(group => ({ id: group.id, label: providerLabel(group.id), done: null, total: group.rows.length }))
 
+  const taskCategory = section === 'daily' ? 'checkin' : section === 'growth' ? 'growth' : section === 'plans' ? 'rewards' : ''
+  for (const row of center.pluginTasks ?? []) {
+    if (row.category !== taskCategory || railOptions.some(option => option.id === row.provider)) continue
+    railOptions.push({ id: row.provider, label: row.providerLabel || providerLabel(row.provider), done: null, total: 0, isTask: true })
+  }
+
   const railTotal = railOptions.reduce<{ done: number; all: number }>((sum, option) => ({
     done: sum.done + (option.done ?? 0), all: sum.all + option.total,
   }), { done: 0, all: 0 })
@@ -571,7 +580,9 @@ export function CenterTab({ center }: { center: CheckinCenter }): React.ReactEle
   }[section]
 
   const emptyText = section === 'daily'
-    ? filter === 'done' ? t('今天还没有账号签到，切到「全部」看看哪些还没签。') : t('今天的账号都签完了。')
+    ? sectionMeta.total === 0
+      ? t('没有可签到的账号')
+      : filter === 'done' ? t('今天还没有账号签到，切到「全部」看看哪些还没签。') : t('今天的账号都签完了。')
     : section === 'onboarding'
       ? extras.onboarding.length === 0
         ? t('没有支持新手福利的账号。')
@@ -633,9 +644,7 @@ export function CenterTab({ center }: { center: CheckinCenter }): React.ReactEle
                     size="sm"
                     variant="outline"
                     disabled={onboardingBusy || onboardingRows.length === 0}
-                    onClick={() => {
-                      for (const row of onboardingRows) void queryOnboarding(row.id)
-                    }}
+                    onClick={() => void queryOnboardingBatch(onboardingRows.map(row => row.id))}
                   >
                     {t('全部查询')}
                   </Button>
@@ -710,6 +719,10 @@ export function CenterTab({ center }: { center: CheckinCenter }): React.ReactEle
                   embedded
                 />
               ) : null}
+              {section === 'daily' || section === 'growth' || section === 'plans' ? <div className='px-4 pt-3'>
+                <CheckinPluginTasks center={center} provider={providerId}
+                  categories={section === 'growth' ? ['growth'] : section === 'plans' ? ['rewards'] : ['checkin']} />
+              </div> : null}
               {section === 'growth' ? growthRows.map(row => <GrowthRow key={row.id} row={row} />) : null}
               {empty ? <Empty className="ck-empty">{emptyText}</Empty> : null}
             </div>

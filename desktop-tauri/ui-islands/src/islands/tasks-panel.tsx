@@ -3,7 +3,8 @@ import { createRoot } from 'react-dom/client'
 import { mountOnPage } from '../island-lazy'
 import { t } from '../i18n'
 import { MaintenancePanel } from '../../../ui-shared/maintenance-panel'
-import type { MaintenanceApi, MaintenanceDetail, MaintenanceOverview, MaintenanceQuery, MaintenanceTask, MaintenanceTaskId } from '../../../ui-shared/maintenance-types'
+import { api as pluginTaskRequest } from './plugins-shared'
+import type { MaintenanceApi, MaintenanceDetail, MaintenanceOverview, MaintenanceQuery, MaintenanceTask, MaintenanceTaskId, MaintenanceTaskPatch } from '../../../ui-shared/maintenance-types'
 
 type Host = {
   workbuddyDesktop?: {
@@ -11,13 +12,13 @@ type Host = {
     getMaintenanceRecord(id: string): Promise<MaintenanceDetail>
     runMaintenance(id: MaintenanceTaskId): Promise<MaintenanceDetail>
     retryMaintenance(id: string, itemId?: string): Promise<MaintenanceDetail>
-    saveScheduledTask(id: string, patch: { enabled: boolean; interval: number }): Promise<MaintenanceTask>
+    saveScheduledTask(id: string, patch: MaintenanceTaskPatch): Promise<MaintenanceTask>
   }
   wbApp?: {
     readonly currentPage?: string
     refresh?(): Promise<unknown>
     showPage?(page: string): void
-    toast?(message: string, kind?: 'ok' | 'err'): void
+    toast?(message: string, kind?: 'ok' | 'err' | 'warn'): void
   }
   wbAccountPanel?: { open(id: string): void }
 }
@@ -45,7 +46,7 @@ function AutoMaintenancePage() {
     window.addEventListener('wb:maintenance-refresh', onRefresh)
     return () => { window.removeEventListener('wb:page', onPage); window.removeEventListener('wb:maintenance-refresh', onRefresh) }
   }, [])
-  return <MaintenancePanel api={api} active={active} revision={revision}
+  return <MaintenancePanel api={api} active={active} revision={revision} pluginTaskRequest={pluginTaskRequest}
     notify={(message, kind) => host().wbApp?.toast?.(message, kind)}
     onChanged={() => host().wbApp?.refresh?.()}
     onAccount={id => { host().wbApp?.showPage?.('accounts'); host().wbAccountPanel?.open(id) }} />

@@ -90,7 +90,10 @@ pub const RESERVED_KV_KEYS: &[&str] = &[
     // 本机编程会话连接设置与加密凭据，不参与配置同步。
     "assistantCoding",
     "assistantCodexLocal",
+    "routingProviderCooldowns",
     "priorityScope",
+    // 单账号可信版本的本机库代次；仅新内核使用，不从配置或云同步恢复授权。
+    "accountCredentialEpoch",
     // 侧边栏布局（core::sidebar_layout）：整份「分组 / 顺序 / 显隐」JSON 一个键。
     // 从前只存浏览器 localStorage，而桌面壳与网页端是两个 origin、localStorage
     // 隔离 —— 于是「在 WebUI 里隐藏的菜单，客户端照旧显示」。落库后两端读同一份。
@@ -99,12 +102,14 @@ pub const RESERVED_KV_KEYS: &[&str] = &[
     "sidebarLayout",
     // 品牌图片与名称独立保存，避免每次转发克隆整份图片；整库备份仍会保留。
     "panelBranding",
+    "advertisementCache",
     // 事件日志的下一个 id 水位（logs_store::sql）
     "logsNextId",
     // 整份桌面设置 JSON（壳侧 settings）—— 一个键而不是拆成三个：
     // 桌面设置是整体读写单元（前端一次 PUT 整份），拆键会让一次写入变成
     // 多行更新，徒增事务与冲突面。
     "desktopSettings",
+    "pluginDesktopClients",
     // **遗留**：旧「敏感词脱敏」的整份状态（词表 / 开关 / 作用角色 / 作用提供商）。
     //
     // 那个功能已随规则集换成硬编码指纹脱敏（`core::sanitize`）而整体删除，
@@ -189,6 +194,10 @@ pub const RESERVED_KV_KEYS: &[&str] = &[
     // 与上面的 `modelCatalogCache` 是两码事：那个存各家上游的**模型清单**，
     // 这个存模型的**元数据**（能力位 / 思考档位），刷新链路与失效语义各不同。
     "modelsDevCatalog",
+    // 模型计价模块本地缓存（USD→CNY 汇率、models.dev 完整价格索引、历史费用回填标记），不进云同步。
+    "fxRateCache",
+    "modelsDevProviderPrices",
+    "modelPricingBackfilled",
     // 云同步的配置与同步状态（core::cloud_sync）：整份
     // `{provider, webdav:{…}, s3:{…}, syncPassword(信封), enabled, autoSync,
     //   remoteRoot, profile, status:{lastSyncAt, lastSnapshotId, …}}` 一个键。
@@ -199,6 +208,9 @@ pub const RESERVED_KV_KEYS: &[&str] = &[
     // 换机时还会被旧凭据覆盖。保留键的身份让 `cloud_sync::snapshot` 的键筛选
     // 天然排除它，不必再维护一份「别同步这个键」的清单。
     "cloudSync",
+    // 上游客户端版本号的持久化缓存、同步排期与手动冷却（core::upstream_versions）。
+    // 属于本机同步状态而非配置项；不进云同步，也不能在修改普通配置时被误删。
+    "upstreamVersionCache",
 ];
 
 /// 这个键是否属于「其它零散状态」（即不归网关配置管）。
@@ -348,12 +360,21 @@ pub fn is_reserved(key: &str) -> bool {
 /// `NULL` = 这一家没上报（旧行 / 不提供该读数），0 = 确实零消耗；用 0 兜底会
 /// 把「没读到」画成「花了 0 积分」，比缺一列更难排查。
 ///
-/// ── 版本 30：logs 补 (level, id DESC) 索引（[`schema_logs_level`]）────
+/// ── 版本 33：logs 补 (level, id DESC) 索引（[`schema_logs_level`]）────
 /// 未读失败角标的水位查询（WHERE level='error' ORDER BY id DESC LIMIT 1，
 /// 管理面板 20 秒一轮）在百万行日志表上无索引即全表扫（实测 ~5 秒），且
 /// 扫描期间单连接互斥把余额查询/账号列表全部排到 6-10 秒后——账号页余额
 /// 查询因此批量超时。见 schema_logs_level.sql 的头部说明。
-pub const SCHEMA_VERSION: i64 = 30;
+///
+/// **编号为什么是 33 而不是 30**：这条迁移原本占 v30，而合入上游 3.5.1
+/// 后上游的 v30/v31/v32 已被 `schema_usage_diagnostics` /
+/// `schema_checkin_records_index` / `schema_model_pricing` 占用。
+/// 迁移按 `PRAGMA user_version` 逐版本执行、每个版本只跑一次，所以把这条
+/// 挪到 33：
+///   · 已经升到 30 的库（索引已建）→ 升 31/32/33 时再跑一次同一条 SQL，
+///     脚本是 `CREATE INDEX IF NOT EXISTS`，幂等，不会报错；
+///   · 停在 29 或更早的库 → 依次跑完 30/31/32/33，四条迁移一次到位。
+pub const SCHEMA_VERSION: i64 = 33;
 
 /// 版本 1 的全部表与索引：改造前所有 JSON / JSONL 文件的对应形态。
 ///
@@ -1093,9 +1114,13 @@ fn apply_version(
         27 => conn.execute_batch(include_str!("schema_coding.sql")),
         28 => conn.execute_batch(include_str!("schema_model_recency.sql")),
         29 => conn.execute_batch(include_str!("schema_usage_query.sql")),
-        // v30：logs 补 (level, id DESC) 索引（未读失败角标水位查询的根治，
-        // 见 schema_logs_level.sql 头部说明）
-        30 => conn.execute_batch(include_str!("schema_logs_level.sql")),
+        30 => conn.execute_batch(include_str!("schema_usage_diagnostics.sql")),
+        31 => conn.execute_batch(include_str!("schema_checkin_records_index.sql")),
+        32 => conn.execute_batch(include_str!("schema_model_pricing.sql")),
+        // v33：logs 补 (level, id DESC) 索引（未读失败角标水位查询的根治，
+        // 见 schema_logs_level.sql 头部说明）。原为 v30，与上游的三条迁移
+        // 撞号后顺延到 33；脚本幂等，重跑无害。
+        33 => conn.execute_batch(include_str!("schema_logs_level.sql")),
         _ => Ok(()),
     }
 }

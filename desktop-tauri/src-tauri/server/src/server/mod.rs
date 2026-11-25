@@ -69,7 +69,7 @@
 //!     auth_http.rs 上游请求发送与解包（管理接口）+ 鉴权错误类型
 //!     login.rs     无头登录与登录任务表
 //!     proxies.rs   账号级出网代理解析（Clash 读取在 clash.rs）
-//!     clash.rs     Clash Verge 配置读取与快照缓存
+//!     clash.rs     EasyClash 配置读取与快照缓存
 //!     egress.rs    出网点（按出口缓存 reqwest Client）+ 出口连通性测试
 //!     billing/     积分 / 签到（checkin.rs） / 运营活动
 //!     models/      模型条目的出口形状（/v1/models 的条目与信封翻译，各家共用）
@@ -115,8 +115,8 @@
 //!   - 软件更新：`ServerState::update()`。
 //!   - 请求统计：写入侧是 `api::chat` 的记账点 → `RequestStats::record`；
 //!     读取侧是 `api::stats_api` 的三条路由（报表 / 明细查询 / 清空），
-//!     句柄取 `ServerState::request_stats()`；退出时在 `start()` 的 serve 任务
-//!     收尾处 `flush()`（把 WAL 并回主库，见那边的说明）。
+//!     句柄取 `ServerState::request_stats()`；退出时由服务器关闭协调器在两个
+//!     监听都确认退出后单次 `flush()`（把 WAL 并回主库，见那边的说明）。
 //!   - 数据保留期：`config::retention_settings()`（内存快照，热路径用）与
 //!     `config::set_retention()`（写盘）；三个消费点都走**回调动态取值**
 //!     （`RequestStats` / `LogStore` / `PUT /api/retention` 的立即清理），
@@ -147,9 +147,13 @@ pub mod errors;
 pub mod http;
 pub mod logging;
 pub mod logs_store;
+mod listener;
+mod shutdown;
+pub use shutdown::ServerHandle;
 mod panel_captcha;
 pub mod request_stats;
 mod static_files;
+pub use static_files::EmbeddedUiAssets;
 
 #[cfg(test)]
 mod native_gateway_tests;
@@ -161,7 +165,7 @@ use std::sync::Arc;
 
 use tokio::sync::oneshot;
 
-use crate::port_conflict::{ConflictKind, PortConflict};
+use crate::port_conflict::PortConflict;
 use crate::server::core::account_store::AccountStore;
 use crate::server::core::auth::AuthService;
 use crate::server::core::auto_checkin::AutoCheckin;
@@ -202,9 +206,10 @@ pub struct ServerState {
     /// 配置目录（`~/.agent2api`），与壳侧 gateway::config_dir() 同源
     pub config_dir: PathBuf,
     /// headless 下托管管理界面（`ui/` 静态目录）的根；`None` = 不托管
-    /// （桌面形态由 Tauri 壳的 custom-protocol 出界面，网关只出 API）。
-    /// 桌面壳不设置它；headless 二进制经 [`ServerState::set_ui_dir`] 打开。
+    /// （桌面形态由 Tauri 壳内嵌资源或开发态目录出界面）。
     ui_dir: Option<PathBuf>,
+    /// 桌面形态开启局域网面板时直接从 Tauri 内嵌资源读取，避免安装目录重复打包一份 `ui/`。
+    ui_assets: Option<Arc<dyn EmbeddedUiAssets>>,
     /// 账号存储句柄（内部一把 Mutex，绝不在持锁时做网络请求）
     store: AccountStore,
     /// 鉴权服务句柄（会话读取 / token 刷新）
@@ -235,6 +240,8 @@ pub struct ServerState {
     /// 为什么允许为 None 而不是直接让启动失败：release 构建是 panic=abort，
     /// 数据库问题不该让整个应用闪退；网关降级启动至少能给出可读错误。
     db: Option<Db>,
+    pub(crate) panel_events_stop: tokio_util::sync::CancellationToken,
+    advertisements: core::advertisements::AdvertisementCache,
     /// 启动时发现「还有旧 JSON/JSONL 文件没搬进库」。
     ///
     /// ── 为什么是 `Arc<AtomicBool>` 而不是裸 `bool` ──────────────
@@ -368,6 +375,7 @@ impl ServerState {
         let snapshot = config::init(db.clone());
         core::upstream_versions::install(db.clone());
         core::task_state::install(db.clone());
+        core::upstream_versions::install(db.clone());
         core::maintenance::storage::install(db.clone());
         // 每账号的余额查询记录（余额不足跳过 / 自动禁用的底座）：装库句柄时
         // 顺带做旧 kv 快照的一次性迁移与内存事实表的装载（见 usage_records 模块头）。
@@ -415,6 +423,7 @@ impl ServerState {
         // 时只读内嵌快照（功能仍在，只是拿不到上次的刷新结果），所以位置不敏感；
         // 放在这里是为了和另外两个 kv 使用者排在一起，便于核对「谁在用这个库」。
         core::model_meta::install(db.clone());
+        core::model_pricing::install(db.clone());
         // ── 旧文件一次性迁移：**本切片起不再自动跑** ────────────────
         // 它现在由用户在升级弹窗里点「升级」触发（`POST /api/upgrade/run`）。
         // 为什么改成手动：需求是「弹窗告诉用户换了 SQLite，点升级才开始导」——
@@ -581,6 +590,7 @@ impl ServerState {
             local_panel: false,
             config_dir,
             ui_dir: None,
+            ui_assets: None,
             store,
             auth,
             login,
@@ -589,6 +599,8 @@ impl ServerState {
             auto_checkin,
             update,
             request_stats,
+            advertisements: core::advertisements::AdvertisementCache::new(db.clone()),
+            panel_events_stop: tokio_util::sync::CancellationToken::new(),
             db,
             upgrade_pending: Arc::new(AtomicBool::new(upgrade_pending)),
             startup_maintenance: Arc::new(AtomicBool::new(false)),
@@ -762,6 +774,7 @@ impl ServerState {
         // 服务器停机时进程会结束，任务随之消失。用 crate::spawn_task
         // （与 auto_checkin 同一理由）保证从非 tokio 上下文调用也能进入全局运行时。
         core::scheduled_tasks::spawn(state.store.clone(), state.update.clone());
+        core::upstream_versions::spawn();
         // 配置更新和插件热加载会唤醒排程，关闭时保持等待而不是省掉调度循环。
         core::growth_scheduler::spawn(state.store.clone());
         // 插件 upstream_version 设置项的定时同步循环（无声明源时空转）。
@@ -840,6 +853,10 @@ impl ServerState {
     /// release 是 panic=abort，数据库问题不该让整个应用闪退。
     pub fn db(&self) -> Option<&Db> {
         self.db.as_ref()
+    }
+
+    pub fn advertisements(&self) -> &core::advertisements::AdvertisementCache {
+        &self.advertisements
     }
 
     /// 还有没有待迁移的旧文件（升级弹窗的判据；见字段说明）。
@@ -921,6 +938,7 @@ impl ServerState {
             let outcome = tokio::task::spawn_blocking(move || {
                 stats.remap_model_dimension_once();
                 stats.backfill_source_dimensions();
+                stats.backfill_pricing_once();
                 stats.prune();
             })
             .await;
@@ -942,14 +960,29 @@ impl ServerState {
     }
 
     /// 打开 headless 形态的管理界面托管：`ui_dir` 指向 `ui/` 静态目录，
-    /// 网关随 API 一并出面板（桌面形态不调用 —— 界面由 Tauri 壳出）。
+    /// 网关随 API 一并出面板。
     pub fn set_ui_dir(&mut self, dir: PathBuf) {
         self.ui_dir = Some(dir);
     }
 
-    /// headless 是否托管管理界面（`http::router` 据此挂静态 fallback）。
+    /// 打开桌面形态的内置管理界面托管（直接读取随壳编译的嵌入资源，避免硬盘重复副本）。
+    pub fn set_ui_assets(&mut self, assets: Arc<dyn EmbeddedUiAssets>) {
+        self.ui_assets = Some(assets);
+    }
+
+    /// headless 是否托管管理界面磁盘目录。
     pub fn ui_dir(&self) -> Option<&PathBuf> {
         self.ui_dir.as_ref()
+    }
+
+    /// 桌面形态内嵌资源提供方。
+    pub fn ui_assets(&self) -> Option<&Arc<dyn EmbeddedUiAssets>> {
+        self.ui_assets.as_ref()
+    }
+
+    /// 是否已启用管理界面静态托管（磁盘目录或内嵌资源任一就绪）。
+    pub fn ui_hosted(&self) -> bool {
+        self.ui_dir.is_some() || self.ui_assets.is_some()
     }
 }
 
@@ -984,174 +1017,18 @@ fn available_account_count(state: &ServerState) -> usize {
         .count()
 }
 
-/// 启动进程内服务器：同步 bind（失败立刻返回可读错误）+ 异步 serve。
-///
-/// 返回停机信号发送端：调用方（state::BackendHandle）持有它，
-/// 退出时 `send(())` 触发 graceful shutdown。
-///
-/// ── 为什么 bind 用同步 std 监听、而 tokio 包装放到 spawn 里 ──
-/// `tokio::net::TcpListener::from_std` 会向 reactor 注册句柄，
-/// **必须在 Tokio 运行时上下文里调用**，否则直接 panic
-/// （本项目 release 是 panic=abort，那会带走整个桌面应用）。
-/// 而本函数可能从任意线程被调用（Tauri 的 setup 钩子在主线程、
-/// commands 在异步上下文），所以：
-///   1. 同步段只做 `std::net::TcpListener::bind` —— 这一步不需要运行时，
-///      且端口占用这个最常见的失败能立刻拿到 OS 错误码返回给调用方；
-///   2. 需要运行时的 from_std 与 serve 都放进 `crate::spawn_task`，
-///      任务体一定跑在运行时的工作线程上，reactor 必然可用。
-///
-/// ── 失败为什么返回 PortConflict 而不是裸字符串 ──
-/// bind 失败的原因决定了界面该给什么出路：被别的进程占用可以「结束进程」，
-/// 落在系统保留段里则只能「更换端口」。分类判据（`std::io::ErrorKind`）
-/// 只有在这里才拿得到，所以在这里分好类往上带，别让界面去猜错误文案。
-pub fn start(state: &ServerState) -> Result<oneshot::Sender<()>, PortConflict> {
-    // ── 路由按形态拆分 ─────────────────────────────────────────
-    // 默认（panel_port = None，桌面壳 / 未设 PANEL_PORT 的 headless）：单端口
-    // 挂完整路由（面板 + 网关合并），行为与拆分前逐字一致。分端口形态
-    // （headless 设 AGENT2API_PANEL_PORT）：主端口只挂网关（/v1/* + /health），
-    // 面板（静态界面 + /api/*）单独监听 panel_port —— 把面板端口留在内网，
-    // 公网只暴露网关端口。（panel_port == port 视为没配，兜底走合并。）
-    let panel_port = match state.panel_port {
-        Some(port) if port != state.port => Some(port),
-        _ => None,
-    };
-    let main_router = match panel_port {
-        Some(_) => http::gateway_router(state.clone()),
-        None => http::router(state.clone()),
-    };
-    let panel_router = panel_port.map(|_| http::panel_router(state.clone()));
-
-    let addr = SocketAddr::new(state.host, state.port);
-    let listener = std::net::TcpListener::bind(addr)
-        .map_err(|error| PortConflict::from_bind_error(state.port, &error, None))?;
-    // 立刻转成非阻塞：从这一刻起到 serve 接手之间，若有连接进来，
-    // 阻塞式 accept 会把工作线程卡住。转非阻塞放在同步段更安全。
-    listener.set_nonblocking(true).map_err(|error| {
-        PortConflict::new(
-            ConflictKind::Other,
-            state.port,
-            None,
-            &format!("设置监听为非阻塞失败: {error}"),
-        )
-    })?;
-    // 面板监听（分端口形态）：也在同步段 bind —— 两个端口都拿到手才起
-    // serve，任一失败直接返回冲突（已 bind 的主监听随 drop 自动释放，
-    // 不会留下半启动状态）。
-    let panel_listener = match panel_port {
-        Some(port) => {
-            let addr = SocketAddr::new(state.host, port);
-            let listener = std::net::TcpListener::bind(addr)
-                .map_err(|error| PortConflict::from_bind_error(port, &error, None))?;
-            listener.set_nonblocking(true).map_err(|error| {
-                PortConflict::new(
-                    ConflictKind::Other,
-                    port,
-                    None,
-                    &format!("设置监听为非阻塞失败: {error}"),
-                )
-            })?;
-            Some(listener)
-        }
-        None => None,
-    };
-
-    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
-    // 停机广播：oneshot 只有一个 receiver，而分端口形态有两个 serve 都要
-    // 收到停机信号。协调任务把 oneshot 信号（send 或发送端被 drop）转成
-    // watch 置位，两个 serve 各拿一份 receiver；watch 发送端 drop 也会让
-    // `wait_for` 返回，停机语义与单 oneshot 一致。
-    let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
-    let mut stop_requested = stop_rx.clone();
-    let stop_from_signal = stop_tx.clone();
-    crate::spawn_task(async move {
-        tokio::select! {
-            _ = shutdown_rx => {}
-            _ = stop_requested.wait_for(|stop| *stop) => {}
-        }
-        stop_from_signal.send_replace(true);
-    });
-
-    // 停机收尾要用的统计句柄：先克隆出来再移进任务（`state` 是借用，不能
-    // 随 async move 一起走）
-    let request_stats = state.request_stats();
-    let stop_main = stop_rx.clone();
-    let stop_from_main = stop_tx.clone();
-    crate::spawn_task(async move {
-        // 运行时上下文在这里必然成立，from_std 不会 panic
-        let listener = match tokio::net::TcpListener::from_std(listener) {
-            Ok(listener) => listener,
-            Err(error) => {
-                stop_from_main.send_replace(true);
-                logging::log("[Server]", &format!("❌ 创建异步监听失败: {error}"));
-                return;
-            }
-        };
-        // into_make_service_with_connect_info：把客户端地址带进 handler
-        // （面板登录的失败锁定按来源 IP 计；无 ConnectInfo 的提取会 panic，
-        //  所以 serve 的形态必须与之一致）
-        let mut stop = stop_main;
-        let server = axum::serve(
-            listener,
-            main_router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-        )
-        .with_graceful_shutdown(async move {
-            // 收到停机广播（或广播端被丢弃）即结束 accept 循环，
-            // 已在处理中的请求会跑完再退出
-            let _ = stop.wait_for(|stop| *stop).await;
-        });
-        let result = server.await;
-        // 正常/异常退出均通知同一轮面板停止 accept。
-        stop_from_main.send_replace(true);
-        match result {
-            Ok(()) => logging::log("[Server]", "服务已停止"),
-            Err(error) => logging::log("[Server]", &format!("❌ 服务异常退出: {error}")),
-        }
-        // 统计收尾：放在 serve 返回**之后**（graceful shutdown 已等在途请求
-        // 跑完），此时不会再有新的记账进来。
-        // 注意它**不再是**「补写未落盘的内容」—— 每次记账都立即提交事务，
-        // 没有延迟落盘的状态了（旧实现的一套延迟机制随 T4 消失）；
-        // 它现在的职责是把 WAL 并回主库、清掉 `-wal` / `-shm` 残留，
-        // 让用户备份时只面对一个文件（见 `RequestStats::flush` 的说明）。
-        request_stats.flush();
-    });
-
-    // 面板 serve（分端口形态才有）：独立监听、同一份停机广播。
-    // 统计收尾只归主 serve（上面那个任务），这里只管转发请求。
-    if let Some(listener) = panel_listener {
-        let router = panel_router.expect("panel_port 与 panel_router 必须成对");
-        let stop_from_panel = stop_tx;
-        crate::spawn_task(async move {
-            let listener = match tokio::net::TcpListener::from_std(listener) {
-                Ok(listener) => listener,
-                Err(error) => {
-                    stop_from_panel.send_replace(true);
-                    logging::log("[Server]", &format!("❌ 面板监听创建失败: {error}"));
-                    return;
-                }
-            };
-            let server = axum::serve(
-                listener,
-                router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-            )
-            .with_graceful_shutdown(async move {
-                let mut stop = stop_rx;
-                let _ = stop.wait_for(|stop| *stop).await;
-            });
-            let result = server.await;
-            stop_from_panel.send_replace(true);
-            if let Err(error) = result {
-                logging::log("[Server]", &format!("❌ 面板服务异常退出: {error}"));
-            }
-        });
-    }
-
-    // 端口都已 bind、两个 serve 任务都已派出：此时面板已经可以打开，再开始
-    // 跑可能很慢的历史统计整理（整表扫描 / 保留期裁剪）。放在 serve 之前会让
-    // 大库升级后的第一次打开一直转圈（见 start_background_maintenance 的说明）。
-    state.start_background_maintenance();
-
-    Ok(shutdown_tx)
+/// 同步绑定所有端口后启动服务器，返回可复制的停止及完成等待句柄。
+/// 返回成功只确认端口绑定；异步监听装配失败由同一wait_shutdown结果明确报告。
+pub fn start_managed(state: &ServerState) -> Result<ServerHandle, PortConflict> {
+    shutdown::start(state)
 }
+
+/// 兼容旧调用方：发送或丢弃oneshot都转成同一服务器的停止请求。
+/// 该入口没有等待结果能力；进程退出方须后续迁移到start_managed并await真实关闭结果。
+pub fn start(state: &ServerState) -> Result<oneshot::Sender<()>, PortConflict> {
+    Ok(start_managed(state)?.compatibility())
+}
+
 
 /// 启动前的端口自检：能不能真的 bind 上这个端口。
 ///

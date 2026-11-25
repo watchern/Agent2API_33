@@ -110,16 +110,53 @@ fn log_query(params: &Params) -> Result<LogQuery, Response> {
     Ok(query)
 }
 
+fn fill_usage_context(store: &crate::server::core::account_store::AccountStore, entry: &mut logs_store::LogEntry) {
+    let Some(data) = entry.data.as_mut().and_then(Value::as_object_mut) else { return; };
+    if data.get("action").and_then(Value::as_str) != Some("usage.query") { return; }
+    let missing_provider = data.get("provider").and_then(Value::as_str).is_none_or(str::is_empty);
+    let missing_name = data.get("accountName").and_then(Value::as_str).is_none_or(str::is_empty);
+    if !missing_provider && !missing_name { return; }
+    let Some(id) = data.get("account").and_then(Value::as_str) else { return; };
+    let Some(account) = store.route_account(id) else { return; };
+    if missing_provider {
+        if let Some(provider) = account.get("provider").and_then(Value::as_str) {
+            data.insert("provider".to_string(), json!(provider));
+            if data.get("providerLabel").and_then(Value::as_str).is_none_or(str::is_empty) {
+                data.insert("providerLabel".to_string(), json!(crate::server::core::providers::label_of(provider)));
+            }
+        }
+    }
+    if missing_name {
+        if let Some(name) = account.get("name").and_then(Value::as_str).filter(|name| !name.is_empty()) {
+            data.insert("accountName".to_string(), json!(name));
+        }
+    }
+}
+
 /// GET /api/logs
-pub async fn query_logs(State(_state): State<ServerState>, Query(params): Query<Params>) -> Response {
+pub async fn query_logs(State(state): State<ServerState>, Query(params): Query<Params>) -> Response {
     let store = match store_or_error() {
         Ok(store) => store,
         Err(response) => return response,
     };
 
     let query = match log_query(&params) { Ok(query) => query, Err(response) => return response };
-
-    let result = store.query(&query);
+    let result = tokio::task::spawn_blocking(move || {
+        let mut result = store.query(&query);
+        for entry in &mut result.entries { fill_usage_context(state.store(), entry); }
+        for group in &mut result.groups {
+            fill_usage_context(state.store(), &mut group.entry);
+            for entry in &mut group.entries { fill_usage_context(state.store(), entry); }
+        }
+        result
+    }).await;
+    let result = match result {
+        Ok(value) => value,
+        Err(error) => {
+            logging::log("[Logs]", &format!("❌ 日志查询任务失败: {error}"));
+            return crate::server::errors::management_error(500, "日志查询失败");
+        }
+    };
     let mut data = match serde_json::to_value(&result) {
         Ok(value) => value,
         Err(error) => {
@@ -139,7 +176,14 @@ pub async fn stats_logs(State(_state): State<ServerState>) -> Response {
         Ok(store) => store,
         Err(response) => return response,
     };
-    let mut data = match serde_json::to_value(store.stats()) {
+    let stats = match tokio::task::spawn_blocking(move || store.stats()).await {
+        Ok(value) => value,
+        Err(error) => {
+            logging::log("[Logs]", &format!("❌ 日志统计任务失败: {error}"));
+            return crate::server::errors::management_error(500, "日志统计失败");
+        }
+    };
+    let mut data = match serde_json::to_value(stats) {
         Ok(value) => value,
         Err(error) => {
             logging::log("[Logs]", &format!("❌ 日志统计序列化失败: {error}"));
@@ -224,7 +268,16 @@ pub async fn download_logs(State(_state): State<ServerState>, Query(params): Que
         Err(response) => return response,
     };
     let query = match log_query(&params) { Ok(query) => query, Err(response) => return response };
-    let body = if params.is_empty() { store.to_jsonl() } else { store.to_jsonl_where(&query) };
+    let empty = params.is_empty();
+    let body = match tokio::task::spawn_blocking(move || {
+        if empty { store.to_jsonl() } else { store.to_jsonl_where(&query) }
+    }).await {
+        Ok(text) => text,
+        Err(error) => {
+            logging::log("[Logs]", &format!("❌ 日志导出任务失败: {error}"));
+            return crate::server::errors::management_error(500, "日志导出失败");
+        }
+    };
     let filename = format!("workbuddy-logs-{}.jsonl", file_stamp());
 
     let mut response = Response::builder()

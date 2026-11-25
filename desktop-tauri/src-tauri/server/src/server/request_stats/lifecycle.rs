@@ -34,7 +34,10 @@ pub(super) fn finish_stale(conn: &Connection, cutoff: i64, now: i64) -> rusqlite
         entry.prompt_tokens = 0;
         entry.completion_tokens = 0;
         entry.cache_read_tokens = 0;
+        entry.cache_creation_tokens = 0;
+        entry.cache_creation_1h_tokens = 0;
         entry.credit = None;
+        entry.cost_usd = None;
         add_to_daily(conn, entry)?;
     }
     Ok(())
@@ -46,7 +49,7 @@ impl RequestStats {
         if id.is_empty() { return; }
         let bounds = self.retention_bounds();
         let guard = self.guard();
-        let _ = self.with_conn_mut(&guard, |conn| {
+        let ok = self.with_conn_mut(&guard, |conn| {
             let tx = conn.transaction()?;
             sql::update_running_progress(&tx, id, progress)?;
             let mut entries = {
@@ -64,11 +67,17 @@ impl RequestStats {
                 entry.prompt_tokens = 0;
                 entry.completion_tokens = 0;
                 entry.cache_read_tokens = 0;
+                entry.cache_creation_tokens = 0;
+                entry.cache_creation_1h_tokens = 0;
                 entry.credit = None;
+                entry.cost_usd = None;
                 add_to_daily(&tx, entry)?;
             }
             daily::delete_daily_before(&tx, &bounds.daily_key)?;
             tx.commit()
-        });
+        }).is_some();
+        if ok {
+            crate::server::core::panel_events::notify_requests();
+        }
     }
 }

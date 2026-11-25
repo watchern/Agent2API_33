@@ -24,6 +24,7 @@ pub(crate) fn generation() -> u64 {
 #[track_caller]
 pub(crate) fn invalidate() {
     let next = GENERATION.fetch_add(1, Ordering::AcqRel) + 1;
+    crate::server::core::panel_events::notify(crate::server::core::panel_events::Change::Accounts);
     let caller = std::panic::Location::caller();
     let now = crate::server::logging::now_ms();
     let last = LAST_CALLER_LOG.load(Ordering::Relaxed);
@@ -58,6 +59,7 @@ pub(crate) fn validation_snapshot(store: &AccountStore) -> std::sync::Arc<Valida
 
 pub(crate) fn config_changed(before: &config::RuntimeConfig, after: &config::RuntimeConfig) -> bool {
     let keys = [crate::server::core::model_rules::KEY_MODEL_RULES,
-        crate::server::core::custom_providers::KEY_CUSTOM_PROVIDERS, config::KEY_ROUTING_PROFILES];
+        crate::server::core::custom_providers::KEY_CUSTOM_PROVIDERS, config::KEY_ROUTING_PROFILES,
+        config::web_tools::KEY];
     keys.iter().any(|key| before.raw().get(*key) != after.raw().get(*key))
 }

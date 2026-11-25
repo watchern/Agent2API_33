@@ -1,3 +1,5 @@
+pub(super) mod shutdown;
+
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
@@ -16,7 +18,11 @@ impl Host {
     }
 
     pub async fn ensure(self: &Arc<Self>) -> Result<Vec<proto::ProviderInfo>, String> {
+        if super::runtime::admission_closed() { return Err("插件宿主全局关闭中，未开放新运行代次".into()); }
         if self.closing.load(Ordering::Acquire) { return Err("插件宿主已关闭，不能重新启动已回收的宿主".to_string()); }
+        if self.options.wasm.is_none() && !self.options.script {
+            return Err(super::support::LEGACY_REASON.to_string());
+        }
         if self.disabled.load(Ordering::Acquire) { return Err(self.failure_message()); }
         if self.ready() {
             return Ok(self.providers.lock().map(|providers| providers.clone()).unwrap_or_default());
@@ -24,10 +30,16 @@ impl Host {
         self.start().await
     }
 
-    pub async fn shutdown(&self) {
-        self.activity.retire();
-        let _serial = self.starting.lock().await;
-        if self.options.wasm.is_some() { self.shutdown_wasm().await; return; }
+    pub async fn shutdown(&self) -> Result<(), String> {
+        self.seal_shutdown(super::wasm::managed_task::shutdown::ShutdownReason::RuntimeReplaced,
+            tokio::time::Instant::now() + shutdown::TIMEOUT);
+        self.notify_shutdown();
+        let report = self.finish_shutdown().await;
+        if report.local_exited { Ok(()) } else { Err("插件宿主本地尚未确认退出，保留旧实例；远端状态未知".into()) }
+    }
+
+    // 原生插件保留原2/15秒礼貌退出与reap；外层统一截止同时约束等待starting锁。
+    async fn shutdown_native(&self) {
         let scoped = self.scoped_runtime_package();
         let run = {
             let _state = self.lifecycle.lock().unwrap_or_else(|error| error.into_inner());
@@ -69,7 +81,7 @@ impl Host {
 
     async fn start(self: &Arc<Self>) -> Result<Vec<proto::ProviderInfo>, String> {
         let _serial = self.starting.lock().await;
-        if self.closing.load(Ordering::Acquire) { return Err("插件宿主正在关闭".to_string()); }
+        if self.closing.load(Ordering::Acquire) || super::runtime::admission_closed() { return Err("插件宿主正在关闭".to_string()); }
         if self.ready() {
             return Ok(self.providers.lock().map(|providers| providers.clone()).unwrap_or_default());
         }
@@ -84,6 +96,7 @@ impl Host {
 
         if let Some(attempt) = &self.options.startup { attempt.phase(super::startup::Phase::Starting); }
         if self.options.wasm.is_some() { return self.start_wasm().await; }
+        if !self.options.script { return Err(super::support::LEGACY_REASON.to_string()); }
         if let Some(old) = self.current_run() {
             {
                 let _state = self.lifecycle.lock().unwrap_or_else(|error| error.into_inner());
@@ -126,7 +139,14 @@ impl Host {
                 .env("AGY_BRIDGE_STATE_FILE", std::path::Path::new(&self.options.data_dir)
                     .join("local-agents").join("agy-cli").join("sessions.json"));
         }
-        let mut child = command.spawn().map_err(|error| {
+        let spawned = {
+            let _state = self.lifecycle.lock().unwrap_or_else(|error| error.into_inner());
+            if self.closing.load(Ordering::Acquire) || super::runtime::admission_closed() {
+                return Err("插件宿主正在关闭，未启动新进程".into());
+            }
+            command.spawn()
+        };
+        let mut child = spawned.map_err(|error| {
             let message = process::redact(&format!("启动插件进程失败（{}）：{error}", self.executable()));
             self.note_failure(&message);
             message
@@ -190,19 +210,24 @@ impl Host {
             .and_then(|result| result.map_err(|error| format!("插件握手失败：{}", error.message)))
             .and_then(|value| {
                 let settings = super::provider_settings::parse(self, &value)?;
+                let error_rules = super::error_rules::parse(&value);
+                let usage_policies = super::usage_policy::parse(&value);
                 let providers = serde_json::from_value::<Vec<proto::ProviderInfo>>(value)
                     .map_err(|error| format!("插件返回的 provider 列表无法解析：{error}"))?;
-                Ok((providers, settings))
+                Ok((providers, settings, error_rules, usage_policies))
             });
         match result {
-            Ok((providers, settings)) => {
+            Ok((providers, settings, error_rules, usage_policies)) => {
                 let _state = self.lifecycle.lock().unwrap_or_else(|error| error.into_inner());
                 if !self.is_current_run(&run) || run.failed.load(Ordering::Acquire)
-                    || !self.running.load(Ordering::Acquire) || self.closing.load(Ordering::Acquire) {
+                    || !self.running.load(Ordering::Acquire) || self.closing.load(Ordering::Acquire)
+                    || super::runtime::admission_closed() {
                     return Err(self.failure_message());
                 }
                 if let Ok(mut current) = self.providers.lock() { *current = providers.clone(); }
                 if let Ok(mut current) = self.provider_settings.lock() { *current = settings; }
+                if let Ok(mut current) = self.error_rules.lock() { *current = error_rules; }
+                if let Ok(mut current) = self.usage_policies.lock() { *current = usage_policies; }
                 if let Ok(mut crashes) = self.crashes.lock() { *crashes = 0; }
                 if let Ok(mut retry) = self.retry_after.lock() { *retry = None; }
                 let previous = self.last_error.lock().ok().and_then(|mut last| last.take());

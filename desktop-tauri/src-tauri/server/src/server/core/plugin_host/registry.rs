@@ -125,6 +125,11 @@ pub fn serves(id: &str) -> bool {
     table().lock().unwrap_or_else(|error| error.into_inner()).adapters.contains_key(id)
 }
 
+pub fn dynamic_login(id: &str) -> bool {
+    table().lock().unwrap_or_else(|error| error.into_inner()).adapters.get(id)
+        .is_some_and(|adapter| adapter.dynamic_login())
+}
+
 pub fn installed_ids() -> Vec<String> {
     let table = table().lock().unwrap_or_else(|error| error.into_inner());
     let mut ids: Vec<_> = table.adapters.keys()
@@ -210,7 +215,10 @@ impl SwitchGuard {
 impl Drop for SwitchGuard {
     fn drop(&mut self) {
         let mut table = table().lock().unwrap_or_else(|error| error.into_inner());
+        // 上游要记下「这次被摘掉的家」以便清掉它们的缓存；我们要记下
+        // 摘之前的集合，用来判断目录内容是否真的变了。两件事都要。
         let before = provider_ids(&table);
+        let mut removed = Vec::new();
         for id in &self.providers {
             if let Some(adapter) = table.staged.remove(id).filter(|adapter| adapter.host().ready()) {
                 table.adapters.insert(id.clone(), adapter);
@@ -218,13 +226,23 @@ impl Drop for SwitchGuard {
             table.switching.remove(id);
             if table.adapters.get(id).is_some_and(|adapter| adapter.host().activity.retired()) {
                 table.adapters.remove(id);
+                removed.push(id.clone());
             }
         }
         let after = provider_ids(&table);
         self.pauses.clear();
         drop(table);
+        // 集合没变就不推 generation（切换期间目录内容可能一点没动）。
         if before != after {
             crate::server::core::providers::catalog::invalidate();
+        }
+        // 上游新增：把这次退役摘掉的提供商从派生缓存里清掉。
+        // `rpc_cache::forget` 内部只在真带走了内容时才作废缓存，
+        // 与上面的条件推generation 不会互相打架。
+        for id in removed {
+            super::rpc_cache::forget(&id);
+            super::schedules::forget(&id);
+            super::wasm::forget(&id);
         }
         changed().notify_waiters();
     }

@@ -362,11 +362,13 @@ impl AccountStore {
         let count = match record.get("rateLimits") {
             Some(Value::Object(limits)) => limits.len(),
             _ => 0,
-        } + usize::from(record.get("upstreamCooldownUntil").is_some());
+        } + usize::from(record.get("upstreamCooldownUntil").is_some())
+            + record.get("routingCooldowns").and_then(Value::as_object).map(|limits| limits.len()).unwrap_or(0);
         if count == 0 {
             return 0;
         }
         record.remove("rateLimits");
+        record.remove("routingCooldowns");
         record.remove("upstreamCooldownUntil");
         if record.enabled() { record.remove("upstreamBlockedReason"); }
         record.set_updated_at(logging::now_ms());
@@ -817,6 +819,7 @@ impl AccountStore {
         }
 
         let codearts_limiters = super::codearts_accounts::migrate_limiters(&mut state.accounts);
+        let raccoon_cleaned = super::raccoon_accounts::clean_dirty_refresh_tokens(&mut state.accounts);
 
         if provider_added == 0
             && assignments.is_empty()
@@ -826,6 +829,7 @@ impl AccountStore {
             && qoder_moved == 0
             && chatglm_healed == 0
             && codearts_limiters == 0
+            && raccoon_cleaned == 0
         {
             return json!({
                 "providerAdded": 0,
@@ -848,6 +852,9 @@ impl AccountStore {
         }
         if codearts_limiters > 0 {
             logging::log("[Accounts]", &format!("已移除 {codearts_limiters} 个 CodeArts 账号的过期活动 Token 限制；无其他规则时改用总积分保护"));
+        }
+        if raccoon_cleaned > 0 {
+            logging::log("[Accounts]", &format!("🧹 已清理 {raccoon_cleaned} 个小浣熊账号的无效或重复 refreshToken 脏数据"));
         }
         if cline_renamed > 0 {
             logging::log(
@@ -986,7 +993,7 @@ impl AccountStore {
         if changed == 0 {
             return;
         }
-        match self.save_locked(&state, &guard) {
+        match self.save(&state, &guard) {
             Ok(()) => {
                 drop(guard);
                 logging::log(
@@ -1144,7 +1151,12 @@ impl AccountStore {
                 .iter()
                 .find(|(id, _)| *id == provider)
                 .map(|(_, rank)| *rank)
-                .unwrap_or_else(|| (provider_index(&provider).unwrap_or(usize::MAX / 2) as u32 + 1) * 10)
+                .unwrap_or_else(|| {
+                    provider_index(&provider)
+                        .and_then(|index| u32::try_from(index).ok())
+                        .map(|index| index.saturating_add(1).saturating_mul(10))
+                        .unwrap_or(u32::MAX)
+                })
         };
         let mut sorted = state.accounts.clone();
         if legacy_order {

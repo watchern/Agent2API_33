@@ -177,6 +177,7 @@ fn all_filters_compose_without_losing_the_new_fields() {
         status: Some("ok".into()),
         start: Some(now),
         end: Some(now + 5),
+        list_only: false,
     };
     let page = stats.query_requests(&query);
     assert_eq!(page["total"], 5);
@@ -366,6 +367,13 @@ fn missing_database_returns_the_same_empty_query_shape() {
     let page: Value = stats.query_requests(&RequestQuery::default());
     assert_eq!(
         page,
-        json!({"entries": [], "total": 0, "matched": 0, "running": 0})
+        json!({
+            "entries": [],
+            "total": 0,
+            "matched": 0,
+            "running": 0,
+            "currency": "usd",
+            "exchangeRate": 7.2
+        })
     );
 }

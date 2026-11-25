@@ -45,6 +45,7 @@
 //! release 是 `panic=abort`：本模块**绝不** unwrap/expect/panic。
 //! SSE 流的中断（客户端断开、上游断开）是**正常路径**，一律用 Result/Option。
 
+mod account_admission;
 pub mod aggregate;
 pub mod cancellation;
 pub mod connections;
@@ -54,7 +55,7 @@ mod images;
 pub mod image_compress;
 mod multipart;
 mod native_tools;
-mod http_dns;
+pub(crate) mod http_dns;
 mod network_fallback;
 pub mod refusal;
 pub mod request;
@@ -63,7 +64,8 @@ mod native_payload;
 mod payload;
 mod provider_loop;
 mod plugin_forward;
-mod retry_after;
+pub(crate) mod replay_guard;
+pub(crate) mod retry_after;
 mod rotate;
 mod route_state;
 mod route_context;
@@ -72,9 +74,14 @@ mod route_sticky;
 pub mod sse;
 pub mod stall;
 pub mod translate;
+mod responses_translate;
 pub mod usage;
 mod usage_normalize;
+pub(crate) mod error_policy;
+mod error_policy_finish;
+mod error_policy_send;
 pub(crate) mod vision_compat;
+pub(crate) mod web_tools;
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -104,10 +111,9 @@ const INFLIGHT_WAIT_MS: u64 = 45_000;
 
 /// 选路循环的最大轮数（防病态数据下的无限回环）。
 ///
-/// Node 版靠 `pickNextAccount` 返回 null 收尾 —— 每次轮换都会往 triedIds 里
-/// 加一个账号，而账号上限是 20，所以必然收敛。这里额外加一个轮数上限兜底：
-/// 万一账号数据被手工改出「同一个 id 出现两次」之类的怪状，宁可报错也不要空转。
-pub(super) const MAX_ROUTE_ATTEMPTS: usize = 32;
+/// 与 `config::error_policy::MAX_SWITCHES`（100）对齐，让高账号数部署在配置到
+/// 100 时不会在转发层被提前截断。
+pub(super) const MAX_ROUTE_ATTEMPTS: usize = 100;
 
 /// 在途请求的完成信号（去重队列用）。
 ///
@@ -344,6 +350,21 @@ impl UpstreamService {
         (snapshot.sunk, snapshot.resting, snapshot.open)
     }
 
+    pub fn route_queue_facts_for(
+        &self,
+        accounts: &[Value],
+        keys: &crate::server::core::routing::CooldownKeys<'_>,
+        now: i64,
+    ) -> (
+        HashMap<String, i64>,
+        HashMap<String, i64>,
+        std::collections::HashSet<String>,
+    ) {
+        let mut snapshot = self.route.snapshot("", now, 0);
+        self.route.merge_scoped_sunk(accounts, keys, now, &mut snapshot.sunk);
+        (snapshot.sunk, snapshot.resting, snapshot.open)
+    }
+
     pub fn route_sticky_sessions(&self, model: Option<&str>, now: i64) -> Vec<Value> {
         self.route.sticky_list(model, now)
     }
@@ -483,7 +504,19 @@ impl UpstreamService {
         let config = crate::server::config::current();
         let sanitize = config.sanitize_settings();
         let developer_role_compat = config.developer_role_compat();
-        let prompt = config.prompt_plan();
+        let prompt_request = request.telemetry.prompt_request().unwrap_or_else(|| {
+            let snapshot = crate::server::config::client_identification::current();
+            let defaults = crate::server::core::client::ClientSettings::default();
+            let (_, evidence) = crate::server::core::client::identify(
+                crate::server::core::client::ClientEvidence::capture(&request.client_headers),
+                snapshot.settings.as_ref().unwrap_or(&defaults),
+            );
+            crate::server::core::prompt::rules::Request {
+                client: if evidence.client_id.is_empty() { "other".into() } else { evidence.client_id },
+                model: request.body.get("model").and_then(Value::as_str).unwrap_or("").into(),
+            }
+        });
+        let prompt = config.prompt_plan().with_request(&prompt_request);
         // 图片压缩设置是 `Copy`，拷一份随上下文带下去（不借用 config，省去生命周期约束）
         let image_compress = *config.image_compress_settings();
         // Key 的提供商白名单随请求带进转发上下文：它要活过整条转发链
@@ -501,6 +534,7 @@ impl UpstreamService {
             body: &upstream_body,
             native: native.as_ref(),
             routing,
+            error_policy: config.error_policy_snapshot(),
             vision,
             direct_provider: resumed_vision.as_ref().map(|resumed| resumed.provider.clone()),
             direct_model: resumed_vision.as_ref().map(|resumed| resumed.model.clone()),
@@ -587,18 +621,28 @@ impl UpstreamService {
         if signal.is_done() {
             return;
         }
+        let wait_started = std::time::Instant::now();
         let wait = tokio::time::timeout(Duration::from_millis(INFLIGHT_WAIT_MS), notified);
         tokio::pin!(wait);
-        match cancel {
+        let timed_out = match cancel {
             // 排队期间被手动终止：立即醒来（返回后由 begin_slot 放弃占位、
             // 转发链在循环顶收尾）
             Some(token) => tokio::select! {
-                _ = &mut wait => {}
-                _ = token.cancelled() => {}
+                result = &mut wait => result.is_err(),
+                _ = token.cancelled() => false,
             },
-            None => {
-                let _ = wait.await;
-            }
+            None => wait.await.is_err(),
+        };
+        if timed_out {
+            logging::log_with_level(
+                "[Upstream]",
+                &format!(
+                    "⚠️ 相同请求去重排队已达 {}s 上限（等待 {}ms），停止等待并继续转发",
+                    INFLIGHT_WAIT_MS / 1000,
+                    wait_started.elapsed().as_millis(),
+                ),
+                "warn",
+            );
         }
     }
 }
@@ -641,7 +685,7 @@ pub struct ForwardStream {
     /// 转换后 poll_next 只拿得到文案）；`from_translated`（翻译协议）的转换层
     /// 同样上抛 io::Error。两个来源在 poll_next 里共用同一条「错误帧 + [DONE]」
     /// 收尾，描述口径也一致。
-    inner: futures::stream::BoxStream<'static, Result<Bytes, std::io::Error>>,
+    inner: Option<futures::stream::BoxStream<'static, Result<Bytes, std::io::Error>>>,
     coalescer: ReasoningCoalescer,
     /// 上游已结束（不再 poll 上游，只把 pending 吐完）
     upstream_done: bool,
@@ -726,7 +770,7 @@ impl ForwardStream {
         // 连接不关闭、一直等在那里（详见 `cancellable` 的说明）。
         let inner = cancellation::cancellable(inner, telemetry.cancel_token());
         Self {
-            inner,
+            inner: Some(inner),
             coalescer: ReasoningCoalescer::with_telemetry(telemetry.clone())
                 .with_policy(policy),
             upstream_done: false,
@@ -755,9 +799,15 @@ impl Stream for ForwardStream {
             if self.upstream_done {
                 return std::task::Poll::Ready(None);
             }
-            match self.inner.poll_next_unpin(context) {
+            let next = match self.inner.as_mut() {
+                Some(inner) => inner.poll_next_unpin(context),
+                None => std::task::Poll::Ready(None),
+            };
+            match next {
                 std::task::Poll::Pending => return std::task::Poll::Pending,
                 std::task::Poll::Ready(None) => {
+                    // 先释放真实来源，再排收尾帧；外层记账槽仍保留到响应流结束。
+                    drop(self.inner.take());
                     self.upstream_done = true;
                     for frame in self.coalescer.finish() {
                         self.pending.push_back(frame);
@@ -778,6 +828,7 @@ impl Stream for ForwardStream {
                     // 上游流式传输中断：那是**正常路径**（客户端断开、上游主动结束），
                     // 不 panic。先把已累积的 reasoning 冲刷出去，再补上
                     // 「错误帧 + [DONE]」收尾（与 Node 一致）。
+                    drop(self.inner.take());
                     self.upstream_done = true;
                     for frame in self.coalescer.finish() {
                         self.pending.push_back(frame);

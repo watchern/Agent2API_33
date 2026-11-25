@@ -39,15 +39,30 @@ pub struct GatewayError {
     pub status_code: i32,
     pub upstream_code: Option<i64>,
     pub code: Option<String>,
+    /// 容量/限流类错误的可区分原因（如 `memory_pressure`、`concurrency_limit`、`account_busy`）。
+    pub reason: Option<String>,
     /// `Retry-After`（秒）；`None` = 不带这个头。
     ///
     /// 只有**算得出恢复时刻**的限额类错误才该有值（见
     /// [`GatewayError::with_retry_after_seconds`]）：给不出时刻就不给头，
     /// 让客户端按自己的退避来 —— 编一个等待时长比不给更坏。
     pub retry_after_secs: Option<u64>,
+    /// 插件结构化错误的有限内部信息；不保存任意上游正文或凭据。
+    pub(crate) plugin_metadata: Option<PluginErrorMetadata>,
     /// 会话错误在异步边界确定的分类；仅供内部使用，不序列化，也不替换上游业务 code。
     pub(crate) conversation_class: Option<crate::server::core::providers::adapter::UpstreamErrorClass>,
+    pub(crate) routing_error: Option<crate::server::core::upstream::error_policy::ErrorDecision>,
     pub(crate) native_response: Option<(crate::server::core::protocol::native::WireProtocol, Value, axum::http::HeaderMap)>,
+    /// 只随受保护的登录任务返回，不进入模型 API 的错误响应。
+    pub(crate) login_diagnostic: Option<crate::server::core::login::LoginDiagnostic>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct PluginErrorMetadata {
+    pub reset_at: Option<i64>,
+    pub credential_scope: Option<String>,
+    /// 有界文本业务码；与防重放标记及数字upstream_code分开保存。
+    pub provider_code: Option<String>,
 }
 
 impl GatewayError {
@@ -58,9 +73,13 @@ impl GatewayError {
             status_code: 500,
             upstream_code: None,
             code: None,
+            reason: None,
             retry_after_secs: None,
+            plugin_metadata: None,
             conversation_class: None,
+            routing_error: None,
             native_response: None,
+            login_diagnostic: None,
         }
     }
 
@@ -71,9 +90,13 @@ impl GatewayError {
             status_code: status,
             upstream_code: None,
             code: None,
+            reason: None,
             retry_after_secs: None,
+            plugin_metadata: None,
             conversation_class: None,
+            routing_error: None,
             native_response: None,
+            login_diagnostic: None,
         }
     }
 
@@ -85,6 +108,17 @@ impl GatewayError {
     /// 挂上错误码字符串（Node 版手写 body 里的 `code` 字段）
     pub fn with_code(mut self, code: impl Into<String>) -> Self {
         self.code = Some(code.into());
+        self
+    }
+
+    /// 挂上可区分的拒绝原因（目前仅容量/并发拒绝等路径使用）
+    pub fn with_reason(mut self, reason: impl Into<String>) -> Self {
+        self.reason = Some(reason.into());
+        self
+    }
+
+    pub fn with_optional_reason(mut self, reason: Option<String>) -> Self {
+        self.reason = reason;
         self
     }
 
@@ -158,8 +192,21 @@ impl GatewayError {
         if let Some(code) = &self.code {
             error.insert("code".to_string(), Value::String(code.clone()));
         }
+        if let Some(reason) = &self.reason {
+            error.insert("reason".to_string(), Value::String(reason.clone()));
+            if let Some(seconds) = self.retry_after_secs.filter(|seconds| *seconds > 0) {
+                error.insert("retry_after".to_string(), Value::from(seconds));
+            }
+        }
         if let Some(code) = self.upstream_code {
             error.insert("upstream_code".to_string(), Value::from(code));
+        }
+        if let Some(scope) = self.plugin_metadata.as_ref().and_then(|metadata| metadata.credential_scope.as_ref()) {
+            error.insert("credential_scope".to_string(), Value::String(scope.clone()));
+        }
+        if let Some(code) = self.plugin_metadata.as_ref().and_then(|metadata| metadata.provider_code.as_ref())
+            .filter(|code| !code.is_empty() && code.len() <= 4096 && !code.chars().any(char::is_control)) {
+            error.insert("provider_code".to_string(), Value::String(code.clone()));
         }
         if self.is_quota_limit() {
             let reset_at = match &self.conversation_class {
@@ -173,7 +220,9 @@ impl GatewayError {
                 // 没有内部分类时仍优先使用结构化等待时间，不从文案反推。
                 None => {
                     let now = crate::server::logging::now_ms();
-                    self.retry_after_secs.and_then(|seconds| reset_from_retry(seconds, now))
+                    self.plugin_metadata.as_ref().and_then(|metadata| metadata.reset_at)
+                        .filter(|reset| valid_future_reset(*reset, now))
+                        .or_else(|| self.retry_after_secs.and_then(|seconds| reset_from_retry(seconds, now)))
                         .unwrap_or_else(|| parse_quota_reset_at(&self.message))
                 }
             };

@@ -33,6 +33,7 @@ mod bootstrap;
 mod callbacks;
 pub mod catalog;
 mod compatibility;
+pub(crate) mod error_rules;
 mod errors;
 mod gemini_signatures;
 mod install;
@@ -47,7 +48,7 @@ mod runtime;
 mod packages;
 mod pack_view;
 mod process;
-mod process_guard;
+pub(crate) mod process_guard;
 pub(crate) mod provider_settings;
 mod registry;
 mod rpc;
@@ -56,11 +57,16 @@ pub mod schedules;
 pub mod script;
 pub mod settings;
 mod stream;
+mod stream_events;
+pub(crate) use stream_events::StreamEvents;
 pub mod startup;
+mod support;
 mod switching;
 pub mod update;
+pub(crate) mod usage_policy;
 pub(crate) mod wasm;
-pub use wasm::owns as dynamic_login;
+pub use registry::dynamic_login;
+pub use wasm::owns as is_wasm_provider;
 
 #[cfg(test)]
 mod tests;
@@ -75,13 +81,15 @@ pub use install::{
     install_zip, list_packs, resolve_ui_file, set_pack_enabled, set_provider_enabled, uninstall,
     InstalledPack, PackProviderSummary, PackRegistry, PackSummary, PackUiSummary,
 };
+pub use pack_view::provider_icons;
 pub use registry::{install as install_provider, installed_ids, lookup, lookup_ready, remove, clear};
 pub use registry::{serves as serves_provider};
 pub use rpc::{HostOptions, RpcAdapter};
 pub(crate) use rpc_cache::meta as model_catalog_meta;
-pub use management::snapshot as management_snapshot;
+pub use management::{snapshot as management_snapshot, snapshot_with_packs as management_snapshot_with_packs};
 pub(crate) use packages::prepare as prepare_pack;
 pub(crate) use compatibility::provider_error as provider_compatibility_error;
+pub(crate) use process::redact as redact_diagnostic;
 
 /// 当前平台的目标三元组（界面提示「下载哪个平台的包」用）。
 pub fn host_target() -> String {
@@ -96,35 +104,31 @@ pub fn host_target() -> String {
 /// 分组，不知道那是什么。清单里写着 label，读它即可。
 ///
 /// ── 为什么必须缓存（2026-11-13 账号中心卡死修复）──────────────
-/// `list_packs()` 不是内存查询：它读一遍注册表，再对**每个包**读
-/// `manifest` 与 `pack.json`，还查兼容性与启动状态；`script::
-/// registered_label` 又要读一遍脚本注册表。早期这里只被 provider 摘要
-/// 调用一次，代价可忽略。后来 `providers::label_of` 成了 `session_models`
-/// 逐条模型、路由组投影逐成员的公共出口 —— 一次 `/api/session` 会问
-/// 三十多次，等于几百次文件读，实测把该阶段拖到 36-38 秒且稳定复现。
+/// 展示名的**查表**在 `pack_view::provider_label`：它读注册表里已缓存的
+/// 清单（`manifest_providers`），不像早期那样对每个包都去读 `manifest`
+/// 与 `pack.json`、查兼容性与启动状态。但它每次调用仍要读一次注册表
+/// 文件，`script::registered_label` 还要再读一遍脚本注册表。早期这里
+/// 只被 provider 摘要调用一次，代价可忽略。后来 `providers::label_of`
+/// 成了 `session_models` 逐条模型、路由组投影逐成员的公共出口 ——
+/// 一次 `/api/session` 会问三十多次，等于几十次文件读，实测把该阶段
+/// 拖到 36-38 秒且稳定复现。
 ///
-/// 现在一次扫描把**所有包的展示名**装进缓存（也缓存「查不到」的负结果，
-/// 免得陌生 id 反复触发 `registered_label` 的磁盘读），后续纯内存命中。
-/// 失效挂在两个既有出口：`catalog::invalidate()`（配置 / 插件注册 /
-/// 模型目录变更都经过它）与 `PackRegistry::save()`（装卸 / 启停包）。
-/// 展示名只是静态文案，最多陈旧到下一次变更，不参与任何转发判定。
+/// 所以这里再叠一层进程内备忘（见下）。展示名只是静态文案，最多陈旧到
+/// 下一次失效，不参与任何转发判定。
 pub fn provider_label(id: &str) -> Option<String> {
+    // ── 命中即返回，不碰磁盘 ───────────────────────────────────
     if let Ok(guard) = label_cache().read() {
         if let Some(cached) = guard.get(id) {
             return cached.clone();
         }
     }
-    let mut table: std::collections::HashMap<String, Option<String>> =
-        std::collections::HashMap::new();
-    for pack in install::list_packs().into_iter().filter(|pack| pack.enabled) {
-        for item in pack.providers {
-            table.insert(item.id, Some(item.label));
-        }
-    }
-    let found = table.get(id).cloned()
-        .unwrap_or_else(|| script::registered_label(id));
+    // 查不到的结果**也**缓存：陌生 id（界面上已知的 provider 大多不在
+    // 已装包里）反复触发 `script::registered_label` 的磁盘读，同样会拖慢
+    // 首次渲染。展示名只是静态文案，陈旧到下一次失效即可。
+    //
+    // 查表顺序照上游：`pack_view` 走插件包清单，`script` 兜底脚本注册表。
+    let found = pack_view::provider_label(id).or_else(|| script::registered_label(id));
     if let Ok(mut guard) = label_cache().write() {
-        guard.extend(table);
         guard.insert(id.to_string(), found.clone());
     }
     found
@@ -139,8 +143,14 @@ fn label_cache() -> &'static std::sync::RwLock<
     CACHE.get_or_init(|| std::sync::RwLock::new(std::collections::HashMap::new()))
 }
 
-/// 插件包 / 配置变更后清空展示名缓存。由 `catalog::invalidate()` 与
-/// `PackRegistry::save()` 调用，调用点不必逐个记着这件事。
+/// 插件包 / 配置变更后清空展示名缓存。由 `PackRegistry::save()` 与
+/// `script::storage::save()` 调用，调用点不必逐个记着这件事。
+///
+/// ── 失效出口为什么只有这两个 ─────────────────────────────────
+/// 展示名只依赖「已安装包清单」与「脚本注册表」，跟模型目录 generation
+/// 无关。所以后台目录刷新（`providers::catalog::snapshot`）**不要**顺手
+/// 清这里 —— 那条路径被高频调用，与 `/api/session` 并发时会把缓存打掉，
+/// 列表里逐条 `label_of` 又各自去查一遍盘，首屏耗时随账号数线性增长。
 pub fn invalidate_provider_labels() {
     if let Ok(mut guard) = label_cache().write() {
         guard.clear();
@@ -176,7 +186,10 @@ use tokio::sync::{oneshot, Mutex};
 use crate::server::logging;
 
 pub use ownership::ProviderCategory;
+pub use support::PackSupportState;
+pub(crate) use support::installed_state as support_state;
 pub use runtime::{current, detach, host_for_pack, host_for_provider, install, provider_category, provider_pack, shutdown_all};
+pub use runtime::shutdown_all_until;
 use runtime::provider_info;
 
 /// 当前已加载的 provider 申报了哪些**管理面板**（去重）。
@@ -187,19 +200,22 @@ use runtime::provider_info;
 /// 一屏「读取失败」。改为按这里的申报渲染：没装插件 → 空表 → 不画面板。
 ///
 /// 宿主没起（没装包 / 崩溃中）时返回空表，与「一个面板都没有」同义。
-pub fn admin_panels() -> Vec<proto::AdminPanel> {
-    let providers = runtime::provider_infos();
+fn collect_admin_panels(providers: &[proto::ProviderInfo]) -> Vec<proto::AdminPanel> {
     let mut panels: Vec<proto::AdminPanel> = Vec::new();
     for info in providers {
-        for panel in info.admin_panels {
+        for panel in &info.admin_panels {
             // `Unknown` 是「新插件配旧网关」的降级位，界面不认识它，
             // 别让它出现在清单里
-            if panel != proto::AdminPanel::Unknown && !panels.contains(&panel) {
-                panels.push(panel);
+            if *panel != proto::AdminPanel::Unknown && !panels.contains(panel) {
+                panels.push(panel.clone());
             }
         }
     }
     panels
+}
+
+pub fn admin_panels() -> Vec<proto::AdminPanel> {
+    collect_admin_panels(&runtime::provider_infos())
 }
 
 /// 某一家是否申报了某个管理面板（面板要按 provider 定位时用）。
@@ -254,18 +270,52 @@ pub fn has_campaign_rewards(provider: &str) -> bool {
 ///
 /// 只收申报过的家 —— 旧插件不申报时不在表里，调用方走内置兜底
 /// （`Capabilities::checkin`），升级因此是渐进的。
-pub fn checkin_features() -> serde_json::Map<String, serde_json::Value> {
+fn collect_checkin_features(providers: &[proto::ProviderInfo]) -> serde_json::Map<String, serde_json::Value> {
     let mut map = serde_json::Map::new();
-    let providers = runtime::provider_infos();
     for info in providers {
-        let Some(checkin) = info.checkin else {
+        let Some(checkin) = &info.checkin else {
             continue;
         };
-        if let Ok(value) = serde_json::to_value(&checkin) {
+        if let Ok(value) = serde_json::to_value(checkin) {
             map.insert(info.id.as_str().to_string(), value);
         }
     }
     map
+}
+
+pub fn checkin_features() -> serde_json::Map<String, serde_json::Value> {
+    collect_checkin_features(&runtime::provider_infos())
+}
+
+/// 签到中心单次构建所需的插件申报快照（只锁并读取一次已加载提供商信息）。
+pub struct CheckinProviderMetadata {
+    pub admin_panels: Vec<proto::AdminPanel>,
+    pub checkin_features: serde_json::Map<String, serde_json::Value>,
+    pub checkin_by_provider: HashMap<String, proto::CheckinInfo>,
+    pub campaign_providers: std::collections::HashSet<String>,
+}
+
+pub fn checkin_provider_metadata() -> CheckinProviderMetadata {
+    let providers = runtime::provider_infos();
+    let admin_panels = collect_admin_panels(&providers);
+    let checkin_features = collect_checkin_features(&providers);
+    let mut checkin_by_provider = HashMap::new();
+    let mut campaign_providers = std::collections::HashSet::new();
+    for info in providers {
+        let id = info.id.as_str().to_string();
+        if let Some(checkin) = info.checkin {
+            if info.capabilities.claims && !checkin.onboarding && !checkin.plans {
+                campaign_providers.insert(id.clone());
+            }
+            checkin_by_provider.insert(id, checkin);
+        }
+    }
+    CheckinProviderMetadata {
+        admin_panels,
+        checkin_features,
+        checkin_by_provider,
+        campaign_providers,
+    }
 }
 
 /// 这次写失败是不是「帧太大」（issue #379）。
@@ -342,6 +392,8 @@ pub struct Host {
     /// 已加载的 provider（`init` 之后填）。
     providers: StdMutex<Vec<proto::ProviderInfo>>,
     provider_settings: StdMutex<std::collections::BTreeMap<String, provider_settings::Schema>>,
+    error_rules: StdMutex<std::collections::BTreeMap<String, crate::server::config::error_policy::DeclaredErrorPolicy>>,
+    usage_policies: StdMutex<std::collections::BTreeMap<String, usage_policy::UsageQueryPolicy>>,
     /// 回调处理器（网关侧实现，见 [`GatewayCallbacks`]）。
     callbacks: Arc<dyn GatewayCallbacks>,
 }
@@ -398,7 +450,7 @@ pub(crate) struct StreamCall {
     /// 本次调用的 RPC id（归还额度、取消时点名用）。
     pub id: i64,
     /// head / chunk / 收尾事件（顺序即协议顺序）。
-    pub events: tokio::sync::mpsc::UnboundedReceiver<StreamEvent>,
+    pub events: StreamEvents,
 }
 
 const CALLBACK_FORBIDDEN: &str = "forbidden";
@@ -427,6 +479,8 @@ impl Host {
             last_error: StdMutex::new(None),
             providers: StdMutex::new(Vec::new()),
             provider_settings: StdMutex::new(std::collections::BTreeMap::new()),
+            error_rules: StdMutex::new(std::collections::BTreeMap::new()),
+            usage_policies: StdMutex::new(std::collections::BTreeMap::new()),
             callbacks,
         }
     }
@@ -594,7 +648,29 @@ impl Host {
         params: serde_json::Value,
         timeout: Duration,
     ) -> Result<serde_json::Value, proto::WireError> {
-        if self.options.wasm.is_some() { return self.call_wasm(method, params, timeout).await; }
+        self.call_coded_with_cancel(method, params, timeout, None).await
+    }
+
+    pub async fn call_coded_with_cancel(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+        timeout: Duration,
+        cancel: Option<&tokio_util::sync::CancellationToken>,
+    ) -> Result<serde_json::Value, proto::WireError> {
+        if self.options.wasm.is_some() {
+            if let Some(token) = cancel {
+                return tokio::select! {
+                    biased;
+                    _ = token.cancelled() => Err(proto::WireError::with_code(
+                        "登录已取消",
+                        proto::WireError::ABORTED,
+                    )),
+                    result = self.call_wasm(method, params, timeout) => result,
+                };
+            }
+            return self.call_wasm(method, params, timeout).await;
+        }
         let lease = if matches!(method, proto::methods::gateway::INIT | proto::methods::gateway::SHUTDOWN | proto::methods::gateway::ABORT) {
             None
         } else {
@@ -640,7 +716,25 @@ impl Host {
                 code,
             ));
         }
-        match tokio::time::timeout(timeout, rx).await {
+        let wait_result = if let Some(token) = cancel {
+            tokio::select! {
+                biased;
+                _ = token.cancelled() => {
+                    Box::pin(self.abort(id)).await;
+                    if let Ok(mut map) = self.pending.lock() {
+                        map.remove(&id);
+                    }
+                    return Err(proto::WireError::with_code(
+                        "登录已取消",
+                        proto::WireError::ABORTED,
+                    ));
+                }
+                res = tokio::time::timeout(timeout, rx) => res,
+            }
+        } else {
+            tokio::time::timeout(timeout, rx).await
+        };
+        match wait_result {
             Ok(Ok(Ok(value))) => Ok(value),
             Ok(Ok(Err(err))) => Err(err),
             Ok(Err(_)) => Err(proto::WireError::with_code(
@@ -736,7 +830,7 @@ impl Host {
             return Err(format!("写插件失败: {e}"));
         }
         opening.id = None;
-        Ok(StreamCall { id, events: event_rx })
+        Ok(StreamCall { id, events: event_rx.into() })
     }
 
     /// 消费端结束不代表插件已完成；登记与租约由终态应答或进程退出释放。

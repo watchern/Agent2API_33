@@ -35,6 +35,127 @@ use super::legacy;
 /// 为什么需要显式标记（而不是像账号维度回填那样从数据本身检测），见
 /// `RequestStats::remap_model_dimension_once` 的说明。
 const MODEL_UPSTREAM_MARKER: &str = "modelUsageUpstreamRemapped";
+pub(super) const MODEL_PRICING_BACKFILL_MARKER: &str = "modelPricingBackfilled";
+
+/// 收集需要重算费用的本地自然日列表（若 `only_if_unmarked` 为真且已完成过一次性回填，则返回 `Ok(None)`）。
+pub(super) fn pricing_candidate_days(
+    conn: &rusqlite::Connection,
+    only_if_unmarked: bool,
+) -> rusqlite::Result<Option<Vec<NaiveDate>>> {
+    if only_if_unmarked && legacy::marker_present(conn, MODEL_PRICING_BACKFILL_MARKER)? {
+        return Ok(None);
+    }
+    let mut days: BTreeSet<NaiveDate> = BTreeSet::new();
+    let mut stmt = conn.prepare("SELECT DISTINCT ts FROM requests WHERE status <> 0")?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let ts: i64 = row.get(0)?;
+        days.insert(day_of(ts));
+    }
+    Ok(Some(days.into_iter().collect()))
+}
+
+/// 读取单日需要重算费用的明细行与当天日报计数（仅持有短读锁）。
+pub(super) fn read_day_for_reprice(
+    conn: &rusqlite::Connection,
+    day: NaiveDate,
+) -> rusqlite::Result<(String, Vec<(i64, RequestEntry)>, i64)> {
+    let key = date_key(day);
+    let start = local_midnight_ms(day);
+    let end = local_midnight_ms(day + ChronoDuration::days(1)).saturating_sub(1);
+    let items = sql::select_between_with_row_id(conn, start, end, false)?;
+    let aggregate_requests: i64 = conn
+        .query_row(
+            "SELECT requests FROM request_daily WHERE date = ?1",
+            rusqlite::params![key],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+    Ok((key, items, aggregate_requests))
+}
+
+/// 在不持有任何数据库或统计锁的纯内存环境下计算单日费用变更与折叠后的日报。
+pub(super) fn compute_day_reprice(
+    key: String,
+    mut items: Vec<(i64, RequestEntry)>,
+    aggregate_requests: i64,
+    settings: &crate::server::core::model_pricing::ModelPricingSettings,
+) -> (Vec<(i64, Option<f64>)>, Option<DailyEntry>) {
+    let mut updates = Vec::new();
+    let mut non_test_count = 0i64;
+    for (row_id, entry) in &mut items {
+        if entry.status == 0 {
+            continue;
+        }
+        if !entry.is_test {
+            non_test_count += 1;
+        }
+        let vision_mode = entry
+            .route
+            .pointer("/visionCompatibility/mode")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let failed = !entry.is_success();
+        let new_cost = if failed && vision_mode != "assist_call" {
+            None
+        } else {
+            crate::server::core::model_pricing::calc_request_cost_usd(
+                settings,
+                &entry.provider,
+                &entry.model,
+                &entry.upstream_model,
+                entry.ts,
+                entry.prompt_tokens,
+                entry.completion_tokens,
+                entry.cache_read_tokens,
+                entry.cache_creation_tokens,
+                entry.cache_creation_1h_tokens,
+            )
+            .flatten()
+        };
+        if new_cost != entry.cost_usd {
+            updates.push((*row_id, new_cost));
+            entry.cost_usd = new_cost;
+        }
+    }
+    let rebuilt_day = if non_test_count >= aggregate_requests && aggregate_requests > 0 {
+        let mut rebuilt = DailyEntry::new(key);
+        for (_, item) in &items {
+            if !item.is_test && item.status != 0 {
+                fold_into_daily(&mut rebuilt, item);
+            }
+        }
+        Some(rebuilt)
+    } else {
+        None
+    };
+    (updates, rebuilt_day)
+}
+
+/// 将计算完毕的单日费用变更与日报写入数据库（单日短事务）。
+pub(super) fn write_day_reprice(
+    conn: &mut rusqlite::Connection,
+    updates: &[(i64, Option<f64>)],
+    rebuilt: Option<&DailyEntry>,
+) -> rusqlite::Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    for (row_id, new_cost) in updates {
+        sql::update_request_cost(&tx, *row_id, *new_cost)?;
+    }
+    if let Some(day_entry) = rebuilt {
+        daily::upsert_daily(&tx, day_entry)?;
+    }
+    tx.commit()
+}
+
+pub(super) fn mark_pricing_backfilled(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT INTO kv (key, value) VALUES (?1, 'true')
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        rusqlite::params![MODEL_PRICING_BACKFILL_MARKER],
+    )?;
+    Ok(())
+}
 
 /// [`RequestStats::remap_model_dimension_once`] 的库操作体：单事务完成
 /// 「读标记 → 找候选日 → 逐日重算 → 写标记」。
@@ -179,6 +300,8 @@ pub(super) fn summarize(
     let mut overview = super::source_report::usage_json(&usage);
     overview["successful"] = json!(totals.successful);
     overview["tokens"] = json!(totals.tokens);
+    overview["costUsd"] = json!(totals.cost_usd);
+    overview["unpricedRequests"] = json!(totals.unpriced_requests);
     overview["activeDays"] = json!(totals.active_days);
     overview["streak"] = json!(consecutive);
     overview["topModel"] = top_model;
@@ -232,6 +355,10 @@ pub(super) fn fold_into_daily(day: &mut DailyEntry, item: &RequestEntry) {
     day.tokens += item.total_tokens;
     day.cache_hit_tokens += item.cache_read_tokens;
     day.cache_input_tokens += item.prompt_tokens;
+    let item_cost = item.cost_usd.filter(|v| v.is_finite() && *v >= 0.0).unwrap_or(0.0);
+    let item_unpriced = i64::from(item.has_billable_tokens() && item.cost_usd.is_none());
+    day.cost_usd += item_cost;
+    day.unpriced_requests += item_unpriced;
     // 模型维度用「上游真名」当统计键（见 `model_stat_key`）：映射只是代名，
     // 实际请求的仍是上游那一个模型，报表要按它归组
     push_model_accum(
@@ -239,6 +366,8 @@ pub(super) fn fold_into_daily(day: &mut DailyEntry, item: &RequestEntry) {
         model_stat_key(&item.model, &item.upstream_model),
         item.total_tokens,
         1,
+        item_cost,
+        item_unpriced,
     );
     // 空 provider 也建组（见 push_provider_accum 的注释）
     push_provider_accum(
@@ -247,6 +376,8 @@ pub(super) fn fold_into_daily(day: &mut DailyEntry, item: &RequestEntry) {
         1,
         i64::from(success),
         item.total_tokens,
+        item_cost,
+        item_unpriced,
     );
     push_account_accum(
         &mut day.account_stats,
@@ -255,5 +386,7 @@ pub(super) fn fold_into_daily(day: &mut DailyEntry, item: &RequestEntry) {
         1,
         i64::from(success),
         item.total_tokens,
+        item_cost,
+        item_unpriced,
     );
 }

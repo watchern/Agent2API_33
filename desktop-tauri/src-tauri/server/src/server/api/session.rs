@@ -2,7 +2,7 @@
 //!
 //!   GET    /api/session                 前端首屏状态（需鉴权）
 //!   GET    /api/session/login/methods   动态登录方式与纯文本 prompts（需鉴权）
-//!   POST   /api/session/login/start     发起登录（可选 methodIndex / inputs / proxy）
+//!   POST   /api/session/login/start     发起登录（provider / methodIndex，inputs / proxy 可选）
 //!   GET    /api/session/login/wait      轮询登录结果 ?state=
 //!   POST   /api/session/login/cancel    取消登录（关弹窗/用户放弃）
 //!   POST   /api/session/login/callback  提交网页登录回调（壳侧捕获或远程面板粘贴）
@@ -31,6 +31,7 @@ use std::time::{Duration, Instant};
 
 use axum::body::Bytes;
 use axum::extract::{Json, OriginalUri, Query, State};
+use axum::http::HeaderMap;
 use axum::response::Response;
 use serde_json::{json, Value};
 
@@ -48,25 +49,35 @@ use crate::server::ServerState;
 /// 这个 handler **没有任何 await**：一旦客户端侧 60 秒超时而这里记录的总耗时
 /// 是毫秒级，就说明请求根本没被调度到（tokio 工作线程被别处的同步库操作饿死）
 /// 或响应卡在传输层 —— 而不是 handler 慢。每段耗时落在哪一格，痕迹里一眼可辨。
-pub async fn get_session(State(state): State<ServerState>) -> Response {
+pub async fn get_session(State(state): State<ServerState>, Query(query): Query<std::collections::HashMap<String, String>>) -> Response {
     let started = std::time::Instant::now();
     crate::server::logging::console("[Session]", "→ 进入 handler（入口即日志：入口出现而出口不出现 = 卡在某个阶段内部）");
     let mut stages: Vec<(&'static str, std::time::Duration)> = Vec::new();
     let snapshot = config::current();
     let plugin_startup = crate::server::core::plugin_host::startup::snapshot();
     // 可见账号与路由页预演共用同一份快照，插件未就绪的账号不参与。
+    // `?accounts=index` 走轻量首屏：只要账号索引，不要完整账号行。
+    let index_only = query.get("accounts").is_some_and(|value| value == "index");
     let accounts = {
         crate::server::logging::console("[Session]", "→ 阶段：列表");
         let stage = std::time::Instant::now();
-        let value = state.store().list_visible_accounts();
+        let value = if index_only {
+            crate::server::core::blocking::in_place(|| crate::server::core::accounts_list::summary(state.store()))
+        } else { state.store().list_visible_accounts() };
         stages.push(("列表", stage.elapsed()));
         value
     };
     let routed = {
         crate::server::logging::console("[Session]", "→ 阶段：路由预演");
         let stage = std::time::Instant::now();
+        let route_accounts = if index_only {
+            let cached = state.store().routing_snapshot();
+            cached.accounts.iter().filter(|account| crate::server::core::account_store::store_view::account_visible(
+                crate::server::core::routing::provider_of(account),
+            )).map(|account| account.as_ref().clone()).collect()
+        } else { crate::server::core::routing::accounts_of(&accounts) };
         let value = super::routing_api::queue_for_accounts(
-            &state, snapshot.last_request_model().map(str::to_string), &crate::server::core::routing::accounts_of(&accounts),
+            &state, snapshot.last_request_model().map(str::to_string), &route_accounts,
         )
             .get("pickedId").and_then(Value::as_str).filter(|id| !id.is_empty())
             .map(|id| Value::String(id.to_string())).unwrap_or(Value::Null);
@@ -143,7 +154,8 @@ pub async fn get_session(State(state): State<ServerState>) -> Response {
         //
         // 没申报的家不在表里 —— 界面走自己的兜底表，旧插件照常工作。
         "accountFeatures": features,
-        "providerIcons": crate::server::core::plugin_host::script::provider_icons(),
+        "desktopLaunch": crate::server::core::plugin_host::wasm::desktop_launch::summaries(),
+        "providerIcons": crate::server::core::blocking::in_place(crate::server::core::plugin_host::provider_icons),
         "pluginStartup": plugin_startup,
         })
     };
@@ -158,9 +170,11 @@ pub async fn get_session(State(state): State<ServerState>) -> Response {
     ok_json(payload)
 }
 
-/// 已加载插件的公开账号能力表。
-fn account_features() -> Value {
-    Value::Object(crate::server::core::plugin_host::account_features())
+/// 插件与内置订阅共用的公开账号能力表。
+pub(super) fn account_features() -> Value {
+    let mut features = crate::server::core::plugin_host::account_features();
+    features.extend(crate::server::core::providers::subscriptions::account_features());
+    Value::Object(features)
 }
 
 fn proxies_summary() -> Value {
@@ -193,8 +207,13 @@ struct LoginMethodMetadata {
     label: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     instructions: Option<String>,
+    /// 只说明当前方法不可用，不授予来源、账号或其它登录方式的权限。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    unavailable_reason: Option<String>,
     #[serde(default)]
     prompts: Vec<LoginPromptMetadata>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    file: Option<LoginFileMetadata>,
     #[serde(default)]
     dynamic_prompts: bool,
     #[serde(default)]
@@ -216,6 +235,19 @@ struct LoginMethodMetadata {
     desktop_only: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     browser_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sms: Option<crate::server::core::login::sms_contract::SmsConfig>,
+}
+
+#[derive(Clone, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LoginFileMetadata {
+    field: String,
+    #[serde(default)]
+    accept: String,
+    max_bytes: usize,
+    #[serde(default)]
+    binary: bool,
 }
 
 #[derive(Clone, Copy, Default, serde::Deserialize, serde::Serialize)]
@@ -224,7 +256,7 @@ enum LoginCallbackInput { #[default] Url, Code }
 
 #[derive(serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
-enum LoginMethodType { Oauth, Api }
+enum LoginMethodType { Oauth, Api, Sms, Desktop }
 
 #[derive(serde::Deserialize, serde::Serialize)]
 struct LoginPromptMetadata {
@@ -271,39 +303,27 @@ struct SelectedLogin {
     adapter: std::sync::Arc<dyn crate::server::core::providers::adapter::ProviderAdapter>,
     proxy: Option<crate::server::core::login::LoginProxySelection>,
     options: Value,
+    request_id: Option<String>,
     local_only: bool,
     manual_callback: bool,
     callback_input: LoginCallbackInput,
     validates_callback: bool,
+    local_source: Option<crate::server::access::login_source::Source>,
     instructions: Option<String>,
 }
 
-/// 旧入口（没有 `methodIndex`）的 `SelectedLogin`：只为把登录代理带下去。
-///
-/// ── 为什么旧入口也要构造它 ──────────────────────────────────
-/// `start_plugin_web_login` 只有在 `selected` 为 `Some` 时才把 `options` 发给
-/// 插件（`None` 分支用的是空 `options`）。旧入口不声明 `manualCallback` /
-/// `localOnly` —— 那些是动态方法的元数据，旧调用没有，保持默认值即与改造前
-/// 一致；唯一的增量是 `options.proxy`。
-///
-/// 适配器查不到时返回 `None`，让 `start_plugin_web_login` 走它原有的
-/// 「未知提供商 / 不支持网页登录」报错路径，而不是在这里吞掉错误。
-fn legacy_selected(
-    provider: &str,
-    proxy: Option<crate::server::core::login::LoginProxySelection>,
-    options: Value,
-) -> Option<SelectedLogin> {
-    let adapter = crate::server::core::providers::adapter::adapter_by_id(provider)?;
-    Some(SelectedLogin {
-        adapter,
-        proxy,
-        options,
-        local_only: false,
-        manual_callback: false,
-        callback_input: LoginCallbackInput::Url,
-        validates_callback: false,
-        instructions: None,
-    })
+fn trae_login_source(headers: &HeaderMap) -> Option<crate::server::access::login_source::Source> {
+    crate::server::access::login_source::Source::capture(headers)
+}
+
+fn callback_origin(raw: &str) -> Result<String, crate::server::errors::GatewayError> {
+    let url = url::Url::parse(raw).map_err(|_| crate::server::errors::GatewayError::bad_request("小浣熊回跳地址无效"))?;
+    if url.scheme() != "http" || !matches!(url.host_str(), Some("127.0.0.1" | "localhost" | "[::1]"))
+        || url.port().is_none_or(|port| port == 0) || url.path() != "/" || url.query().is_some() || url.fragment().is_some()
+        || !url.username().is_empty() || url.password().is_some() || raw.contains('\\') || raw.chars().any(char::is_control) {
+        return Err(crate::server::errors::GatewayError::bad_request("小浣熊网页回跳需要 HTTP 回环地址和显式端口；远程部署请先通过本机端口转发打开面板"));
+    }
+    Ok(url.origin().ascii_serialization())
 }
 
 async fn read_login_methods(
@@ -338,6 +358,43 @@ async fn read_login_methods(
         }
         method.label = login_text(&method.label);
         method.instructions = method.instructions.take().map(|text| login_text(&text));
+        if method.unavailable_reason.as_ref().is_some_and(|reason| reason.len() > 8192
+            || reason.trim().is_empty() || reason.chars().any(|ch| ch.is_control() && ch != '\n')) {
+            return Err(GatewayError::with_status(502, "插件返回的登录方式元数据无法解析"));
+        }
+        method.unavailable_reason = method.unavailable_reason.take().map(|reason| login_text(reason.trim()));
+        if method.unavailable_reason.as_ref().is_some_and(|reason| reason.len() > 8192
+            || reason.trim().is_empty() || reason.chars().any(|ch| ch.is_control() && ch != '\n')) {
+            return Err(GatewayError::with_status(502, "插件返回的登录方式元数据无法解析"));
+        }
+        if matches!(method.kind, LoginMethodType::Sms) {
+            if method.local_only || method.manual_callback || method.embedded_only || method.desktop_only
+                || method.dynamic_prompts || !method.prompts.is_empty()
+                || method.browser_mode.as_deref().is_some_and(|mode| mode != "none")
+            {
+                return Err(GatewayError::with_status(502, "短信登录不能声明浏览器、回调或额外动态表单"));
+            }
+            let sms = method.sms.as_mut().ok_or_else(|| GatewayError::with_status(502, "插件未提供短信登录声明"))?;
+            if crate::server::core::plugin_host::wasm::owns(adapter.provider_id())
+                && !crate::server::core::plugin_host::wasm::has_capability(adapter.provider_id(), "login.sms.v1")
+            {
+                return Err(GatewayError::with_status(502, "WASM 插件未声明短信登录能力"));
+            }
+            sms.validate()?;
+            if sms.challenge.is_some()
+                && (adapter.provider_id() != "codar"
+                    || (crate::server::core::plugin_host::wasm::owns(adapter.provider_id())
+                        && !crate::server::core::plugin_host::wasm::has_capability(adapter.provider_id(), "login.sms.alicom4.v1")))
+            {
+                return Err(GatewayError::with_status(502, "插件未声明短信人机验证能力"));
+            }
+            sms.phone_label = login_text(&sms.phone_label);
+            sms.phone_placeholder = login_text(&sms.phone_placeholder);
+            for country in &mut sms.country_codes { country.label = login_text(&country.label); }
+            method.browser_mode = Some("none".to_string());
+        } else if method.sms.is_some() {
+            return Err(GatewayError::with_status(502, "非短信登录方式不能声明短信参数"));
+        }
         let mut keys = std::collections::HashSet::new();
         for prompt in &mut method.prompts {
             if prompt.key.is_empty() || prompt.key.len() > 64 ||
@@ -368,6 +425,26 @@ async fn read_login_methods(
                 }
             }
         }
+        if let Some(file) = &method.file {
+            if !matches!(method.kind, LoginMethodType::Api) || method.dynamic_prompts
+                || file.accept.len() > 512 || file.accept.chars().any(char::is_control)
+                || file.max_bytes == 0 || file.max_bytes > if file.binary { 32 * 1024 * 1024 } else { 262_144 }
+                || !method.prompts.iter().any(|prompt| prompt.key == file.field
+                    && matches!(prompt.kind, LoginPromptType::Text) && prompt.when.is_none())
+                || file.binary && (!crate::server::core::plugin_host::wasm::has_capability(adapter.provider_id(), "resources.cookie-file.v1")
+                    || adapter.provider_id() != "kuku") {
+                return Err(GatewayError::with_status(502, "插件凭据文件声明无效"));
+            }
+        }
+        if method.local_only && method.browser_mode.as_deref() == Some("none")
+            && crate::server::core::plugin_host::wasm::has_capability(adapter.provider_id(), "desktop.credentials.v1") {
+            method.kind = LoginMethodType::Desktop;
+        }
+        if matches!(method.kind, LoginMethodType::Desktop) && (!method.local_only || method.browser_mode.as_deref() != Some("none")
+            || method.manual_callback || !method.prompts.is_empty()
+            || !crate::server::core::plugin_host::wasm::has_capability(adapter.provider_id(), "desktop.credentials.v1")) {
+            return Err(GatewayError::with_status(502, "插件本机导入契约无效"));
+        }
         if method.local_only && matches!(method.kind, LoginMethodType::Api) {
             return Err(GatewayError::with_status(502, "本机登录不能进入复制 API 凭证路线"));
         }
@@ -379,8 +456,7 @@ async fn read_login_methods(
     Ok(Some(metadata))
 }
 
-/// 成功数据 `{methods:[...], instructions?}`。404 / 501 表示没有动态元数据，
-/// 调用方回到既有表单；不携带 methodIndex 的旧 POST /start 不做这次探测。
+/// 返回已校验的动态登录方式；缺少声明时明确报错，不回退旧表单。
 pub async fn login_methods(
     State(state): State<ServerState>,
     Query(params): Query<std::collections::HashMap<String, String>>,
@@ -395,7 +471,7 @@ pub async fn login_methods(
             Ok(value) => ok_json(value),
             Err(_) => management_error(502, "登录方式元数据无法序列化"),
         },
-        Ok(None) => management_error(501, "该提供商尚未申报动态登录方式，请使用既有登录入口"),
+        Ok(None) => management_error(501, "该提供商未声明动态登录方式，请更新插件或网关后重试；不会使用旧版兼容入口。"),
         Err(error) => management_error(error.status_code, error.message),
     }
 }
@@ -454,7 +530,7 @@ fn checked_login_proxy(
     value: Option<&Value>,
 ) -> Result<Option<crate::server::core::login::LoginProxySelection>, crate::server::errors::GatewayError> {
     use crate::server::core::login::LoginProxySelection;
-    use crate::server::core::proxies::{normalize_account_proxy, resolve_account_proxy, ResolvedProxy};
+    use crate::server::core::proxies::{chain, normalize_account_proxy, resolve_account_proxy, ResolvedProxy};
     use crate::server::errors::GatewayError;
     let Some(value) = value else { return Ok(None) };
     if !value.is_null() && !value.is_object() {
@@ -467,7 +543,9 @@ fn checked_login_proxy(
         .map_err(|_| GatewayError::bad_request("登录代理配置无效，请检查代理来源、主机与端口"))?
         .unwrap_or_else(|| json!({ "source": "direct" }));
     if config.get("source").and_then(Value::as_str) == Some("direct") {
-        return Ok(Some(LoginProxySelection { config, resolved: Value::Null }));
+        let selected = chain::capture_selected(None)
+            .map_err(|_| GatewayError::bad_request("登录直连出口无法准备"))?;
+        return Ok(Some(LoginProxySelection { config, resolved: Value::Null, selected }));
     }
     if crate::server::core::proxies::is_rotate_config(&config) {
         return Err(GatewayError::bad_request("登录代理不支持轮询出网，请选择一条已保存的代理"));
@@ -479,14 +557,13 @@ fn checked_login_proxy(
         return Err(GatewayError::bad_request("登录代理无法解析，请检查所选代理是否存在且已启用"));
     }
     let proxy = ResolvedProxy::from_json(&resolution.to_json())
-        .map_err(|_| GatewayError::bad_request("登录代理出口无效，请检查主机与端口"))?;
-    let wire = proxy.map(|proxy| agent2api_provider_protocol::WireProxy {
-        protocol: proxy.protocol, host: proxy.host, port: proxy.port,
-        username: proxy.username, password: proxy.password,
-    });
-    let resolved = serde_json::to_value(wire)
-        .map_err(|_| GatewayError::bad_request("登录代理无法序列化"))?;
-    Ok(Some(LoginProxySelection { config, resolved }))
+        .map_err(|_| GatewayError::bad_request("登录代理出口无效，请检查主机与端口"))?
+        .ok_or_else(|| GatewayError::bad_request("所选登录代理未返回出口，已拒绝回退直连"))?;
+    let selected = chain::capture_selected(Some(proxy))
+        .map_err(|_| GatewayError::bad_request("登录代理链无法准备，请检查所选代理及系统上游"))?;
+    let resolved = selected.wire_json()
+        .map_err(|_| GatewayError::bad_request("登录代理出口无法准备，已拒绝回退默认出口"))?;
+    Ok(Some(LoginProxySelection { config, resolved, selected }))
 }
 
 fn login_start_response(
@@ -502,6 +579,7 @@ fn login_start_response(
         "edition": edition, "provider": provider,
         "instructions": crate::server::core::login::login_text(&start.instructions),
         "pollIntervalMs": start.poll_interval_ms,
+        "timeoutMs": crate::server::core::providers::subscriptions::login_timeout_ms(provider),
         "externalBrowser": start.external_browser,
         "allowedHosts": start.allowed_hosts,
         "manualCallback": manual_callback,
@@ -511,22 +589,13 @@ fn login_start_response(
 
 // ─── POST /api/session/login/start ──────────────────────────
 
-/// 发起登录：显式 methodIndex 时校验动态 methods；旧调用保持专用入口。
+/// 发起登录前校验当前提供商声明的方法索引与输入。
 /// 空 URL 可用于本机 / 自动登录，但必须有非空 flow，最终仍只看轮询 Done。
 ///
-/// ── `provider` 维度 ───────────────────────────────────────
-/// body 里的可选 `provider`（缺省 = workbuddy）决定走哪条链：
-///   - **由插件接管的家**（含全部内置家装上插件后、以及第三方 provider）→
-///     `start_plugin_web_login`：问插件的 `login.start` 拿完整 `LoginStart`
-///     （授权地址 + flow + 流程形态），回调型等 `login.callback`、轮询型由网关
-///     按 `pollIntervalMs` 问 `login.poll`；
-///   - 注册表里的 provider 但**没有插件接管** → 503，指名「需要安装插件」；
-///   - 注册表里没有的 id → 400「未知的提供商」（不静默回落 workbuddy：
-///     那会把一次小浣熊登录发起成 workbuddy 登录）。
-///
-/// 网关已经没有任何一家的登录实现 —— 这一段的分流只有「插件」与「没装插件」
-/// 两种结果，不再有内置换码的分支。
-pub async fn login_start(State(state): State<ServerState>, body: Bytes) -> Response {
+/// 提供商身份和登录方式索引必须显式给出。插件声明与启动共用同一个
+/// 适配器，主程序订阅使用自身声明；缺少执行体或声明时明确拒绝。
+pub async fn login_start(State(state): State<ServerState>, headers: HeaderMap, body: Bytes,
+) -> Response {
     // 请求里的 `edition` 不再参与地区判定：拆家后界面上两张卡片各发各的
     // provider id，那是权威（`edition` 只是前端回显字段，见下面 Qoder /
     // ZCode 两个分支的说明）。解析失败不是错误（Node 版 `catch { edition = null }`）。
@@ -536,24 +605,62 @@ pub async fn login_start(State(state): State<ServerState>, body: Bytes) -> Respo
         .and_then(|payload| payload.get("provider").and_then(Value::as_str))
         .map(str::trim)
         .unwrap_or("");
-    // 显式索引走动态契约，先于旧 AutoClaw 特判；没有索引的旧调用完全不探测
-    // auth.methods，仍保留各家的专用登录入口及支持位判定。
+    if provider.is_empty() { return management_error(400, "缺少 provider"); }
+    if !crate::server::core::providers::is_executable_provider(provider) {
+        return management_error(503, "该提供商当前不可用，请安装并启用对应插件后重试");
+    }
+    if payload.as_ref().is_none_or(|value| value.get("methodIndex").is_none()) {
+        return management_error(400, "请从添加账号页面选择当前提供商声明的登录方式；旧版默认登录入口已停止支持。");
+    }
+    let local_source = if provider == "trae" && crate::server::core::plugin_host::wasm::owns(provider) {
+        trae_login_source(&headers)
+    } else { None };
     if let Some(request) = payload.as_ref().filter(|value| value.get("methodIndex").is_some()) {
         let Some(index) = request.get("methodIndex").and_then(Value::as_u64) else {
             return management_error(400, "methodIndex 必须是非负整数");
         };
-        let provider = if provider.is_empty() { "workbuddy" } else { provider };
+        if provider == "trae" && index == 0 && crate::server::core::plugin_host::wasm::owns(provider) && local_source.is_none() {
+            return management_error(403, "Trae 网页登录需要有效的面板管理会话，请登录面板后重新发起");
+        }
         let Some(adapter) = crate::server::core::providers::adapter::adapter_by_id(provider) else {
             return management_error(400, format!("未知的提供商：{provider}"));
         };
-        let metadata = match read_login_methods(&state, adapter.as_ref(), None).await {
+        // 语言只用于当前流程的公开文案；旧端不传时保持简体中文，不作为来源或权限。
+        let locale = match request.get("locale") {
+            None => "zh-CN",
+            Some(Value::String(locale)) if matches!(locale.as_str(), "zh-CN" | "zh-Hans" | "en" | "ja" | "ko" | "pt-BR" | "zh-Hant") => locale.as_str(),
+            Some(_) => return management_error(400, "locale 必须是支持的界面语言"),
+        };
+        let metadata = match read_login_methods(&state, adapter.as_ref(), Some(locale)).await {
             Ok(Some(metadata)) => metadata,
-            Ok(None) => return management_error(501, "该提供商尚未申报动态登录方式，请使用既有登录入口"),
+            Ok(None) => return management_error(501, "该提供商未声明动态登录方式，请更新插件或网关后重试；不会使用旧版兼容入口。"),
             Err(error) => return management_error(error.status_code, error.message),
         };
         let Some(method) = metadata.methods.iter().find(|method| method.method_index == index) else {
             return management_error(400, "methodIndex 不在该提供商的登录方式清单中");
         };
+        if let Some(reason) = &method.unavailable_reason {
+            return management_error(503, reason.clone());
+        }
+        if matches!(method.kind, LoginMethodType::Api | LoginMethodType::Desktop) {
+            return management_error(400, "凭据和本机导入方式应通过添加账号入口提交");
+        }
+        if matches!(method.kind, LoginMethodType::Sms) {
+            if request.get("inputs").is_some_and(|value| value.as_object().is_none_or(|object| !object.is_empty())) {
+                return management_error(400, "短信输入应提交到当前登录步骤");
+            }
+            let proxy = match checked_login_proxy(request.get("proxy")) {
+                Ok(proxy) => proxy,
+                Err(error) => return management_error(error.status_code, error.message),
+            };
+            let Some(config) = method.sms.clone() else {
+                return management_error(502, "插件未提供短信登录声明");
+            };
+            return match crate::server::core::login::sms::start(&state, adapter, index, config, proxy).await {
+                Ok(value) => ok_json(value),
+                Err(error) => management_error(error.status_code, error.message),
+            };
+        }
         let inputs = match checked_login_inputs(method, request.get("inputs")) {
             Ok(inputs) => inputs,
             Err(error) => return management_error(error.status_code, error.message),
@@ -569,10 +676,25 @@ pub async fn login_start(State(state): State<ServerState>, body: Bytes) -> Respo
         if method.desktop_only && mode != "embedded" {
             return management_error(400, "此登录方式需要桌面应用的内嵌窗口；浏览器或手机端请使用其他登录方式");
         }
-        let mut options = json!({ "methodIndex": index, "inputs": inputs, "mode": mode });
+        let mut options = json!({ "methodIndex": index, "inputs": inputs, "mode": mode, "locale": locale });
+        if provider == "raccoon" && mode == "external" {
+            if let Some(raw) = request.get("callbackOrigin").and_then(Value::as_str) {
+                let origin = match callback_origin(raw) {
+                    Ok(origin) => origin,
+                    Err(error) => return management_error(error.status_code, error.message),
+                };
+                options["callbackOrigin"] = json!(origin);
+            }
+        }
         if let Some(selection) = &proxy {
             options["proxy"] = selection.resolved.clone();
         }
+        let request_id = request
+            .get("requestId")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
         let instructions = [metadata.instructions.as_deref(), method.instructions.as_deref()]
             .into_iter().flatten().filter(|text| !text.trim().is_empty())
             .collect::<Vec<_>>().join("\n");
@@ -580,96 +702,17 @@ pub async fn login_start(State(state): State<ServerState>, body: Bytes) -> Respo
             adapter,
             proxy,
             options,
+            request_id,
             local_only: method.local_only,
             manual_callback: method.manual_callback,
             callback_input: method.callback_input,
             validates_callback: method.validates_callback,
+            local_source,
             instructions: (!instructions.is_empty()).then_some(instructions),
         };
-        return start_plugin_web_login(state, provider.to_string(), Some(selected)).await;
+        return start_plugin_web_login(state, provider.to_string(), selected).await;
     }
-    // AutoClaw：网页登录走**另一条入口**（`/api/session/login/oauth/start`），
-    // 必须在下面所有分流之前挡掉 —— 通用插件链会回「插件未能生成授权地址」，
-    // 而国际版是**支持**的，只是发起方式不同（授权地址要先过一次浏览器端风控
-    // 验证码，由前端拿地址再交壳开窗口）。
-    if let Some(region) = crate::server::core::providers::autoclaw::Region::from_provider_id(provider) {
-        let message = if region == crate::server::core::providers::autoclaw::Region::Intl {
-            "AutoClaw 国际版的网页登录需要先完成一次风控验证，请回到「添加账号」弹窗，             用「网页登录（Zai / Google）」发起"
-        } else {
-            // 国内版确实没有 OAuth（上游 oauth-captcha-config 返回 enabled:false），
-            // 它的官方唯一登录方式是手机验证码 —— 文案要指向那条
-            "AutoClaw 国内版没有网页授权登录，请改用「手机验证码登录」或「填写凭证」"
-        };
-        return management_error(400, message);
-    }
-    // 注册表是 provider 白名单的唯一事实来源（见 providers::kind_from_id 的说明）
-    // 旧入口（没有 methodIndex）也可以带登录代理：内置家与旧插件的登录链
-    // 都要出网（antigravity 尤其 —— 无头服务器上只有应用内代理能到 Google）。
-    // 这里解析一次，随 options 下发；插件按 `payload.proxy` 收（见 antigravity
-    // `login::resolve_login_proxy`），旧插件忽略这个键、行为不变。
-    let legacy_proxy = match checked_login_proxy(
-        payload.as_ref().and_then(|value| value.get("proxy")),
-    ) {
-        Ok(proxy) => proxy,
-        Err(error) => return management_error(error.status_code, error.message),
-    };
-    let legacy_options = match &legacy_proxy {
-        Some(selection) => json!({ "proxy": selection.resolved.clone() }),
-        None => json!({}),
-    };
-    let kind = match provider {
-        "" if crate::server::core::plugin_host::serves_provider("workbuddy") => {
-            return start_plugin_web_login(
-                state,
-                "workbuddy".to_string(),
-                legacy_selected("workbuddy", legacy_proxy, legacy_options),
-            )
-            .await;
-        }
-        "" => crate::server::core::providers::ProviderKind::WorkBuddy,
-        other => match crate::server::core::providers::kind_from_id(other) {
-            // 已被插件接管的内置家：走插件那条路。下面那些分支是**内置实现**
-            // 的登录链，插件接管的同一 id 若从这里进，会拿内置的 OAuth 流程
-            // 换一个插件并不认识的会话（症状是「登录成功但账号不能用」）。
-            Some(_) if crate::server::core::plugin_host::serves_provider(other) => {
-                return start_plugin_web_login(
-                    state,
-                    other.to_string(),
-                    legacy_selected(other, legacy_proxy, legacy_options),
-                )
-                .await;
-            }
-            Some(kind) => kind,
-            // 插件家的 id 不在枚举里（第三方 provider 没有 `ProviderKind`）。
-            // 它们走 `start_plugin_web_login`：`build_login_url_async` 发一次
-            // `login.start` RPC，拿到授权地址与 state 后与内置家同一条收尾链。
-            None => {
-                if crate::server::core::providers::adapter::adapter_by_id(other).is_none() {
-                    return management_error(400, format!("未知的提供商：{other}"));
-                }
-                return start_plugin_web_login(
-                    state,
-                    other.to_string(),
-                    legacy_selected(other, legacy_proxy, legacy_options),
-                )
-                .await;
-            }
-        },
-    };
-    // 走到这里说明：这是注册表里的 provider，但此刻没有插件接管它 ——
-    // 小浣熊 / CatPaw / Qoder / ZCode / WorkBuddy / Trae / OfficeAce / AtomCode /
-    // Cline / AutoClaw 等都属这一类。历史上这里按家分流到各自的
-    // `start_web_login`，那套实现已逐家搬空。
-    // 内置实现已经一家不剩（`implemented_kinds()` 为空），所以剩下的每种
-    // 情况都只有「没装插件」这一个解释。直接说清楚，而不是回一句「这家不支持
-    // 网页登录」—— 后者会让用户去翻凭证格式，而真正该做的是装插件。
-    management_error(
-        503,
-        format!(
-            "{}的网页登录需要安装提供商插件：本版本不再内置该家的登录实现",
-            crate::server::core::providers::meta(kind).label
-        ),
-    )
+    management_error(400, "缺少有效的登录方式索引")
 }
 
 /// 插件家的网页登录分支。
@@ -687,34 +730,37 @@ pub async fn login_start(State(state): State<ServerState>, body: Bytes) -> Respo
 async fn start_plugin_web_login(
     state: ServerState,
     provider: String,
-    selected: Option<SelectedLogin>,
+    selected: SelectedLogin,
 ) -> Response {
-    let selected = match selected {
-        Some(selected) => selected,
-        None => {
-            let Some(adapter) = crate::server::core::providers::adapter::adapter_by_id(&provider) else {
-                return management_error(400, format!("未知的提供商：{provider}"));
-            };
-            if !adapter.supports_web_login() {
-                return management_error(400, format!(
-                    "{}不支持网页登录，请改用「填写凭证」或「导入桌面端登录态」添加账号", adapter.label(),
-                ));
-            }
-            SelectedLogin {
-                adapter, proxy: None, options: json!({}), local_only: false,
-                manual_callback: false, callback_input: LoginCallbackInput::Url,
-                validates_callback: false, instructions: None,
-            }
-        }
-    };
-    let SelectedLogin { adapter, proxy, options, local_only, manual_callback, callback_input, validates_callback, instructions } = selected;
+    let SelectedLogin { adapter, proxy, options, request_id, local_only, manual_callback, callback_input, validates_callback, local_source, instructions } = selected;
     let label = adapter.label();
     let method_index = options.get("methodIndex").and_then(Value::as_u64);
-    let mut start = match adapter.build_login_flow_with_options(options).await {
+    if let Some(index) = method_index.filter(|index| adapter.supports_managed_login(*index)) {
+        return match crate::server::core::login::managed::start(&state, adapter, index, options, proxy, local_source) {
+            Ok(value) => ok_json(value),
+            Err(error) => management_error(error.status_code, error.message),
+        };
+    }
+    let (cancel_token, _pending_guard) = state.login().register_pending(request_id.as_deref());
+    if cancel_token.is_cancelled() {
+        return management_error(400, "登录已取消");
+    }
+    let start_result = tokio::select! {
+        biased;
+        _ = cancel_token.cancelled() => return management_error(400, "登录已取消"),
+        result = crate::server::core::plugin_host::wasm::desktop_credentials::import_scope(
+            &provider, local_only, adapter.build_login_flow_with_options_cancellable(options, cancel_token.clone()),
+        ) => result,
+    };
+    let mut start = match start_result {
         Ok(Some(start)) => start,
         Ok(None) => return management_error(400, format!("{label}未能生成登录流程，请重试")),
         Err(error) => return management_error(error.status_code, error.message),
     };
+    if cancel_token.is_cancelled() {
+        let _ = adapter.login_cancel_async(&start.flow).await;
+        return management_error(400, "登录已取消");
+    }
     if start.flow.trim().is_empty() {
         return management_error(502, "插件没有返回登录流程 id");
     }
@@ -734,6 +780,7 @@ async fn start_plugin_web_login(
     let handle = state.login().new_handle_for_adapter(edition, adapter.clone(), proxy);
     handle.update(|task| {
         task.state = Some(start.flow.clone());
+        task.request_id = request_id;
         task.auth_url = Some(start.url.clone());
         task.allowed_hosts = start.allowed_hosts.clone();
         task.validates_callback = validates_callback;
@@ -796,9 +843,9 @@ pub(crate) fn spawn_plugin_login_poll(
     provider: String,
 ) {
     crate::spawn_task(async move {
-        let deadline = tokio::time::Instant::now()
-            + std::time::Duration::from_millis(crate::server::core::login::LOGIN_TIMEOUT_MS);
-        let interval = Duration::from_millis(interval_ms.clamp(1_000, LOGIN_TIMEOUT_MS));
+        let timeout_ms = crate::server::core::providers::subscriptions::login_timeout_ms(&provider);
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_ms);
+        let interval = Duration::from_millis(interval_ms.clamp(1_000, timeout_ms));
         loop {
             tokio::time::sleep(interval).await;
             let _operation = handle.operation.lock().await;
@@ -841,7 +888,7 @@ pub(crate) fn spawn_plugin_login_poll(
                     return;
                 }
                 Err(error) => {
-                    crate::server::core::login::fail_plugin_login(&handle, &error.message);
+                    crate::server::core::login::fail_plugin_login_with_error(&handle, &error);
                     handle.cancel_provider_flow_locked(&flow).await;
                     return;
                 }
@@ -868,18 +915,30 @@ pub async fn login_wait(
 // ─── POST /api/session/login/cancel ─────────────────────────
 
 pub async fn login_cancel(State(state): State<ServerState>, body: Bytes) -> Response {
-    let task_state = parse_body(&body)
-        .ok()
-        .and_then(|payload| {
-            payload
-                .get("state")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        })
-        .unwrap_or_default();
-    // 走 LoginService 那一层（而不是 `tasks().cancel`）：AutoClaw 那条链借来的
-    // 回调端口挂在它的待办表上，取消时得一起释放（见 `LoginService::cancel`）
-    let canceled = state.login().cancel_async(&task_state).await;
+    let payload = parse_body(&body).ok();
+    let task_state = payload
+        .as_ref()
+        .and_then(|payload| payload.get("state").and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let request_id = payload
+        .as_ref()
+        .and_then(|payload| payload.get("requestId").and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    // 走 LoginService 那一层（而不是 `tasks().cancel`）：既清理进行中的启动请求，
+    // 也释放插件侧会话与回调端口（见 `LoginService::cancel`）。
+    let mut canceled = match task_state.as_deref() {
+        Some(target) => state.login().cancel_async(target).await,
+        None => false,
+    };
+    if !canceled {
+        if let Some(req) = request_id.as_deref().filter(|req| Some(*req) != task_state.as_deref()) {
+            canceled = state.login().cancel_async(req).await;
+        }
+    }
     ok_json(json!({ "canceled": canceled }))
 }
 
@@ -920,6 +979,12 @@ pub async fn login_callback(State(state): State<ServerState>, body: Bytes) -> Re
         .to_string();
     if callback_url.trim().is_empty() {
         return management_error(400, "缺少 callbackUrl（登录回调地址）");
+    }
+    if state.login().tasks().get(&task_state).is_some_and(|task| task.snapshot().managed) {
+        return management_error(400, "托管登录请在当前步骤提交完整回调，不接受旧回调入口");
+    }
+    if state.login().tasks().get(&task_state).is_some_and(|task| task.snapshot().sms) {
+        return management_error(400, "短信登录请在当前步骤提交验证码，不接受网页回调");
     }
     let validates_callback = state.login().tasks().get(&task_state)
         .is_some_and(|task| task.snapshot().validates_callback);
@@ -1017,49 +1082,44 @@ pub async fn login_callback(State(state): State<ServerState>, body: Bytes) -> Re
 /// 登录任务生成的不可预测 state 承担（插件侧再逐字比对一次）。
 pub async fn login_remote_callback(
     State(state): State<ServerState>,
-    Query(params): Query<std::collections::HashMap<String, String>>,
+    OriginalUri(uri): OriginalUri,
+    headers: HeaderMap,
 ) -> Response {
-    let task_state = params.get("state").cloned().unwrap_or_default();
-    if let Some(error) = params.get("error").filter(|value| !value.trim().is_empty()) {
-        let error = state.login().reject_login_callback(&task_state, error).await;
-        return oauth_callback_page(error.status_code, &error.message);
+    use crate::server::core::login::callback_page;
+
+    let params = url::form_urlencoded::parse(uri.query().unwrap_or("").as_bytes()).collect::<Vec<_>>();
+    let states = params.iter().filter(|(key, _)| key == "state").collect::<Vec<_>>();
+    if states.len() != 1 || states[0].1.is_empty() {
+        return callback_page::error_response(400, None, "回调缺少唯一 state，请重新发起网页登录");
     }
-    let code = params
-        .get("code")
-        .or_else(|| params.get("authorization_code"))
-        .cloned()
-        .unwrap_or_default();
-    drop(params);
-    if task_state.trim().is_empty() || code.trim().is_empty() {
-        return oauth_callback_page(
-            400,
-            "登录失败：回调缺少 state 或授权码，请重新发起网页登录。",
+    let task_state = states[0].1.to_string();
+    let Some(task) = state.login().tasks().get(&task_state) else {
+        return callback_page::expired_response(None);
+    };
+    let provider = task.snapshot().provider;
+    let provider_ref = (!provider.trim().is_empty()).then_some(provider.as_str());
+    if provider == "raccoon" && task.snapshot().method_index.is_some() {
+        let callback = match original_callback_url(&uri, &headers) {
+            Ok(value) => value,
+            Err(error) => return callback_page::error_response(error.status_code, provider_ref, &error.message),
+        };
+        return callback_page::submission_response(
+            state.login().submit_login_callback(&task_state, &callback).await,
+            provider_ref,
         );
     }
-    // 这是既有的「只交一次性 code」中转，不是 provider 的真实 callback URL。
-    // 不伪造 localhost URL：旧插件会校验真实 scheme/host/path（例如小浣熊），
-    // 合成一个占位 URL 再保留它反而会破坏旧登录。完整 URL 走 POST /callback。
-    match state
-        .login()
-        .submit_login_callback(&task_state, &code)
-        .await
-    {
-        Ok(crate::server::core::login::LoginCallbackSubmission::Completed(_)) => {
-            oauth_callback_page(200, "登录成功，已返回网关，可以关闭此页面。")
-        }
-        Ok(crate::server::core::login::LoginCallbackSubmission::Accepted) => {
-            oauth_callback_page(200, "回调已接收，登录仍在处理中，请返回面板等待。")
-        }
-        Ok(crate::server::core::login::LoginCallbackSubmission::Retry(message)) => {
-            oauth_callback_page(400, &message)
-        }
-        Ok(crate::server::core::login::LoginCallbackSubmission::ContinueTo(_)) => {
-            oauth_callback_page(400, "登录回调仍需继续，请重新发起网页登录。")
-        }
-        Err(error) => {
-            oauth_callback_page(error.status_code, &format!("登录失败：{}", error.message))
-        }
+    if let Some((_, error)) = params.iter().find(|(key, value)| key == "error" && !value.trim().is_empty()) {
+        let error = state.login().reject_login_callback(&task_state, error).await;
+        return callback_page::error_response(error.status_code, provider_ref, &error.message);
     }
+    let codes = params.iter().filter(|(key, _)| matches!(key.as_ref(), "code" | "authorization_code")).collect::<Vec<_>>();
+    if codes.len() != 1 || codes[0].1.trim().is_empty() {
+        return callback_page::error_response(400, provider_ref, "回调缺少唯一授权码，请重新发起网页登录");
+    }
+    callback_page::submission_response(
+        state.login().submit_login_callback(&task_state, &codes[0].1).await,
+        provider_ref,
+    )
 }
 
 // ─── POST /api/session/login/sms/send 与 /verify ────────────
@@ -1749,37 +1809,6 @@ pub async fn login_oauth_start(State(state): State<ServerState>, body: Bytes) ->
     ok_json(body)
 }
 
-/// OAuth 回调结果页（浏览器停在它上边，用户看到人话即可）。
-///
-/// 不带任何脚本与外链：这一页的内容我们完全控制，注入面越小越好。
-/// 状态码可能是 410（登录上下文已丢失）这类非 200 —— 统一用 `from_u16`
-/// 兜底成 200，避免一个非法状态码让响应构造失败。
-fn oauth_callback_page(status: i32, message: &str) -> Response {
-    use axum::response::IntoResponse;
-
-    let escaped = message
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;");
-    let html = format!(
-        "<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\">\
-         <title>登录回调</title></head>\
-         <body style=\"font-family:system-ui,sans-serif;padding:48px;text-align:center\">\
-         <p style=\"font-size:16px\">{escaped}</p></body></html>"
-    );
-    let status = u16::try_from(status)
-        .ok()
-        .and_then(|code| axum::http::StatusCode::from_u16(code).ok())
-        .unwrap_or(axum::http::StatusCode::OK);
-    (
-        status,
-        [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
-        html,
-    )
-        .into_response()
-}
-
 // ─── /auth/callback（LobsterAI 的 loopback 回调）─────────────
 
 /// LobsterAI 网页登录的回调。**浏览器 302 到这里**（授权页完成后顶层导航回我们
@@ -1798,33 +1827,40 @@ pub async fn login_lobsterai_callback(
     headers: axum::http::HeaderMap,
     Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> Response {
+    use crate::server::core::login::callback_page;
+    use crate::server::core::providers::{kind_id, ProviderKind};
+
+    let lobsterai = kind_id(ProviderKind::LobsterAi);
     let task_state = params.get("state").cloned().unwrap_or_default();
     if let Some(task) = state.login().tasks().get(&task_state) {
         let snapshot = task.snapshot();
-        if snapshot.provider != crate::server::core::providers::kind_id(crate::server::core::providers::ProviderKind::LobsterAi) {
-            return oauth_callback_page(400, "这次登录不属于 LobsterAI");
+        if snapshot.provider != lobsterai {
+            return callback_page::error_response(400, None, "这次登录不属于 LobsterAI");
         }
         if let Some(error) = params.get("error").filter(|value| !value.trim().is_empty()) {
             let error = state.login().reject_login_callback(&task_state, error).await;
-            return oauth_callback_page(error.status_code, &error.message);
+            return callback_page::error_response(error.status_code, Some(lobsterai), &error.message);
         }
         if task.adapter().is_some() {
             let callback_url = match original_callback_url(&uri, &headers) {
                 Ok(url) => url,
-                Err(error) => return oauth_callback_page(error.status_code, &error.message),
+                Err(error) => return callback_page::error_response(error.status_code, Some(lobsterai), &error.message),
             };
-            return login_callback_page(state.login().submit_login_callback(&task_state, &callback_url).await);
+            return callback_page::submission_response(
+                state.login().submit_login_callback(&task_state, &callback_url).await,
+                Some(lobsterai),
+            );
         }
     }
     if let Some(error) = params.get("error").filter(|value| !value.trim().is_empty()) {
         let error = state.login().reject_login_callback(&task_state, error).await;
-        return oauth_callback_page(error.status_code, &error.message);
+        return callback_page::error_response(error.status_code, Some(lobsterai), &error.message);
     }
     // 未绑定的旧强类型任务仍走专用收尾，不改变其解析与落库契约。
     let code = params.get("code").cloned().unwrap_or_default();
     match state.login().finish_lobsterai_login(&code, &task_state).await {
-        Ok(_) => oauth_callback_page(200, "登录成功，已返回网关，可以关闭此页面。"),
-        Err(error) => oauth_callback_page(error.status_code, &format!("登录失败：{}", error.message)),
+        Ok(_) => callback_page::success_response(Some(lobsterai)),
+        Err(error) => callback_page::error_response(error.status_code, Some(lobsterai), &error.message),
     }
 }
 
@@ -1854,25 +1890,36 @@ pub async fn login_antigravity_callback(
     headers: axum::http::HeaderMap,
     Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> Response {
+    use crate::server::core::login::callback_page;
+    use crate::server::core::providers::{kind_id, ProviderKind};
+
+    let antigravity = kind_id(ProviderKind::Antigravity);
     let code = params.get("code").cloned().unwrap_or_default();
     let task_state = params.get("state").cloned().unwrap_or_default();
     if let Some(error) = params.get("error").filter(|value| !value.trim().is_empty()) {
         let error = state.login().reject_login_callback(&task_state, error).await;
-        return oauth_callback_page(error.status_code, &error.message);
+        return callback_page::error_response(error.status_code, Some(antigravity), &error.message);
     }
     if task_state.trim().is_empty() || code.trim().is_empty() {
-        return oauth_callback_page(400, "登录失败：回调缺少 state 或授权码，请重新发起网页登录。");
+        return callback_page::error_response(
+            400,
+            Some(antigravity),
+            "回调缺少 state 或授权码，请重新发起网页登录",
+        );
     }
     let callback_url = match original_callback_url(&uri, &headers) {
         Ok(url) => url,
-        Err(error) => return oauth_callback_page(error.status_code, &error.message),
+        Err(error) => return callback_page::error_response(error.status_code, Some(antigravity), &error.message),
     };
-    login_callback_page(state.login().submit_login_callback(&task_state, &callback_url).await)
+    callback_page::submission_response(
+        state.login().submit_login_callback(&task_state, &callback_url).await,
+        Some(antigravity),
+    )
 }
 
 /// HTTP 请求不携带 fragment；只补原始请求的 origin，保留 path/query 的原始编码，
 /// 不从已解码的 Query 重新拼 code/state，不伪造 localhost 或丢弃其它供应商参数。
-fn original_callback_url(
+pub(super) fn original_callback_url(
     uri: &axum::http::Uri,
     headers: &axum::http::HeaderMap,
 ) -> Result<String, crate::server::errors::GatewayError> {
@@ -1884,19 +1931,6 @@ fn original_callback_url(
         .map_err(|_| GatewayError::bad_request("登录回调主机地址无效"))?;
     let scheme = uri.scheme_str().unwrap_or("http");
     Ok(format!("{scheme}://{host}{uri}"))
-}
-
-fn login_callback_page(
-    result: Result<crate::server::core::login::LoginCallbackSubmission, crate::server::errors::GatewayError>,
-) -> Response {
-    use crate::server::core::login::LoginCallbackSubmission;
-    match result {
-        Ok(LoginCallbackSubmission::Completed(_)) => oauth_callback_page(200, "登录成功，已返回网关，可以关闭此页面。"),
-        Ok(LoginCallbackSubmission::Accepted) => oauth_callback_page(200, "回调已接收，登录仍在处理中，请返回面板等待。"),
-        Ok(LoginCallbackSubmission::Retry(message)) => oauth_callback_page(400, &message),
-        Ok(LoginCallbackSubmission::ContinueTo(_)) => oauth_callback_page(400, "登录回调仍需继续，请重新发起网页登录。"),
-        Err(error) => oauth_callback_page(error.status_code, &format!("登录失败：{}", error.message)),
-    }
 }
 
 // ─── POST /api/session/refresh ──────────────────────────────

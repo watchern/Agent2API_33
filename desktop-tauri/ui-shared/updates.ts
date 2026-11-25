@@ -1,4 +1,26 @@
-import type { GithubFailure } from './github-access'
+export const UPDATE_WEBSITE = 'https://agent2api.dev'
+export const UPDATE_CDN = 'https://cdn.agent2api.dev'
+
+export function websiteDownloadUrl(value: string): boolean {
+  try {
+    const url = new URL(value)
+    if (url.username || url.password || url.search || url.hash) return false
+    if (url.origin === UPDATE_WEBSITE) return url.pathname.startsWith('/downloads/')
+    if (url.origin === UPDATE_CDN) {
+      return url.pathname.startsWith('/agent2api/installers/') || url.pathname.startsWith('/agent2api/plugins/')
+    }
+    return false
+  } catch { return false }
+}
+
+export function updatePageUrl(value?: string | null): string {
+  if (!value) return `${UPDATE_WEBSITE}/downloads`
+  try {
+    const url = new URL(value)
+    return url.origin === UPDATE_WEBSITE && !url.username && !url.password
+      && !url.hash ? url.href : `${UPDATE_WEBSITE}/downloads`
+  } catch { return `${UPDATE_WEBSITE}/downloads` }
+}
 
 export type ForceUpdatePolicy = { required: boolean; minimumVersion: string; targetVersion: string; message: string; source?: string }
 
@@ -66,7 +88,7 @@ export type AssetProbe = {
   assetsTotal?: number
   /** 这些文件出现过的后缀（小写、带点、去重） */
   suffixes?: string[]
-  /** 有文件因更新源的访问方式（加速前缀 / 自定义 API）没通过而被丢掉 */
+  /** 有文件未通过官网地址与版本核对而被丢掉 */
   filteredBySource?: boolean
   /** 本机要找的后缀（桌面安装包；容器内更新是空表） */
   expectedSuffixes?: string[]
@@ -89,7 +111,7 @@ export function assetMissingReason(
   // ① 被更新源的访问方式过滤掉：文件其实传了，是我们这边把它们挡掉了。
   // 先说这条 —— 它的处置办法（去「更新设置」改访问方式）与另外两种完全不同
   if (probe?.filteredBySource) {
-    return t('发布页上的文件被更新源的访问方式过滤掉了，请检查「更新设置」里的 GitHub 访问方式')
+    return t('官网更新包信息异常，请重新检查更新或前往官网下载页')
   }
   // ② 一个文件都没传：构建失败，或者还在打包上传
   if (probe?.assetsTotal === 0) {
@@ -117,38 +139,51 @@ export function assetMissingReason(
     : t('这一版没有为当前平台提供安装包')
 }
 
-export function githubFailureMessage(value: GithubFailure, t: Translator, settings: 'update' | 'plugin', now = Date.now()): string {
-  if (!value.rateLimited && !value.rateLimits?.length) return githubErrorMessage(value.reason, t, settings)
-  const active = (value.rateLimits || []).filter(limit => limit.retryAt > now)
-  if (!active.length) return t('上次 GitHub 限流的等待时间已结束，可重新检查')
-  const first = active.reduce((left, right) => left.retryAt <= right.retryAt ? left : right)
-  const source = [...new Set(active.map(limit => limit.source === 'official' ? t('官方源') : limit.label))].join(' / ')
-  const params = { source, seconds: Math.ceil((first.retryAt - now) / 1000) }
-  const message = first.retrySource === 'fallback'
-    ? t('GitHub 源「{source}」限流，{seconds} 秒后可重试（上游未提供恢复时间）', params)
-    : t('GitHub 源「{source}」限流，请在 {seconds} 秒后重试', params)
-  return value.canRetry ? t('{message}；其他线路可重新检查', { message }) : message
+export function updateErrorMessage(error: unknown, t: Translator): string {
+  const message = error instanceof Error ? error.message : String(error ?? '')
+  return message ? t(message) : ''
 }
 
-export function githubErrorMessage(error: unknown, t: Translator, settings: 'update' | 'plugin'): string {
-  const message = error instanceof Error ? error.message : String(error ?? '')
-  const sourceLimit = /^GitHub 源「(.+)」限流，(?:请在 )?(\d+) 秒后(?:重试|可重试)(（上游未提供恢复时间）)?(；其他线路可重新检查)?$/.exec(message)
-  if (sourceLimit) {
-    const params = { source: sourceLimit[1] === '官方源' ? t('官方源') : sourceLimit[1], seconds: sourceLimit[2] }
-    const text = sourceLimit[3]
-      ? t('GitHub 源「{source}」限流，{seconds} 秒后可重试（上游未提供恢复时间）', params)
-      : t('GitHub 源「{source}」限流，请在 {seconds} 秒后重试', params)
-    return sourceLimit[4] ? t('{message}；其他线路可重新检查', { message: text }) : text
+export function summarizeNetworkError(error: unknown, t: Translator): { summary: string; detail: string } {
+  const raw = (error instanceof Error ? error.message : String(error ?? '')).trim()
+  if (!raw) return { summary: '', detail: '' }
+  const lower = raw.toLowerCase()
+  const official = raw.includes('官网更新服务') || raw.includes('官网社区') || lower.includes('agent2api.dev')
+  const hasDetail = lower.includes('error sending request') || lower.includes('client error') || raw.includes('→') || raw.includes('->') || raw.length > 120
+  let summary = ''
+  if (lower.includes('tls handshake eof') || lower.includes('unexpected eof')) {
+    summary = official
+      ? t('连接官网服务时加密握手中断，可能是临时网络波动或代理异常')
+      : t('网络加密握手中断，可能是临时网络波动或代理异常')
+  } else if (lower.includes('certificate') || lower.includes('invalid peer') || lower.includes('ssl')) {
+    summary = official
+      ? t('连接官网服务时安全校验失败，请检查系统时间或代理配置')
+      : t('安全连接校验失败，请检查系统时间或代理配置')
+  } else if (lower.includes('dns') || lower.includes('failed to lookup') || lower.includes('no such host')) {
+    summary = official
+      ? t('无法解析官网域名，请检查网络或 DNS 设置')
+      : t('域名解析失败，请检查网络或 DNS 设置')
+  } else if (lower.includes('connection refused')) {
+    summary = official
+      ? t('官网服务连接被拒绝，请检查网络或代理端口是否正常')
+      : t('网络连接被拒绝，请检查网络或代理设置')
+  } else if (lower.includes('connection reset') || lower.includes('broken pipe')) {
+    summary = official
+      ? t('与官网服务的连接意外中断，请稍后重试')
+      : t('网络连接被重置，可能是临时波动或代理中断')
+  } else if (lower.includes('timed out') || raw.includes('超时')) {
+    summary = official
+      ? t('连接官网服务超时，请稍后重试或检查出网代理')
+      : t('网络请求超时，请稍后重试或检查代理设置')
+  } else if (lower.includes('429') || lower.includes('rate limit') || raw.includes('限流')) {
+    summary = t('请求过于频繁或触发限流，请稍后再试')
+  } else if (/\bhttp\s*5\d\d\b/i.test(raw) || /\b50[234]\b/.test(raw)) {
+    summary = official
+      ? t('官网服务暂时不可用，请稍后再试')
+      : t('上游服务暂时不可用，请稍后再试')
+  } else if (hasDetail && official) {
+    summary = t('无法连接官网服务，请检查网络或出网代理设置')
   }
-  if (message === '上次 GitHub 限流的等待时间已结束，可重新检查') return t('上次 GitHub 限流的等待时间已结束，可重新检查')
-  if (message === 'GitHub 接口限流中，请在「更新设置」的「GitHub 令牌」中填写凭证，以提高请求限额。'
-    || message === 'GitHub 接口限流中，请在「插件设置」的「GitHub 令牌」中填写凭证，以提高请求限额。') {
-    return settings === 'plugin'
-      ? t('GitHub 接口限流中，请在「插件设置」的「GitHub 令牌」中填写凭证，以提高请求限额。')
-      : t('GitHub 接口限流中，请在「更新设置」的「GitHub 令牌」中填写凭证，以提高请求限额。')
-  }
-  const cooldown = /^GitHub 接口限流中，请在 (\d+) 秒后重试$/.exec(message)
-  if (cooldown) return t('GitHub 接口限流中，请在 {seconds} 秒后重试', { seconds: cooldown[1] })
-  if (message === 'GitHub 接口限流中，请稍后重试') return t('GitHub 接口限流中，请稍后重试')
-  return message
+  if (!summary) return { summary: t(raw), detail: '' }
+  return { summary, detail: raw }
 }

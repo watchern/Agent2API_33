@@ -156,7 +156,10 @@ async fn plugin_header_tables(state: &ServerState) -> (Map<String, Value>, Map<S
     let provider = crate::server::core::providers::kind_id(
         crate::server::core::providers::ProviderKind::ClineFree,
     );
-    let Some(adapter) = adapter::adapter_by_id(provider) else {
+    let Some(adapter) = crate::server::core::plugin_host::serves_provider(provider)
+        .then(|| adapter::adapter_by_id(provider))
+        .flatten()
+    else {
         return (Map::new(), Map::new());
     };
     match adapter

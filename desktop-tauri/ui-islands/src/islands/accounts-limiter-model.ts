@@ -5,11 +5,16 @@ import type { LimiterCondition, LimiterGroup, LimiterGroupState, LimiterReading,
 
 let snapshot: LimiterSnapshot = {}
 
-export function adoptLimiterSnapshot(next: LimiterSnapshot | null | undefined): boolean {
+export function adoptLimiterSnapshot(next: (LimiterSnapshot & { partial?: boolean }) | null | undefined): boolean {
   if (!next?.limiterStates) return false
+  const merged = next.partial ? {
+    ...next, limiterStates: { ...snapshot.limiterStates, ...next.limiterStates },
+    quotaSources: { ...snapshot.quotaSources, ...next.quotaSources },
+    limiterModels: { ...snapshot.limiterModels, ...next.limiterModels },
+  } : next
   const changed = JSON.stringify([snapshot.limiterStates, snapshot.quotaSources, snapshot.limiterModels])
-    !== JSON.stringify([next.limiterStates, next.quotaSources, next.limiterModels])
-  snapshot = { tokenAt: next.tokenAt, limiterStates: next.limiterStates, quotaSources: next.quotaSources, limiterModels: next.limiterModels }
+    !== JSON.stringify([merged.limiterStates, merged.quotaSources, merged.limiterModels])
+  snapshot = { tokenAt: merged.tokenAt, limiterStates: merged.limiterStates, quotaSources: merged.quotaSources, limiterModels: merged.limiterModels }
   return changed
 }
 
@@ -25,22 +30,27 @@ export function groupsOf(account: AccountRecord | null | undefined, legacy: Limi
   }))
 }
 
-export function sourcesOf(account: AccountRecord | null | undefined): QuotaSource[] {
+export function sourcesOf(account: AccountRecord | null | undefined, provider?: string): QuotaSource[] {
+  const providerId = String(account?.provider || provider || '')
   const sources = account ? snapshot.quotaSources?.[account.id] : undefined
   return Array.isArray(sources) ? sources.slice() : [
-    { id: 'account', label: t('账号主额度'), provider: String(account?.provider || '') },
-    { id: 'local', label: t('本地用量保护'), provider: String(account?.provider || ''), localOnly: true },
+    { id: 'account', label: t('账号主额度'), provider: providerId },
+    { id: 'local', label: t('本地用量保护'), provider: providerId, localOnly: true },
   ]
 }
 
-export function modelsOf(account: AccountRecord | null | undefined): Array<{ value: string; label: string }> {
-  const provider = String(account?.provider || '')
-  const models = snapshot.limiterModels?.[provider] || []
+export function modelsOf(account: AccountRecord | null | undefined, provider?: string): Array<{ value: string; label: string }> {
+  const providerId = String(account?.provider || provider || '')
+  const models = snapshot.limiterModels?.[providerId] || []
   return models.map(model => ({ value: model.id, label: model.name && model.name !== model.id ? `${model.name}（${model.id}）` : model.id }))
 }
 
+export function limiterStatesOf(account: AccountRecord | null | undefined): LimiterGroupState[] | undefined {
+  return account ? snapshot.limiterStates?.[account.id] : undefined
+}
+
 export function statesOf(account: AccountRecord | null | undefined): LimiterGroupState[] {
-  return account ? snapshot.limiterStates?.[account.id] || [] : []
+  return limiterStatesOf(account) || []
 }
 
 export function limiterHit(account: AccountRecord | null | undefined, metric?: 'balance' | 'token', action = 'skip'): boolean {
@@ -74,9 +84,9 @@ export function groupHit(conditions: LimiterCondition[], readings: Array<{ hit: 
   return conditions.length > 0 && (any || term)
 }
 
-export function conditionText(condition: LimiterCondition, account?: AccountRecord): string {
+export function conditionText(condition: LimiterCondition, account?: AccountRecord, provider?: string): string {
   const id = condition.sourceId || (condition.metric === 'tokens' || condition.metric === 'requests' ? 'local' : 'account')
-  const current = sourcesOf(account).find(source => source.id === id)
+  const current = sourcesOf(account, provider).find(source => source.id === id)
   const source = sourceLabel(current || condition.source, id)
   const models = condition.models.length ? condition.models.join('、') : t('全部模型')
   const metric = metricLabel(condition.metric)
@@ -124,11 +134,11 @@ function readingReason(reason: string | undefined): string {
   }
 }
 
-export function expressionText(conditions: LimiterCondition[], account?: AccountRecord): string {
+export function expressionText(conditions: LimiterCondition[], account?: AccountRecord, provider?: string): string {
   const terms: string[][] = []
   conditions.forEach((condition, index) => {
     if (index === 0 || condition.join === 'or') terms.push([])
-    terms[terms.length - 1].push(conditionText(condition, account))
+    terms[terms.length - 1].push(conditionText(condition, account, provider))
   })
   return terms.map(term => term.length > 1 ? `（${term.join(` ${t('与')} `)}）` : term[0])
     .join(` ${t('或')} `)

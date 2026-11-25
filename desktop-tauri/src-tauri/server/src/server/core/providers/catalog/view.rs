@@ -271,6 +271,8 @@ pub fn models_by_provider(store: &AccountStore) -> Value {
 #[allow(clippy::too_many_arguments)]
 fn push_managed_model(
     rules: &model_rules::ModelRules,
+    pricing: &crate::server::core::model_pricing::ModelPricingSettings,
+    now_ms: i64,
     models: &mut Vec<Value>,
     mappings: &mut Vec<Value>,
     attached: &mut HashSet<usize>,
@@ -328,6 +330,7 @@ fn push_managed_model(
         "provider": provider, "providerLabel": super::super::label_of(provider),
         "source": source, "enabled": enabled, "aliases": aliases,
         "capabilities": capability::effective(&item),
+        "toolCallingMode": item.get("toolCallingMode"),
         "kind": if super::super::images::model_is_image(&item) { json!("image") }
             else { item.get("kind").cloned().unwrap_or(json!("chat")) },
         "output_modalities": item.get("output_modalities"),
@@ -366,6 +369,7 @@ fn push_managed_model(
         // 「这家没这个信息」和「这家说它不可见」是两件事。
         "upstreamStatus": item.get("upstreamStatus"),
         "visibility": item.get("visibility").cloned().unwrap_or(Value::Null),
+        "pricing": crate::server::core::model_pricing::model_manage_pricing_json(pricing, provider, &id, now_ms),
     }));
 }
 
@@ -419,6 +423,8 @@ pub fn manage_view(store: &AccountStore) -> Value {
     // 时就不列它 —— 页面上根本没有这一家（左栏也不会有它），把它名下的映射列出来
     // 只会多出一批用户在这儿无从下手的条目（要管那家得先去账号页把它加回来）。
     let mut managed_providers = HashSet::new();
+    let pricing = crate::server::core::model_pricing::settings();
+    let now_ms = crate::server::logging::now_ms();
     for (provider, mut manifest) in managed_manifests(store) {
         managed_providers.insert(provider.to_lowercase());
         manifest.sort_by_key(|item| !rules.default_enabled(&provider, &model_id(item)));
@@ -436,7 +442,7 @@ pub fn manage_view(store: &AccountStore) -> Value {
         }));
         for item in manifest.iter().cloned() {
             push_managed_model(
-                &rules, &mut models, &mut mappings, &mut attached, &mut claimed,
+                &rules, &pricing, now_ms, &mut models, &mut mappings, &mut attached, &mut claimed,
                 &provider, source, refreshed_at, &manifest, item,
             );
         }
@@ -474,6 +480,7 @@ pub fn manage_view(store: &AccountStore) -> Value {
         // 时刻 + 条数）。它服务的是「这份档位/能力是什么时候的数据」这个问题 ——
         // 界面上那些档位来自哪一份、新不新，只能由这里回答。
         "modelsDev": model_meta::status(),
+        "pricingSettings": crate::server::core::model_pricing::settings_view(),
     })
 }
 

@@ -11,10 +11,10 @@ import { checkAllowance, preserveRefreshableSignIn } from "./allowance.mjs"
 import { rpc, send, chunk, MAX_CHUNK } from "./wire.mjs"
 import { acquire } from "./concurrency.mjs"
 import { safeMessage } from "./diagnostics.mjs"
-import { loginMethods, validateInputs } from "./login-policy.mjs"
+import { loginMethods, validateInputs, importCredential } from "./login-policy.mjs"
 import { usageReport, checkinReport } from "./reports.mjs"
 import { compatibleUsageResult } from "./usage-policy.mjs"
-import { isLocalProvider, localErrorPolicy, localRequest } from "./local-provider.mjs"
+import { isLocalProvider, localAddress, localErrorPolicy, localRequest } from "./local-provider.mjs"
 import { checkLocalProxy } from "./local-process.mjs"
 
 export { safeMessage }
@@ -41,9 +41,7 @@ async function conversation(provider, params, call) {
   const suffix = protocol === "gemini" ? `models/${encodeURIComponent(model.api?.id || modelID)}:streamGenerateContent?alt=sse`
     : { anthropic: "messages", responses: "responses", chat: "chat/completions" }[protocol]
   const url = new URL(origin.replace(/\/+$/, "") + "/" + suffix)
-  if (!["https:", "http:"].includes(url.protocol)
-    && !(isLocalProvider(provider) && url.protocol === "agy:" && url.hostname === "local"
-      && !url.username && !url.password && typeof options.fetch === "function")) throw new Error("Invalid upstream protocol")
+  if (!["https:", "http:"].includes(url.protocol) && !localAddress(provider, options, url)) throw new Error("Invalid upstream protocol")
   const nativeProtocol = params.native_protocol === "chat_completions" ? "chat" : params.native_protocol
   const native = nativeProtocol === protocol
   if (params.native_protocol && !native) throw unsupported("Account model protocol differs from the requested native protocol")
@@ -55,7 +53,7 @@ async function conversation(provider, params, call) {
   variantOptions(protocol, model, params.body?.reasoning_effort, body)
   localRequest(provider, params, body)
   if (protocol === "chat") body.stream_options = { ...body.stream_options, include_usage: true }
-  const headers = new Headers({ "content-type": "application/json", accept: "text/event-stream" })
+  const headers = new Headers({ "content-type": "application/json", accept: provider.originalID === "joycode" ? "*/*" : "text/event-stream" })
   const key = options.apiKey || auth?.key
   if (key) headers.set(protocol === "gemini" ? "x-goog-api-key" : protocol === "anthropic" ? "x-api-key" : "authorization",
     protocol === "chat" || protocol === "responses" ? `Bearer ${key}` : key)
@@ -135,21 +133,98 @@ async function conversation(provider, params, call) {
 }
 
 async function normalize(provider, params) {
-  if (params.source?.kind !== "manual") throw unsupported("Use the plugin's sign-in method to add this account")
-  const payload = params.source.payload ?? {}
+  const source = params.source ?? {}
+  const context = scope.getStore()
+  if (source.kind === "file_text" || source.kind === "file_base64") {
+    let content = ""
+    if (source.kind === "file_base64") {
+      try { content = Buffer.from(String(source.content ?? ""), "base64").toString("utf8").replace(/^\uFEFF/, "") }
+      catch { throw new Error("凭据文件无法按 UTF-8 文本解码") }
+    } else {
+      content = String(source.content ?? "").replace(/^\uFEFF/, "")
+    }
+    if (!content.trim() || content.includes("\0")) throw new Error("此脚本插件只接受有效的文本凭据文件")
+    context.inputSecrets = [content]
+    context.loginAuth = { key: content }
+    const allMethods = loginMethods(provider)
+    const fileMethod = allMethods.find(method => method.type === "api" && method.file)
+    const apiMethod = fileMethod || allMethods.find(method => method.type === "api" && !method.keyless)
+    let result
+    if (apiMethod && typeof apiMethod.authorize === "function") {
+      const field = typeof apiMethod.file?.field === "string" ? apiMethod.file.field : (apiMethod.prompts?.[0]?.key || "key")
+      const inputs = { [field]: content, ...(field !== "key" ? { key: content } : {}) }
+      await validateInputs(apiMethod, inputs)
+      result = await apiMethod.authorize(inputs, { signal: context.signal, fileName: source.file_name })
+    } else {
+      result = await importCredential(provider, content, { signal: context.signal })
+    }
+    if (result?.type !== "success") throw new Error(result?.error || "Plugin rejected the credentials")
+    context.signal.throwIfAborted()
+    return normalized(provider.id, result, params.name, provider.hooks.auth?.single === true)
+  }
+  if (source.kind !== "manual") throw unsupported("Use the plugin's sign-in method to add this account")
+  const payload = source.payload ?? {}
+  if (payload.methodIndex === undefined) {
+    const raw = JSON.stringify(payload)
+    context.inputSecrets = Object.values(payload).filter(value => typeof value === "string" && value)
+    const result = await importCredential(provider, raw, { signal: context.signal })
+    if (result?.type !== "success") throw new Error(result?.error || "Plugin rejected the credentials")
+    context.signal.throwIfAborted()
+    return normalized(provider.id, result, params.name, provider.hooks.auth?.single === true)
+  }
   const method = loginMethods(provider).find(method => method.methodIndex === payload.methodIndex)
   if (method?.type !== "api") throw unsupported("Select an API key method declared by this plugin")
   const inputs = payload.inputs ?? {}
-  const context = scope.getStore()
   context.inputSecrets = Object.values(inputs).filter(value => typeof value === "string" && value)
   if (typeof inputs.key === "string") context.loginAuth = { key: inputs.key }
   await validateInputs(method, inputs)
-  const result = typeof method.authorize === "function" ? await method.authorize(inputs, { signal: context.signal }) : { type: "success", key: inputs.key, metadata: inputs }
+  const rawKey = typeof inputs.key === "string" ? inputs.key.trim() : ""
+  const isJsonKey = rawKey.startsWith("{") || rawKey.startsWith("[")
+  const result = typeof method.authorize === "function"
+    ? await method.authorize(inputs, { signal: context.signal })
+    : (isJsonKey || (provider.originalID || provider.id) === "commandcode-plan")
+      ? await importCredential(provider, inputs.key, { signal: context.signal, inputs })
+      : { type: "success", key: inputs.key, metadata: inputs }
   if (result?.type !== "success") throw new Error(result?.error || "Plugin rejected the credentials")
   context.signal.throwIfAborted()
-  if (!("refresh" in result)) result.metadata = { ...inputs, ...result.metadata }
-  if (!("refresh" in result) && !("key" in result) && typeof inputs.key === "string") result.key = inputs.key
+  const cleanInputs = { ...inputs }
+  if (method.file?.field) delete cleanInputs[method.file.field]
+  if (isJsonKey) delete cleanInputs.key
+  if (!("refresh" in result)) result.metadata = { ...cleanInputs, ...result.metadata }
+  if (!("refresh" in result) && !("key" in result) && typeof inputs.key === "string" && !isJsonKey) result.key = inputs.key
   return normalized(provider.id, result, params.name, provider.hooks.auth?.single === true)
+}
+
+const USAGE_CATALOG_WARM_TIMEOUT_MS = 2000
+
+async function warmUsageModels(provider) {
+  if (!isLocalProvider(provider) || typeof provider.hooks.provider?.models !== "function") return
+  const account = String(scope.getStore()?.account ?? "")
+  if (!provider.usageCatalogWarmed) provider.usageCatalogWarmed = new Set()
+  if (provider.usageCatalogWarmed.has(account)) return
+  const controller = new AbortController()
+  let timer = null
+  try {
+    const auth = await getAuth()
+    if (!auth) return
+    provider.usageCatalogWarmed.add(account)
+    const work = Promise.resolve(
+      provider.hooks.provider.models(structuredClone(providerInfo(provider)), { auth, signal: controller.signal }),
+    )
+    await Promise.race([
+      work.catch(() => {}),
+      new Promise((resolve) => {
+        timer = setTimeout(() => {
+          controller.abort()
+          resolve()
+        }, USAGE_CATALOG_WARM_TIMEOUT_MS)
+      }),
+    ])
+  } catch {
+    // Usage display still falls back to pool windows when model discovery is unavailable.
+  } finally {
+    if (timer) clearTimeout(timer)
+  }
 }
 
 export async function dispatch(provider, method, params, call) {
@@ -168,17 +243,20 @@ export async function dispatch(provider, method, params, call) {
     case "token.refresh": { const auth = await refresh(provider, true); return auth?.access || auth?.key || "" }
     case "token.expiring": {
       const auth = await getAuth()
+      const requested = Number.isFinite(params?.minLeadMs) && params.minLeadMs > 0 ? params.minLeadMs : 0
+      const lead = Math.max(refreshLead(provider), requested)
       return auth?.type === "oauth" && Number.isFinite(auth.expires) && auth.expires > 0
-        && provider.hooks.auth?.keepAlive !== false && auth.expires <= Date.now() + refreshLead(provider)
+        && provider.hooks.auth?.keepAlive !== false && auth.expires <= Date.now() + lead
     }
     case "usage.query": {
       if (typeof provider.hooks.auth?.usage !== "function") throw unsupported()
       await refresh(provider)
+      await warmUsageModels(provider)
       const context = scope.getStore()
       context.emptyUsage = null
       const value = compatibleUsageResult(await provider.hooks.auth.usage(getAuth, structuredClone(providerInfo(provider))), context)
       await noteSignIn(value?.signIn)
-      const report = usageReport(value)
+      const report = usageReport(value, provider.id)
       if (context.account) await rpc("store.ledger_put", { account: context.account, kind: "magpieUsage", value: { at: Date.now(), report } })
       return report
     }
@@ -195,10 +273,10 @@ export async function dispatch(provider, method, params, call) {
     case "login.callback": return callback(provider, params)
     case "login.cancel": return cancel(provider, params.flow)
     case "admin.action":
-      if (params.action === "auth.methods") return methods(provider)
+      if (params.action === "auth.methods") return methods(provider, params.payload?.locale)
       if (params.action === "auth.prompts") return resolvePrompts(provider, params.payload ?? {})
       throw unsupported()
-    case "classify": return classify(params.status, params.body)
+    case "classify": return classify(params.status, params.body, provider.originalID || provider.id)
     case "is_error_response": return params.status < 200 || params.status >= 300
     case "refusal_markers": return { finishes: [], markers: [] }
     case "retry_advice": return null

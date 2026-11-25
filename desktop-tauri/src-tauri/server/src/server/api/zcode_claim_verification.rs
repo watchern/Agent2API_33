@@ -1,5 +1,4 @@
 //! 领取验证的账号管理入口；WASM 仅使用宿主绑定的短通道，旧原生保持受控兼容。
-
 use axum::body::Bytes;
 use axum::extract::State;
 use axum::response::Response;
@@ -12,23 +11,6 @@ use crate::server::http::{ok_json, parse_body};
 use crate::server::ServerState;
 
 fn unsupported() -> Response { ok_json(json!({ "supported": false, "active": false, "task": null })) }
-
-/// 旧原生定向轮询的账号归属校验；WASM 的归属由宿主用无代理快照再做一次。
-fn check_native_account(state: &ServerState, account: &str, provider: &str) -> Result<(), (i32, String)> {
-    if account.is_empty() || account.len() > 512 || account.chars().any(char::is_control) {
-        return Err((400, "请明确领取验证所属账号".into()));
-    }
-    let Some(actual) = state.store().account_provider_of(account) else {
-        return Err((404, "领取账号已不存在".into()));
-    };
-    if actual != provider {
-        return Err((400, "领取验证提供商与账号真实归属不一致".into()));
-    }
-    if zcode::region::Region::from_provider_id(provider).is_none() {
-        return Err((400, "该账号不是 ZCode 账号".into()));
-    }
-    Ok(())
-}
 
 pub async fn verification(State(state): State<ServerState>, body: Bytes) -> Response {
     if body.len() > bridge::MAX_MESSAGE { return management_error(413, "领取验证请求超过大小限制"); }
@@ -53,18 +35,14 @@ pub async fn verification(State(state): State<ServerState>, body: Bytes) -> Resp
             .find(|provider| bridge::legacy_native(provider)) else { return unsupported(); };
         provider.to_string()
     } else if !supplied_provider.is_empty() {
-        if zcode::region::Region::from_provider_id(&supplied_provider).is_none() {
-            return management_error(400, "领取验证提供商无效");
-        }
+        if zcode::region::Region::from_provider_id(&supplied_provider).is_none() { return management_error(400, "领取验证提供商无效"); }
         supplied_provider
     } else {
         // 只有确实属于旧原生的完整旧回传允许省略 provider；WASM 后续仍强制检查。
-        if payload.get("configId").is_some() {
+        if payload.get("provider").is_some() || payload.get("configId").is_some() {
             return management_error(400, "领取验证包含不完整的账号配置绑定");
         }
-        let Some(provider) = state.store().account_provider_of(&account) else {
-            return management_error(404, "领取账号已不存在");
-        };
+        let Some(provider) = state.store().account_provider_of(&account) else { return management_error(404, "领取账号已不存在"); };
         if !bridge::legacy_native(&provider) || zcode::region::Region::from_provider_id(&provider).is_none() {
             return management_error(400, "WASM 领取验证缺少 provider");
         }
@@ -74,7 +52,10 @@ pub async fn verification(State(state): State<ServerState>, body: Bytes) -> Resp
     if !wasm {
         if !bridge::legacy_native(&provider) { return unsupported(); }
         if !account.is_empty() {
-            if let Err((status, message)) = check_native_account(&state, &account, &provider) {
+            if !complete && payload["provider"].as_str().is_none_or(|provider| provider.is_empty()) {
+                return management_error(400, "定向领取轮询必须明确提供商");
+            }
+            if let Err((status, message)) = super::zcode_captcha::account_provider(&state, &account, Some(&provider)) {
                 return management_error(status, message);
             }
         }

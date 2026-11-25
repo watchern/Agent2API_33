@@ -11,6 +11,7 @@ import {
   InputGroup,
   InputGroupAddon,
   InputGroupInput,
+  SegmentedControl,
 } from '@ui'
 import { SearchableSelect } from '../../../ui-shared/searchable-select'
 import { t } from '../i18n'
@@ -65,7 +66,7 @@ import { ModelsFetchTable, type RefreshItem, type Row } from './models-fetch-tab
 type Account = {
   id?: unknown; provider?: string; name?: string; nickname?: string; email?: string
   nameCustom?: boolean
-  available?: boolean; enabled?: boolean
+  available?: boolean; enabled?: boolean; hasCredentials?: boolean
 }
 
 /** 内置家注册表里的一项（`wbProviders.all()`）；自定义家目录里的一项（`customList()`） */
@@ -81,6 +82,8 @@ type OpenOptions = {
   custom?: boolean
   /** 展示名（标题用）；缺省回落 providerId */
   name?: string
+  /** 打开弹窗后是否立即自动触发拉取（新建首个账号后自动拉取场景使用） */
+  autoFetch?: boolean
   /** 自定义家：导入成功后回调；内置家：远程目录真落地后回调（各自重取自己的数） */
   onDone?: () => void
   onRefreshed?: () => void
@@ -106,6 +109,7 @@ type SharedWindow = {
   wbApp?: {
     toast?: (message: string, kind?: 'err' | 'ok') => void
     getState?: () => { accounts?: { accounts?: Account[] } } | null | undefined
+    refresh?: (options?: { force?: boolean }) => Promise<unknown>
     formatTime?: (value: unknown) => string
   }
   /** 裸全局：app.js 的顶层函数声明，旧实现直接写 formatTime(...) */
@@ -117,8 +121,11 @@ type SharedWindow = {
     customRequest?: (method: string, path: string, body?: unknown) => Promise<{ models?: unknown[] } | null | undefined>
   }
   wbModelsPanel?: {
+    load?: (options?: { force?: boolean }) => Promise<unknown> | unknown
     /** 模型管理页左栏**实有清单**的家（本弹窗的刷新范围读它） */
     builtinProviders?: () => string[]
+    /** 模型管理页已取到的内置提供商 `{id, label}`，作为主状态未及时轮询时的补充元数据 */
+    builtinProviderMetas?: () => ProviderMeta[]
     /** 某家清单当前的拉取时刻（毫秒，0 = 未知 / 从未成功过） */
     providerRefreshedAt?: (providerId: string) => number
   }
@@ -142,7 +149,7 @@ function shared(): SharedWindow {
  * 源）：Cline 的清单接口无鉴权、内容是全局的，「用哪个账号去拉」对它没有意义 —— 那一列显示为空
  * 占位，而不是给一个选了也一样的下拉。
  */
-const ACCOUNTLESS_REFRESH = new Set(['cline-free', 'cline-pass'])
+const ACCOUNTLESS_REFRESH = new Set(['cline-free'])
 
 /** 「模型来源」的落盘键：`{providerId: accountId}`（见 loadSavedSource 的说明） */
 const SOURCE_KEY = 'workbuddy-desktop-fetch-model-source'
@@ -194,43 +201,38 @@ function accountLabel(account: Account): string {
   return name || t('未命名账号')
 }
 
-/** 该家可用于拉取目录的账号（「模型来源」下拉的选项）。过滤 = `available`（后端口径：启用 + 有
- *  凭证）+ `enabled`；排序用账号页同一条 `byPriorityOrder`（前端渲染层与后端 `order_key` 是同构
- *  实现，两边算出的「第一个账号」必然是同一条）。账号清单直接读主状态，不另拉接口。 */
+/** 仅启用且凭证可用的账号参与目录范围与「模型来源」选择（与模型管理页左栏口径一致）。 */
+function isUsableAccount(account: Account): boolean {
+  return account?.enabled !== false && account?.available !== false && account?.hasCredentials !== false
+}
+
+/** 该家可用于拉取目录的账号（「模型来源」下拉的选项）；顺序沿用账号优先级。 */
 function sourceAccounts(providerId: string): Account[] {
   if (ACCOUNTLESS_REFRESH.has(providerId)) return []
   const order = shared().wbAccountsModel?.byPriorityOrder
   const list = accounts().filter(account => (account?.provider || 'workbuddy') === providerId
-    && account?.available !== false && account?.enabled !== false)
+    && isUsableAccount(account))
   return order ? list.sort(order) : list
 }
 
-/**
- * 本次刷新的范围：**模型管理页左栏实有清单的家 ∪ 有启用账号的家**。
- *
- * 与「模型来源」下拉同一哲学（见 sourceAccounts）：用户在界面上都看不到的家（没有启用账号、清单
- * 也为空）不该参加刷新 —— 刷它只会得到一行「缺少登录态」，而用户既没有账号可选、列表里也根本
- * 没有这家，无从理解。名单随请求带给后端（见 api/models.rs 的 providers）：名单外的家不打网络、
- * 也不进结果。
- *
- * 「有启用账号的家」并进来，是为「刚加完账号、清单还是空的」这一档：它暂时不在左栏，但用户马上
- * 就该看到它 —— 刷一次清单就有了。左栏数据缺席（页面数据未加载）时不降级成全量：宁缺毋滥，自动
- * 刷新任务会兜底。
- */
+/** 刷新范围包含模型页已有提供商和有启用可用账号的提供商。 */
 function scopeProviders(): string[] {
   const ids = new Set(shared().wbModelsPanel?.builtinProviders?.() || [])
   for (const account of accounts()) {
-    if (account?.available === false || account?.enabled === false) continue
+    if (!isUsableAccount(account)) continue
     ids.add(account?.provider || 'workbuddy')
   }
   return [...ids]
 }
 
-/** 待获取那一屏要列的家：按注册表顺序（与模型管理页左栏同一序）列 scoped 名单 —— `all()` 只有
- *  内置家，自定义家的 id 即使进了 scopeProviders 也不会出现在这里。 */
+/** 待获取那一屏要列的家：优先沿用注册表顺序，并补入模型管理页已加载但主状态尚未同步的家
+ *  （例如刚补全或启用插件后立即切到模型管理页）。 */
 function pendingProviders(): ProviderMeta[] {
   const scoped = new Set(scopeProviders())
-  return (shared().wbProviders?.all?.() || []).filter(item => scoped.has(item?.id ?? ''))
+  const known = shared().wbProviders?.all?.() || []
+  const extras = (shared().wbModelsPanel?.builtinProviderMetas?.() || [])
+    .filter(item => item?.id && !known.some(meta => meta?.id === item.id))
+  return [...known, ...extras].filter(item => scoped.has(item?.id ?? ''))
 }
 
 /**
@@ -300,19 +302,71 @@ function ModelsFetchModal({ options, onClose }: { options: OpenOptions; onClose:
   const [picked, setPicked] = React.useState<ReadonlySet<string>>(() => new Set<string>())
   /** 内置家：逐家刷新结果（status === 'ready' 时的表体） */
   const [results, setResults] = React.useState<RefreshItem[]>([])
-  /** 自定义家：搜索词（受控；旧实现是 input 事件即时过滤） */
+  /** 搜索词（受控；自定义家搜模型 ID，内置家搜提供商名称/ID） */
   const [keyword, setKeyword] = React.useState('')
+  /** 内置家：按获取状态筛选（全部 / 未获取 / 已获取 / 失败） */
+  const [stateFilter, setStateFilter] = React.useState<'all' | 'unfetched' | 'fetched' | 'failed'>('all')
   /** 「模型来源」的落盘记忆（打开时读一次；选中即写回并更新本状态） */
   const [savedSource, setSavedSource] = React.useState<Record<string, string>>(loadSavedSource)
+  const [, setSyncTick] = React.useState(0)
+  const autoFetchedRef = React.useRef(false)
+
+  React.useEffect(() => {
+    if (custom) return
+    let alive = true
+    const known = new Set((shared().wbProviders?.all?.() || []).map(item => item?.id ?? '').filter(Boolean))
+    const missingFromSession = (shared().wbModelsPanel?.builtinProviders?.() || []).some(id => !known.has(id))
+    const tasks: Array<Promise<unknown>> = []
+    if (missingFromSession || known.size === 0) {
+      const refreshTask = shared().wbApp?.refresh?.({ force: true })
+      if (refreshTask) tasks.push(refreshTask)
+    }
+    const loadPanelTask = shared().wbModelsPanel?.load?.({ force: true })
+    if (loadPanelTask) tasks.push(Promise.resolve(loadPanelTask))
+    if (tasks.length) {
+      void Promise.allSettled(tasks).then(() => {
+        if (alive) setSyncTick(tick => tick + 1)
+      })
+    }
+    return () => { alive = false }
+  }, [custom])
+
+  const refreshedAtOf = (pid: string): number =>
+    Number(shared().wbModelsPanel?.providerRefreshedAt?.(pid)) || 0
 
   /** 内置家：本次范围里的家（与 scopeProviders 同源，也就是真正会进请求的名单） */
   const pending = custom ? [] : pendingProviders()
-  /** 内置家的表体行（待获取的家 + 已有结果的家，见 buildRows）；自定义家没有这条模型 */
+  /** 内置家的表体行（待获取的家 + 已有结果的家，未获取优先置顶，见 buildRows）；自定义家没有这条模型 */
   const rows = custom ? [] : buildRows()
+
+  const isRowUnfetched = (row: Row): boolean => {
+    if (row.item) return false
+    return refreshedAtOf(row.provider) <= 0
+  }
+
+  const isRowFetched = (row: Row): boolean => {
+    if (row.item) return row.item.status === 'refreshed'
+    return refreshedAtOf(row.provider) > 0
+  }
+
+  const isRowFailed = (row: Row): boolean => row.item?.status === 'failed'
+
+  const unfetchedRows = custom ? [] : rows.filter(isRowUnfetched)
+  const fetchedRowsCount = custom ? 0 : rows.filter(isRowFetched).length
+  const failedRowsCount = custom ? 0 : rows.filter(isRowFailed).length
+
+  const filteredRows = custom ? [] : rows.filter(row => {
+    if (stateFilter === 'unfetched' && !isRowUnfetched(row)) return false
+    if (stateFilter === 'fetched' && !isRowFetched(row)) return false
+    if (stateFilter === 'failed' && !isRowFailed(row)) return false
+    const needle = keyword.trim().toLowerCase()
+    if (!needle) return true
+    return [row.label, t(row.label), row.provider].some(text => String(text || '').toLowerCase().includes(needle))
+  })
 
   /**
    * 汇总行（表格左端，旧实现 paintSummary 的文案与状态语义）：自定义家是「已选 N / 上游共
-   * M / 清单已有 K」，内置家是「N 家 · 成功 X · 失败 Y」。
+   * M / 清单已有 K」，内置家是「N 家 · 未获取 U · 已获取 F」。
    */
   const summary = custom
     // 还没拉过时三个计数都是 0，列出来只会让人以为「上游没有模型」——那与「还没拉」是两件事
@@ -323,8 +377,8 @@ function ModelsFetchModal({ options, onClose }: { options: OpenOptions; onClose:
     : intlSummary(rows)
 
   /**
-   * 内置家的表体行：按注册表顺序（= 左栏顺序）列出本次范围里的家，已有结果的那几行挂上自己那一条
-   * 结果。行序不随后端结果的到达顺序变 —— 逐行「获取」回来后只有那一行的内容变化，位置不动。
+   * 内置家的表体行：未获取过模型的提供商自动排在最前面，方便用户一眼看到新加账号尚未获取模型的提供商；
+   * 组内保持注册表顺序。
    */
   function buildRows(): Row[] {
     const byProvider = new Map(results.map(item => [String(item.provider || ''), item]))
@@ -338,7 +392,16 @@ function ModelsFetchModal({ options, onClose }: { options: OpenOptions; onClose:
       const id = String(item.provider || '')
       if (!known.has(id)) built.push({ provider: id, label: String(item.providerLabel || id), item })
     }
-    return built
+    const focusId = !custom && providerId && providerId !== 'all' ? providerId : ''
+    const focusGroup: Row[] = []
+    const unfetchedGroup: Row[] = []
+    const otherGroup: Row[] = []
+    for (const row of built) {
+      if (focusId && row.provider === focusId) focusGroup.push(row)
+      else if (!row.item && refreshedAtOf(row.provider) <= 0) unfetchedGroup.push(row)
+      else otherGroup.push(row)
+    }
+    return [...focusGroup, ...unfetchedGroup, ...otherGroup]
   }
 
   /**
@@ -414,7 +477,7 @@ function ModelsFetchModal({ options, onClose }: { options: OpenOptions; onClose:
 
   /* ─── 取数与导入 ─────────────────────────── */
 
-  async function load() {
+  async function load(targetProviders?: string[]) {
     if (busy) return
     setBusyKind('load')
     setHint('')
@@ -446,14 +509,16 @@ function ModelsFetchModal({ options, onClose }: { options: OpenOptions; onClose:
       // 「模型来源」下拉的选择与刷新范围随请求带上（范围见 scopeProviders）
       const refresh = shared().workbuddyDesktop?.refreshModels
       if (!refresh) throw new Error(t('模型目录刷新不可用，请重新打开面板'))
-      const providers = pending.map(item => item.id).filter((id): id is string => Boolean(id))
+      const providers = (targetProviders && targetProviders.length
+        ? targetProviders
+        : pending.map(item => item.id).filter((id): id is string => Boolean(id)))
       const result = await refresh({ accounts: buildSourceMap(sourceRows), providers })
       if (!Array.isArray(result?.results) || result.results.some(item => !item || typeof item.provider !== 'string'
         || !['refreshed', 'failed', 'skipped'].includes(item.status || ''))
         || providers.some(provider => result.results!.filter(item => item.provider === provider).length !== 1)) {
         throw new Error(t('网关未返回逐家模型目录刷新结果'))
       }
-      setResults(result.results)
+      setResults(prev => targetProviders && targetProviders.length ? mergeResults(prev, result.results!) : result.results!)
       setFetched(true)
       setStatus('ready')
       // 真刷到新目录时通知调用方 —— 刷新落地只改了后端那份目录，模型管理页自持的 manage 视图
@@ -467,6 +532,19 @@ function ModelsFetchModal({ options, onClose }: { options: OpenOptions; onClose:
       setBusyKind(null)
     }
   }
+
+  React.useEffect(() => {
+    if (!options.autoFetch || autoFetchedRef.current) return
+    autoFetchedRef.current = true
+    if (custom) {
+      void load()
+    } else if (providerId && providerId !== 'all') {
+      void load([providerId])
+    } else {
+      void load()
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [options.autoFetch, custom, providerId])
 
   /**
    * **逐行取数**（每行最右那颗）：只刷这一家。请求里的 `providers` 收窄成 `[row.provider]` —— 后端
@@ -625,13 +703,30 @@ function ModelsFetchModal({ options, onClose }: { options: OpenOptions; onClose:
             <>
               <div className='flex flex-wrap items-center gap-2.5'>
                 <span className='text-[11.5px] text-muted-foreground'>{summary}</span>
-                {custom && (
-                  <InputGroup className='w-[240px] flex-none'>
-                    <InputGroupInput type='search' placeholder={t('搜索模型 ID…')} autoComplete='off'
-                      value={keyword} onChange={event => setKeyword(event.currentTarget.value)} />
-                    <InputGroupAddon aria-hidden='true'>⌕</InputGroupAddon>
-                  </InputGroup>
+                {!custom && (
+                  <SegmentedControl
+                    options={[
+                      { value: 'all', label: `${t('全部')} (${rows.length})` },
+                      { value: 'unfetched', label: `${t('未获取')} (${unfetchedRows.length})` },
+                      { value: 'fetched', label: `${t('已获取')} (${fetchedRowsCount})` },
+                      ...(failedRowsCount > 0 ? [{ value: 'failed', label: `${t('失败')} (${failedRowsCount})` }] : []),
+                    ]}
+                    value={stateFilter}
+                    onValueChange={next => setStateFilter(next as 'all' | 'unfetched' | 'fetched' | 'failed')}
+                    aria-label={t('按获取状态筛选')}
+                    className='shrink-0'
+                  />
                 )}
+                <InputGroup className='w-[200px] flex-none'>
+                  <InputGroupInput
+                    type='search'
+                    placeholder={custom ? t('搜索模型 ID…') : t('搜索提供商…')}
+                    autoComplete='off'
+                    value={keyword}
+                    onChange={event => setKeyword(event.currentTarget.value)}
+                  />
+                  <InputGroupAddon aria-hidden='true'>⌕</InputGroupAddon>
+                </InputGroup>
                 <div className='mr-auto' />
                 {custom && (
                   <>
@@ -639,16 +734,29 @@ function ModelsFetchModal({ options, onClose }: { options: OpenOptions; onClose:
                     <Button variant='ghost' size='sm' onClick={() => setPicked(new Set())}>{t('清空')}</Button>
                   </>
                 )}
-                <Button variant='outline' size='sm' title={t('刷新全部家（逐家打上游）')} disabled={busy}
+                {!custom && unfetchedRows.length > 0 && unfetchedRows.length < rows.length && (
+                  <Button
+                    variant='default'
+                    size='sm'
+                    disabled={busy}
+                    title={t('只获取尚未同步过模型目录的提供商')}
+                    onClick={() => { void load(unfetchedRows.map(row => row.provider)) }}
+                  >
+                    {busyKind === 'load' ? t('获取中…') : t('获取未同步 ({n})', { n: unfetchedRows.length })}
+                  </Button>
+                )}
+                <Button variant={(!custom && unfetchedRows.length > 0 && unfetchedRows.length < rows.length) ? 'outline' : 'default'} size='sm'
+                  title={custom ? t('从该提供商上游获取模型清单') : t('刷新全部提供商（逐家请求上游）')}
+                  disabled={busy || (!custom && !rows.length)}
                   onClick={() => { void load() }}>
-                  {busyKind === 'load' ? t('获取中…') : fetched ? t('重新获取') : t('获取模型')}
+                  {busyKind === 'load' ? t('获取中…') : fetched ? t('重新获取') : (!custom && unfetchedRows.length > 0 && unfetchedRows.length < rows.length ? t('全部获取') : t('获取模型'))}
                 </Button>
               </div>
-              <ModelsFetchTable custom={custom} status={status} rows={rows}
+              <ModelsFetchTable custom={custom} status={status} rows={custom ? rows : filteredRows}
                 upstream={upstream} managed={managed} picked={picked} keyword={keyword}
                 busy={busy} busyRow={busyRow} onPick={togglePicked}
                 onFetchRow={row => { void loadRow(row) }} sourceCell={sourceCell} formatTime={formatTime}
-                refreshedAt={pid => Number(shared().wbModelsPanel?.providerRefreshedAt?.(pid)) || 0} />
+                refreshedAt={refreshedAtOf} />
             </>
           )}
         </DialogBody>

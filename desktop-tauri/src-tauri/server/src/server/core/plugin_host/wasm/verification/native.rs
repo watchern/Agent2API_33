@@ -1,5 +1,4 @@
 //! 旧原生领取桥：显式账号必须先有无副作用的能力确认，不能用真实 poll 探测。
-//! 从上游 3.5.0-beta.4 移植。
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::sync::atomic::Ordering;

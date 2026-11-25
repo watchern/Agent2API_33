@@ -132,6 +132,7 @@ pub async fn responses_endpoint(
     // `Extension<_>` —— 后者在免鉴权模式下取不到会直接拒绝请求。
     key_scope: Option<Extension<KeyScope>>,
     key_identity: Option<Extension<crate::server::request_stats::ApiKeyIdentity>>,
+    key_source: Option<Extension<Arc<crate::server::config::model_key_source::Source>>>,
     body: Bytes,
 ) -> Response {
     let scope = key_scope.map(|Extension(scope)| scope);
@@ -211,8 +212,9 @@ pub async fn responses_endpoint(
     // 模型那一半已在上面判过（分工见 forward_chat 的说明）。
     // telemetry 在这里创建（不再由 forward_chat 代建）：进行中行要在
     // 转发开始前插入，见下方 record_started。
-    let telemetry = Arc::new(RequestTelemetry::with_id());
+    let telemetry = Arc::new(RequestTelemetry::with_model_key(key_source.map(|Extension(source)| source)));
     let client_model = pipeline::model_field_text(&raw);
+    telemetry.capture_prompt_request(&source, &client_model);
     // 「进行中」行（与 /v1/chat/completions 同一处时点：模型解析成功、
     // 转发开始前；生命周期见 `RequestStats::record_started`）
     let telemetry_id = telemetry.snapshot().id;
@@ -271,6 +273,15 @@ pub async fn responses_endpoint(
         source: source.clone(),
     };
 
+    let outcome = match pipeline::catpaw_output::converted_outcome(outcome, &context.telemetry,
+        &original, &requested_model, stream, true, reasoning_collapse).await {
+        Ok(outcome) => outcome,
+        Err(response) => {
+            pipeline::record_entry(&RecordContext { status: i64::from(response.status().as_u16()), ..context }, None);
+            guard.complete();
+            return response;
+        }
+    };
     match outcome {
         Ok(ForwardOutcome::Native(response)) => native_response::respond(response, context, &mut guard),
         Ok(ForwardOutcome::Stream { status, stream: source }) => {
@@ -334,9 +345,13 @@ pub async fn responses_endpoint(
             let response = error_response(context, &error, |status, error| {
                 if let Some(response) = native_response::error_response(WireProtocol::Responses, status, error) { return response; }
                 let code = anthropic::responses_error_code(status);
-                GatewayError::with_status(i32::from(status), error.message.clone())
+                let mut mapped = GatewayError::with_status(i32::from(status), error.message.clone())
                     .with_code(code)
-                    .payload_response()
+                    .with_optional_reason(error.reason.clone());
+                if let Some(seconds) = error.retry_after_secs {
+                    mapped = mapped.with_retry_after_seconds(seconds);
+                }
+                mapped.payload_response()
             });
             // 记账已完成（含手动终止的 408）：解除兜底并注销令牌
             guard.complete();
@@ -354,6 +369,7 @@ pub async fn messages_endpoint(
     // R9：同 responses_endpoint（`Option` + 取不到 = 不限制）
     key_scope: Option<Extension<KeyScope>>,
     key_identity: Option<Extension<crate::server::request_stats::ApiKeyIdentity>>,
+    key_source: Option<Extension<Arc<crate::server::config::model_key_source::Source>>>,
     body: Bytes,
 ) -> Response {
     let scope = key_scope.map(|Extension(scope)| scope);
@@ -413,8 +429,9 @@ pub async fn messages_endpoint(
     // 模型那一半已在上面判过（分工见 forward_chat 的说明）。
     // telemetry 在这里创建（与 responses_endpoint 同理：进行中行要在
     // 转发开始前插入）
-    let telemetry = Arc::new(RequestTelemetry::with_id());
+    let telemetry = Arc::new(RequestTelemetry::with_model_key(key_source.map(|Extension(source)| source)));
     let client_model = pipeline::model_field_text(&raw);
+    telemetry.capture_prompt_request(&source, &client_model);
     // 流式 `message_start` 的输入锚点：上游 usage 要等流末尾那帧才到，先按
     // 请求体估算一个（口径同 `/v1/messages/count_tokens`，见 issue #437）。
     // 必须在这里算 —— `chat_body` 下面会被 move 进 `forward_chat`。
@@ -477,6 +494,15 @@ pub async fn messages_endpoint(
         source: source.clone(),
     };
 
+    let outcome = match pipeline::catpaw_output::converted_outcome(outcome, &context.telemetry,
+        &raw, &requested_model, stream, false, false).await {
+        Ok(outcome) => outcome,
+        Err(response) => {
+            pipeline::record_entry(&RecordContext { status: i64::from(response.status().as_u16()), ..context }, None);
+            guard.complete();
+            return response;
+        }
+    };
     match outcome {
         Ok(ForwardOutcome::Native(response)) => native_response::respond(response, context, &mut guard),
         Ok(ForwardOutcome::Stream { status, stream: source }) => {
@@ -528,7 +554,7 @@ pub async fn messages_endpoint(
             logging::console_line("[Model]", &format!("❌ {message}"));
             let response = error_response(context, &error, |status, error| {
                 if let Some(response) = native_response::error_response(WireProtocol::Anthropic, status, error) { return response; }
-                anthropic_error_response_with_status(status, &error.message)
+                anthropic_error_response_with_status(status, error)
             });
             // 记账已完成（含手动终止的 408）：解除兜底并注销令牌
             guard.complete();
@@ -560,17 +586,32 @@ async fn collect_stream(
 
 /// Anthropic 形态的错误响应（`{type:"error", error:{type, message}}`）
 fn anthropic_error_response(error: &GatewayError) -> Response {
-    anthropic_error_response_with_status(error.http_status().as_u16(), &error.message)
+    anthropic_error_response_with_status(error.http_status().as_u16(), error)
 }
 
-fn anthropic_error_response_with_status(status: u16, message: &str) -> Response {
+fn anthropic_error_response_with_status(status: u16, error: &GatewayError) -> Response {
     let kind = anthropic::error_kind_for_status(status);
+    let mut detail = serde_json::Map::new();
+    detail.insert("type".to_string(), json!(kind));
+    detail.insert("message".to_string(), json!(error.message));
+    let retry_after = error.retry_after_secs.filter(|seconds| *seconds > 0);
+    if let Some(reason) = &error.reason {
+        detail.insert("reason".to_string(), json!(reason));
+        if let Some(seconds) = retry_after {
+            detail.insert("retry_after".to_string(), json!(seconds));
+        }
+    }
     let body = json!({
         "type": "error",
-        "error": { "type": kind, "message": message },
+        "error": Value::Object(detail),
     });
     let code = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
     let mut response = json_response(body);
     *response.status_mut() = code;
+    if let Some(seconds) = retry_after {
+        if let Ok(value) = axum::http::HeaderValue::from_str(&seconds.to_string()) {
+            response.headers_mut().insert(axum::http::header::RETRY_AFTER, value);
+        }
+    }
     response
 }

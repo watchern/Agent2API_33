@@ -2,6 +2,7 @@ import * as React from 'react'
 import { mountOnPage } from '../island-lazy'
 import { createRoot } from 'react-dom/client'
 import { Badge, Empty, SegmentedControl, type SegmentedControlOption, PageHeader, PageTitle, PageDescription } from '@ui'
+import { updateCachedDisplay } from './model-pricing'
 import {
   RANGES, DEFAULT_RANGE, RANGE_KEY, RANGE_LABEL, RANGE_OPTION_LABEL,
   CUSTOM_RANGE,
@@ -227,6 +228,13 @@ function ReportPage() {
       if (token !== seq) return summaryValue
       if (!payload || typeof payload !== 'object') throw new Error('后端未返回报表数据')
       summaryValue = payload
+      if (payload.currency || payload.exchangeRate || payload.fx) {
+        updateCachedDisplay({
+          currency: payload.currency,
+          exchangeRate: payload.exchangeRate,
+          fx: payload.fx,
+        })
+      }
       // 内容与上一轮完全一致就不落 state（见 signatureRef 的说明）：轮询到「没有变化」
       // 是常态，那一轮不该付整页重渲染的代价
       const signature = JSON.stringify(payload)
@@ -253,7 +261,14 @@ function ReportPage() {
   const renderData = React.useCallback((next?: StatsSummary | null): void => {
     if (next === undefined) return
     summaryValue = next || null
-    if (next) applyData({ summary: next, error: null }, JSON.stringify(next))
+    if (next) {
+      updateCachedDisplay({
+        currency: next.currency,
+        exchangeRate: next.exchangeRate,
+        fx: next.fx,
+      })
+      applyData({ summary: next, error: null }, JSON.stringify(next))
+    }
   }, [applyData])
 
   /** 换档位：内存为准，localStorage 只负责跨次启动恢复；换完立刻重拉一次 */

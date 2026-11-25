@@ -9,13 +9,10 @@
 //!      功能都在本进程里，复用别人的端口等于把自己的管理 API 交给一个
 //!      不受控的进程（版本可能不匹配，行为也无从保证）。端口被占用时直接
 //!      报错并提示用户结束旧网关，比「看起来启动成功、实际连的是旧服务」安全得多。
-//!   2. **退出时不再杀进程**，只发一个停机信号让 axum 优雅收尾
-//!      （不再有「杀不掉 node 子进程」导致覆盖安装失败的问题 ——
-//!      这正是本次迁移要解决的问题之一）。
-//!
-//! 对外契约保持不变：`ensure_ready(app)` 与 `shutdown(&AppState)` 两个函数
-//! 的签名与语义（成功/失败返回、幂等）与旧版一致，lib.rs / tray.rs /
-//! commands.rs 的调用点一行都不用改。
+//!   2. 退出先封闭启动并申请服务器停止，独立协调任务保留初始化和清理责任。
+//!      同步 shutdown 只申请关闭；真正退出方须等待 shutdown_and_wait 的真实结果。
+//!      本模块不执行窗口退出、重启或安装器动作。
+//! 多个 ensure_ready 共享同一次启动，失败后不在同进程重建进程级单例。
 //!
 //! ── 升级迁移（1.0.x → 1.1.0）───────────────────────────────
 //! 已装旧版的用户覆盖安装后，有两个遗留问题要在**新版首次启动**时自动处理：
@@ -25,12 +22,16 @@
 //!      `cleanup_legacy_resources` 在服务就绪后清掉。
 //! 两个都只在升级后的第一次启动有实际动作，正常启动零开销。
 
+pub(crate) mod lifecycle;
+
+use std::collections::HashMap;
 #[cfg(windows)]
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
-use tauri::{AppHandle, Manager};
+use tauri::AppHandle;
 
 // 端口归属查询与进程树结束改用 Win32 API 的原因见 Cargo.toml 里 windows-sys
 // 依赖处的说明：外部命令（taskkill / powershell）的字符串与进程创建行为会被
@@ -86,11 +87,11 @@ const HEALTH_INTERVAL: Duration = Duration::from_millis(100);
 /// 同时被 `commands::backend_status` 使用（前端启动阶段显示「服务已就绪」提示），
 /// 因此保持为公开函数、语义不变：能拿到 2xx 就算就绪。
 pub async fn is_ready(port: u16) -> bool {
-    let Ok(client) = local_client(HEALTH_TIMEOUT) else {
+    let Ok(client) = local_client() else {
         return false;
     };
     matches!(
-        client.get(format!("http://127.0.0.1:{port}/health")).send().await,
+        client.get(format!("http://127.0.0.1:{port}/health")).timeout(HEALTH_TIMEOUT).send().await,
         Ok(response) if response.status().is_success()
     )
 }
@@ -104,6 +105,12 @@ pub async fn is_ready(port: u16) -> bool {
 /// vs 落在系统保留段里），界面据此给的出路完全不同，而分类所需的 OS 错误码
 /// 只有在 bind 失败的那一刻才拿得到。详见 `crate::port_conflict`。
 pub async fn ensure_ready(app: &AppHandle) -> Result<(), StartupFailure> {
+    lifecycle::ensure_ready(app).await
+}
+
+// 仅由独立启动任务调用；已在任何读取设置/await前领取唯一启动资格。
+async fn start_once(app: &AppHandle, start: &lifecycle::Startup) -> Result<(), StartupFailure> {
+    start.check_open()?;
     let port = proxy_port();
 
     // ── 监听地址：本机回环（默认）或全网卡（局域网访问，issue #48）──────
@@ -126,12 +133,8 @@ pub async fn ensure_ready(app: &AppHandle) -> Result<(), StartupFailure> {
     // 「局域网访问」后绑 0.0.0.0，此时免鉴权语义由下面的闸门接管
     // （headless 形态由 agent2api-server 二进制按 AGENT2API_HOST 自行决定）。
     // 数据库迁移和历史回填会阻塞，不能占住处理 IPC 与启动等待的异步线程。
-    let mut state = tauri::async_runtime::spawn_blocking(move || {
-        server::ServerState::bootstrap(port, host)
-    })
-    .await
-    .map_err(|error| StartupFailure::other(format!("网关初始化任务失败: {error}")))?
-    .map_err(StartupFailure::other)?;
+    let mut state = start.bootstrap(port, host).await?;
+    start.check_open()?;
 
     // 访问控制与桌面壳使用同一份进程内会话状态。
     server::access::attach_db(state.db().cloned());
@@ -165,16 +168,28 @@ pub async fn ensure_ready(app: &AppHandle) -> Result<(), StartupFailure> {
                 "⚠️  网络访问已开启但尚未配置 API Key：/v1/* 暂时拒绝服务，请在「网关 Key」页创建第一把",
             );
         }
-        // 网页管理面板（可选）：设了 ui_dir 网关就在本端口托管 ui/ 静态目录
-        //（含网页端 bridge），远程浏览器打开 http://<本机IP>:<端口> 即面板；
-        // 不开则保持桌面形态 —— 网关只出 API，界面仍由 Tauri 壳自己出。
+        // 网页管理面板（可选）：开发态直接读源码目录 ui/ 便于热调试；发布版直接复用
+        // Tauri 编译期内嵌进可执行文件的界面资源，不再在安装目录重复放第二份 ui/。
         if lan.lan_panel {
-            match resolve_ui_dir(app) {
-                Some(dir) => state.set_ui_dir(dir),
-                None => server::logging::log(
-                    "[Server]",
-                    "⚠️  网页面板资源缺失：网页管理面板无法托管（重装本程序可恢复），API 转发不受影响",
-                ),
+            if cfg!(debug_assertions) {
+                match resolve_dev_ui_dir() {
+                    Some(dir) => state.set_ui_dir(dir),
+                    None => server::logging::log(
+                        "[Server]",
+                        "⚠️  网页面板资源缺失：开发目录 ui/ 不存在，API 转发不受影响",
+                    ),
+                }
+            } else {
+                use server::EmbeddedUiAssets;
+                let assets = TauriUiAssets::new(app.asset_resolver());
+                if assets.etag("/index.html").is_some() {
+                    state.set_ui_assets(Arc::new(assets));
+                } else {
+                    server::logging::log(
+                        "[Server]",
+                        "⚠️  网页面板内嵌资源缺失：网页管理面板无法托管（重装本程序可恢复），API 转发不受影响",
+                    );
+                }
             }
         }
     }
@@ -183,79 +198,95 @@ pub async fn ensure_ready(app: &AppHandle) -> Result<(), StartupFailure> {
     // 先尝试自动接管；接管不了（别的程序 / 用户手工起的服务）才走报错。
     // 这里不静默复用（见模块头部说明）—— 复用别人的端口等于把管理 API
     // 交给一个不受控的旧版本进程。
-    if is_ready(port).await && !reclaim_port_from_legacy(port).await {
-        // 端口上有服务应答但接管失败：属于「被占用」这一类，查出监听进程
-        // 一并交给界面（能查出进程时用户就不必自己去翻 netstat）
-        let occupant = occupant_of(port);
-        return Err(StartupFailure::port(PortConflict::new(
-            ConflictKind::Occupied,
-            port,
-            occupant,
-            "端口上已有服务在响应",
-        )));
+    let occupied = start.until_closing(is_ready(port)).await?;
+    if occupied {
+        start.check_open()?;
+        let reclaimed = start.until_closing(reclaim_port_from_legacy(port)).await?;
+        if !reclaimed {
+            let occupant = occupant_of(port);
+            return Err(StartupFailure::port(PortConflict::new(
+                ConflictKind::Occupied,
+                port,
+                occupant,
+                "端口上已有服务在响应",
+            )));
+        }
     }
-    let shutdown_tx = server::start(&state).map_err(|conflict| {
-        // bind 失败：补上「谁占着」再交给界面（查进程是平台细节，见 backend 模块头）
-        StartupFailure::port(conflict.with_occupant(occupant_of(port)))
-    })?;
-
-    // 句柄先入 state：即使后面的自检失败，退出路径也能正常发停机信号，
-    // 不会留下一个「已经起来但没人管」的监听端口
-    {
-        let app_state = app.state::<AppState>();
-        let mut guard = app_state
-            .backend
-            .lock()
-            .map_err(|_| StartupFailure::other("服务器状态锁不可用"))?;
-        guard.shutdown_tx = Some(shutdown_tx);
-        guard.port = port;
-    }
+    // bind与句柄发布之间不能丢失收尾责任；退出先到则拒绝bind，退出后到则立即停新句柄。
+    start.bind(&state, port)?;
 
     // 本地自检：bind 成功不代表路由可用（例如路由构造期出错），
     // 因此仍然按旧版的「轮询 /health」风格确认端到端可用
     let deadline = std::time::Instant::now() + STARTUP_TIMEOUT;
     while std::time::Instant::now() < deadline {
-        if is_ready(port).await {
+        if start.until_closing(is_ready(port)).await? {
+            start.check_open()?;
+            crate::panel_session::ensure_local_access().map_err(StartupFailure::other)?;
+            start.check_open()?;
             let scope = if lan.lan_access { "，网络访问已开启" } else { "" };
             server::logging::log("[Server]", &format!("服务已就绪（127.0.0.1:{port}{scope}）"));
-            crate::panel_session::ensure_local_access().map_err(StartupFailure::other)?;
-            // 起来了就清掉上一次的失败记录：那条记录描述的是「之前起不来」，
-            // 留着会让界面在网关正常运行时仍显示「端口被占用」——
-            // 用户刚结束完进程重启，看到这个只会以为没生效。
-            if let Ok(mut guard) = app.state::<AppState>().backend.lock() {
-                guard.failure = None;
-            }
-            // 升级迁移收尾：清掉旧版安装目录残留的 node.exe / server.cjs。
-            // 放在就绪之后 —— 网关可用是本程序存在的意义，先保主链路再清磁盘。
+            // 保留原升级清理行为；最终ready在独立启动任务的同一关闭门内发布。
             cleanup_legacy_resources();
-            return Ok(());
+            return start.check_open();
         }
-        tokio::time::sleep(HEALTH_INTERVAL).await;
+        start.until_closing(tokio::time::sleep(HEALTH_INTERVAL)).await?;
     }
     Err(StartupFailure::other(format!(
         "服务启动超时（{port} 端口未就绪）：端口已绑定但健康检查未通过，请查看运行日志"
     )))
 }
 
-/// 局域网面板托管用的 `ui/` 静态目录（与 headless 同一份界面文件）。
+/// 局域网面板开发态使用的 `ui/` 静态目录。
 ///
-/// release：tauri.conf.json 把 `../ui` 列进了 bundle resources —— 打包器会把
-/// 越出应用目录的 `..` 段映射成 `_up_`（见 tauri-utils `resources.rs` 的目标
-/// 路径规则），所以安装后落在资源目录的 `_up_/ui` 下（Windows NSIS 实测为
-/// `<install>/_up_/ui`）。只找 `ui/` 会永远找不到，面板托管随之静默降级成
-/// 「远程没界面」—— 两个候选都看一遍，把这种布局差异吃在这里。
-/// debug：资源不打包，直接指源码目录（`tauri dev` 时 ui-islands 的构建产物就
-/// 落在那里）。目录不存在返回 None —— 面板托管的缺失只是「远程没界面」，
-/// API 照常工作（headless 对 ui 缺失也是这个取舍）。
-fn resolve_ui_dir(app: &AppHandle) -> Option<std::path::PathBuf> {
-    if cfg!(debug_assertions) {
-        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../ui");
-        return dir.is_dir().then_some(dir);
+/// 发布版已改为直接读取随程序打包的嵌入资源（见 [`TauriUiAssets`]），
+/// 不再随安装包分发第二份磁盘 `ui/` 目录。
+fn resolve_dev_ui_dir() -> Option<std::path::PathBuf> {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../ui");
+    dir.is_dir().then_some(dir)
+}
+
+/// 桌面端内嵌静态资源适配器：把 Tauri 编译期内嵌的 `frontendDist` 暴露给局域网面板。
+struct TauriUiAssets {
+    resolver: tauri::AssetResolver<tauri::Wry>,
+    etags: HashMap<String, String>,
+}
+
+impl TauriUiAssets {
+    fn new(resolver: tauri::AssetResolver<tauri::Wry>) -> Self {
+        let etags = resolver
+            .iter()
+            .map(|(key, bytes)| {
+                let normalized = if key.starts_with('/') {
+                    key.into_owned()
+                } else {
+                    format!("/{key}")
+                };
+                let etag = embedded_etag(&bytes);
+                (normalized, etag)
+            })
+            .collect();
+        Self { resolver, etags }
     }
-    let base = app.path().resource_dir().ok()?;
-    [base.join("_up_").join("ui"), base.join("ui")]
-        .into_iter()
-        .find(|dir| dir.is_dir())
+}
+
+impl server::EmbeddedUiAssets for TauriUiAssets {
+    fn etag(&self, key: &str) -> Option<String> {
+        self.etags.get(key).cloned()
+    }
+
+    fn get(&self, key: &str) -> Option<Vec<u8>> {
+        let trimmed = key.strip_prefix('/').unwrap_or(key);
+        self.resolver.get(trimmed.to_string()).map(|asset| asset.bytes)
+    }
+}
+
+fn embedded_etag(bytes: &[u8]) -> String {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for &byte in bytes {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("W/\"{}-{:x}-{:x}\"", env!("CARGO_PKG_VERSION"), bytes.len(), hash)
 }
 
 /// 查端口上的监听进程（PID、镜像名、路径，以及两个身份标记）。
@@ -612,10 +643,10 @@ fn process_image_path(pid: u32) -> Option<String> {
 
 /// 端口上的服务是否是 WorkBuddy 网关（读 /health 的 product 特征字段）。
 async fn health_reports_workbuddy(port: u16) -> bool {
-    let Ok(client) = local_client(HEALTH_TIMEOUT) else {
+    let Ok(client) = local_client() else {
         return false;
     };
-    let Ok(response) = client.get(format!("http://127.0.0.1:{port}/health")).send().await
+    let Ok(response) = client.get(format!("http://127.0.0.1:{port}/health")).timeout(HEALTH_TIMEOUT).send().await
     else {
         return false;
     };
@@ -699,53 +730,38 @@ fn cleanup_legacy_resources() {
             }
         }
     }
-}
-
-/// 退出时停掉进程内服务器：发送一次停机信号，让 axum 优雅收尾。
-///
-/// 签名与旧版一致（同步函数、接收 `&AppState`），因此 lib.rs 的三处调用点与
-/// commands.rs / tray.rs 都无需改动。**幂等**：重复调用时发送端已被 take，
-/// 直接返回 —— 这一点与旧版 `child.take()` 的行为一致。
-pub fn shutdown(state: &AppState) {
-    crate::startup::stop();
-    crate::panel_session::clear();
-    // 定时签到调度：在停服务之前先停它（对照 Node 版 closeAll 里的
-    // `autoCheckin.stop(); closeDispatchers();`）。
-    //
-    // **放在幂等判断之前**：调度循环是独立于 HTTP 服务的后台任务
-    // （由 auto_checkin 句柄持有），只要它在跑就该被停掉；若写在下面的
-    // `shutdown_tx.take()` 之后，第二次调用（服务器已停 → 发送端已被 take）
-    // 会整段跳过，留下一个仍在轮询的循环。stop 自身也是幂等的（task 取走后
-    // 再调直接返回），所以不破坏本函数「重复调用无副作用」的既有语义。
-    server::core::auto_checkin::stop_global();
-
-    let Ok(mut guard) = state.backend.lock() else {
-        return;
-    };
-    if let Some(sender) = guard.shutdown_tx.take() {
-        // 接收端可能已经随运行时一起退出（发送失败）—— 那说明服务早就停了，无需处理
-        let sent = sender.send(()).is_ok();
-        server::logging::log(
-            "[Server]",
-            if sent {
-                "已发送停机信号，服务正在退出"
-            } else {
-                "服务已停止（停机信号无需发送）"
-            },
-        );
-        // 从日志确认：Node 版退出时也是打印一行说明，这里保持一致的可观测性。
-        // 不做「等待确认」——shutdown 是同步函数且可能从程序退出路径调用，
-        // 等异步收尾只会拖慢退出。
-        server::logging::console_line("[Server]", "退出中…");
+    // 旧版曾通过 bundle.resources 把 ../ui 拷贝到 _up_/ui；改走内嵌资源后覆盖安装顺手清理旧副本。
+    let legacy_up = install_dir.join("_up_");
+    let legacy_ui = legacy_up.join("ui");
+    if legacy_ui.is_dir() {
+        match std::fs::remove_dir_all(&legacy_ui) {
+            Ok(()) => {
+                let _ = std::fs::remove_dir(&legacy_up);
+                server::logging::log("[Server]", "已清理旧版残留的磁盘界面副本（_up_/ui）");
+            }
+            Err(error) => {
+                server::logging::log(
+                    "[Server]",
+                    &format!("清理旧版磁盘界面副本失败（下次启动再试）: {error}"),
+                )
+            }
+        }
     }
 }
 
-/// 已启动服务的端口；未启动时返回 None（供后续切片查询状态时使用）。
+/// 兼容同步退出入口：只申请关闭，不代表初始化、HTTP或插件清理已完成。
+/// 真正退出/重启的调用方必须改为等待 shutdown_and_wait；本模块不执行最终退出。
+pub fn shutdown(state: &AppState) {
+    lifecycle::request_shutdown(&state.backend);
+}
+
+/// 申请并等待同一次关闭；等待者取消不会取消后台清理，失败仍保留旧句柄。
+pub async fn shutdown_and_wait(state: &AppState) -> Result<(), String> {
+    lifecycle::shutdown_and_wait(&state.backend).await
+}
+
+/// 只有本轮启动成功且未进入关闭时才返回端口；不以空句柄或旧健康检查推断状态。
 #[allow(dead_code)]
 pub fn running_port(state: &AppState) -> Option<u16> {
-    state
-        .backend
-        .lock()
-        .ok()
-        .and_then(|guard| guard.shutdown_tx.is_some().then_some(guard.port))
+    lifecycle::running_port(&state.backend)
 }

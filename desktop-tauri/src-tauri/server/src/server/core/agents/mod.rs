@@ -35,19 +35,65 @@ pub use types::{active_profile, Model, Profile};
 use serde_json::{json, Value};
 
 pub fn snapshot(port: u16) -> Value {
+    snapshot_with_options(port, false)
+}
+
+pub fn snapshot_with_options(port: u16, force_refresh: bool) -> Value {
+    if force_refresh {
+        paths::invalidate_caches();
+        dsh_installation::invalidate_cache();
+    }
     let gateway = format!("http://127.0.0.1:{port}");
-    let mut keys = crate::server::core::api_keys::entries_from(&crate::server::config::current().raw())
+    let current = crate::server::config::current();
+    let default_model = current.default_model();
+    let mut keys = crate::server::core::api_keys::entries_from(&current.raw())
         .into_iter().filter(crate::server::core::api_keys::ApiKeyEntry::is_usable)
         .map(|key| json!({ "id": key.id, "name": key.name, "allowedModels": key.allowed_models, "allowedProviders": key.allowed_providers }))
         .collect::<Vec<_>>();
     if crate::server::config::parse::env_api_key_value().is_some() {
         keys.push(json!({ "id": "env", "name": "环境变量 Key", "allowedModels": [], "allowedProviders": [] }));
     }
+    let saved = store::load_snapshot();
+    let preferences = paths::load_preferences();
+    let binaries = paths::binary_index(!force_refresh);
+    let backup_ids = backups::scan_directory().ok();
+    let clients = std::thread::scope(|scope| {
+        let handles = CLIENTS
+            .iter()
+            .map(|def| {
+                let gateway = gateway.as_str();
+                let saved = &saved;
+                let preferences = &preferences;
+                let binaries = &binaries;
+                let backup_ids = backup_ids.as_deref();
+                scope.spawn(move || {
+                    client_view_with(
+                        def,
+                        gateway,
+                        saved,
+                        preferences,
+                        binaries,
+                        backup_ids,
+                        force_refresh,
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        handles
+            .into_iter()
+            .zip(CLIENTS.iter())
+            .map(|(handle, def)| {
+                handle.join().unwrap_or_else(|_| {
+                    json!({ "id": def.id, "name": def.name, "readError": "检测客户端失败" })
+                })
+            })
+            .collect::<Vec<_>>()
+    });
     json!({
-        "clients": CLIENTS.iter().map(|def| client_view(def, &gateway)).collect::<Vec<_>>(),
+        "clients": clients,
         "gateway": {
             "baseUrl": gateway,
-            "defaultModel": crate::server::config::current().default_model(),
+            "defaultModel": default_model,
             "requiresKey": true,
             "keys": keys,
         },
@@ -56,13 +102,33 @@ pub fn snapshot(port: u16) -> Value {
     })
 }
 
-fn client_view(def: &ClientDef, gateway: &str) -> Value {
-    let detection = paths::detect(def);
+pub fn warm_up() {
+    let binaries = paths::binary_index(true);
+    let dsh_bin = find("dsh").and_then(|def| binaries.find(def));
+    let _ = dsh_installation::desktop();
+    if dsh_bin.is_some() {
+        let _ = dsh_installation::cli(dsh_bin.as_deref());
+    }
+}
+
+fn client_view_with(
+    def: &ClientDef,
+    gateway: &str,
+    saved_snapshot: &Result<Value, String>,
+    preferences: &Result<paths::Preferences, String>,
+    binaries: &paths::BinaryIndex,
+    backup_ids: Option<&[String]>,
+    allow_spawn: bool,
+) -> Value {
+    let detection = paths::detect_with_context(def, preferences, binaries, allow_spawn);
     let (mut live, read_error) = discover::read_live(def, &detection.path);
     for profile in &mut live {
         profile.kind = kind_of(&profile.base_url, gateway).into();
     }
-    let saved = store::load_with_revision(def.id);
+    let saved = match saved_snapshot {
+        Ok(value) => store::load_from_snapshot(value, def.id),
+        Err(error) => Err(error.clone()),
+    };
     let state = if read_error.is_some() {
         "read_error"
     } else if !detection.detected {
@@ -77,7 +143,7 @@ fn client_view(def: &ClientDef, gateway: &str) -> Value {
     let writable = def.writable && !detection.unsupported && read_error.is_none();
     let (mut profiles, revision) = saved.as_ref().cloned().unwrap_or_default();
     for profile in &mut profiles { model_config::normalize(def, profile); }
-    let applied = apply::applied_status(def.id, &detection.path).unwrap_or_else(
+    let applied = apply::applied_status_with_ids(def.id, &detection.path, backup_ids).unwrap_or_else(
         |error| json!({ "canUndo": false, "canDisconnect": false, "error": error }),
     );
     let views = profiles
@@ -103,7 +169,7 @@ fn client_view(def: &ClientDef, gateway: &str) -> Value {
         "icon": format!("assets/agents/{}", def.icon), "iconFull": def.icon_full,
         "configPath": detection.path.display().to_string(),
         "resolvedPath": detection.path.display().to_string(),
-        "pathOverride": paths::path_override(def.id).unwrap_or_default(),
+        "pathOverride": detection.override_path,
         "format": def.format.as_str(), "configMode": def.behavior,
         "protocol": def.protocols.first().copied().unwrap_or(""), "protocols": def.protocols,
         "installed": detection.detected, "detected": detection.detected,
@@ -114,7 +180,7 @@ fn client_view(def: &ClientDef, gateway: &str) -> Value {
         "supportsGateway": def.gateway, "supportsEnvKey": def.env_key,
         "supportNote": detection.note.as_deref().unwrap_or(def.note),
         "docsUrl": def.docs, "needsRestart": def.needs_restart,
-        "resources": resources::capabilities(def),
+        "resources": resources::capabilities_for(def, &detection),
         "configurations": configurations::list(def, &detection.path, &profiles, &live, writable).iter().map(configurations::Configuration::view).collect::<Vec<_>>(),
         "profiles": views, "live": live.iter().map(|profile| {
             let mut view = profile.view();

@@ -122,7 +122,7 @@ Launch at boot, automatic restart after a crash (`Restart=always`) and graceful 
 >
 > For an older installation, download a new server package containing this feature and run `sudo bash install.sh --upgrade` from that package once. This installs the update helper. Custom service accounts or paths are not overwritten; keep using your existing deployment procedure. Set `AGENT2API_SYSTEMD_UPDATE=0` to hide the panel entry, or disable `agent2api-updater.socket` to disable the helper. `AGENT2API_SELF_UPDATE` remains Docker-only; do not enable it on bare metal.
 >
-> The helper uses a local socket, not a network port. It verifies the release repository through the official index by default. Administrators may set `AGENT2API_UPDATER_REPO=owner/repo` or `HTTPS_PROXY` in `/etc/agent2api/updater.env` to pin a repository or configure a proxy for independent verification. Replacement failures restore the old files. If the new service cannot be confirmed ready, recovery files remain in `/opt/agent2api/.before-update-*` and failure is reported; the database is never rolled back automatically.
+> The helper uses a local socket, not a network port. Release policies and checksums come only from the official website. Set `HTTPS_PROXY` in `/etc/agent2api/updater.env` if independent verification needs a proxy. Replacement failures restore the old files. If the new service cannot be confirmed ready, recovery files remain in `/opt/agent2api/.before-update-*` and failure is reported; the database is never rolled back automatically.
 
 ### After installing
 
@@ -197,7 +197,8 @@ Environment variables (all optional):
 | `AGENT2API_SELF_UPDATE` | In-container update entry: `1` enabled by default (the panel offers "Download and update"); set `0` to upgrade manually only |
 | `AGENT2API_IMAGE_CACHE_MB` | Upper bound of the in-memory download cache for generated images (MiB, default `128`, range 8–4096). Invalid or out-of-range values fall back to the default |
 | `AGENT2API_IMAGE_COMPRESS_CACHE_MB` | Upper bound of the in-memory cache for compressed session images (MiB, default `128`, range 8–4096, same rules) |
-| `WORKBUDDY_UPDATE_REPO` + `WORKBUDDY_UPDATE_API_BASE` | Advanced: point update checks/downloads at your own source. The first swaps the repository (defaults to the upstream `aimod-cc/Agent2API`; forks should override it), the second swaps the API root (default `https://api.github.com`, must return a GitHub-shaped release JSON). With a custom source set, the download allowlist additionally admits only **that source's own host** (scheme follows the source: an `http://` source also allows plaintext downloads — for local drills / internal mirrors only) |
+
+Software and plugin updates check versions and download packages only through the [Agent2API website](https://agent2api.dev/downloads). Custom update sources and GitHub accelerators are no longer supported, and no GitHub token is required. Select an outbound proxy for website access in Update settings.
 
 Build from source: clone the repo and run `docker compose up -d --build` (the image contains only the gateway and the panel, no Rust toolchain).
 
@@ -224,7 +225,7 @@ glibc allocator tuning such as `MALLOC_ARENA_MAX=2` only matters for builds **wi
 
 ### In-container updates (optional)
 
-The panel's "Software update" page can download and apply updates from inside the container: it fetches `agent2api-server-linux-<arch>.tar.gz` from the official Release (verifying the `.sha256`), replaces the executable and `ui/`, then exits gracefully so the `restart` policy brings the same container back up. Controlled by `AGENT2API_SELF_UPDATE` (set to `1` in the Dockerfile); set it to `0` to upgrade manually only.
+The panel's Software update page can download and apply updates inside the container. It obtains `agent2api-server-linux-<arch>.tar.gz` from the official website, verifies the SHA-256 published there, replaces the executable and `ui/`, then exits gracefully so the restart policy brings the same container back up. This is controlled by `AGENT2API_SELF_UPDATE` (`1` in the Dockerfile); set it to `0` for manual upgrades only.
 
 The same `agent2api-server-linux-<arch>.tar.gz` is also the installer package for the [Linux server](#linux-systemd): its `agent2api-server` and `ui/` entries are exactly what the update chain reads by name, and it additionally ships `install.sh` / `agent2api.service` / `agent2api.env.example`. The update chain only reads the first two (the rest are discarded — see `selfupdate::extract_bundle`), so one artifact serves both purposes: unpack and replace inside a container, unpack and run `install.sh` on a bare-metal host.
 
@@ -273,8 +274,8 @@ There are three forms — pick what you need:
 | Form | How to install | Good for |
 | --- | --- | --- |
 | **Browser / PWA** | Open `/m` in a phone browser; optionally "Add to Home Screen" | Quick look, nothing to install, the easiest option on iPhone |
-| **Android APK** | Install `Agent2API-<version>.apk` | Home-screen icon, full screen, multiple servers |
-| **iOS IPA** | Install `Agent2API-<version>.ipa` (unsigned — you re-sign it) | Home-screen icon, full screen |
+| **Android APK** | Install `Agent2API-<version>.apk` from [Downloads](https://agent2api.dev/downloads) or Release | Home-screen icon, full screen, multiple servers |
+| **iOS IPA** | Install `Agent2API-<version>.ipa` from [Downloads](https://agent2api.dev/downloads) or Release (unsigned — you re-sign it) | Home-screen icon, full screen |
 
 All three run the same UI code. The difference is who serves the page: the PWA is served by the gateway (so "also expose the web management panel" must be on), while the APK / IPA ship the UI inside the package (so they can start the UI offline and do not need that switch).
 
@@ -328,7 +329,7 @@ To sideload: drop the `.ipa` into AltStore (or SideStore), re-sign with your App
 
 **Known limitations of the IPA**:
 
-- **In-app updates can only link out**: iOS does not allow an app to download and install executable code, so "Software update" in settings shows a "Get it" button that opens the Release page instead of downloading like Android does. The PWA form updates through the Service Worker — just refresh.
+- **In-app updates link to download**: iOS does not allow an app to download and install executable code directly, so checking for updates in settings offers a "Download IPA" button (fetching the `.ipa` from the official CDN for re-signing with AltStore / SideStore or your own certificate) and a link to the official downloads page, instead of installing in-place like Android does. The PWA form updates through the Service Worker — just refresh.
 - Cleartext `http://` gateways: `Info.plist` already relaxes ATS and declares the local-network usage. The first connection triggers an "allow local network" prompt — you must accept it, otherwise every request fails with no visible explanation.
 - Everything else matches the APK: the UI follows the package version, and http is the default scheme.
 
@@ -356,7 +357,7 @@ When a new version is available, a "Restart & update" bar floats at the bottom: 
 | One-tap check-in, view check-in history | Claim onboarding rewards and plans one by one |
 | Enable/disable models, filter by provider | Edit model mappings, reasoning levels, capability flags |
 | Copy gateway keys, enable/disable keys | Create keys, set provider/model allowlists |
-| Add, edit and delete manual HTTP / SOCKS5 proxies; sync Clash Verge endpoints; enable/disable and test connectivity | — (proxy subscriptions and the built-in kernel have been discontinued) |
+| Add, edit and delete manual HTTP / SOCKS5 proxies; sync EasyClash endpoints; enable/disable and test connectivity | — (proxy subscriptions and the built-in kernel have been discontinued) |
 | Enable/disable scheduled tasks, change intervals | Change port, routing, retry, timeouts, data retention |
 | Assistant quick queries (balances / duplicate models / today's usage / rate-limited accounts) | Free-form assistant chat and tool calling |
 | View Agent takeover status, restore | Rewrite client configs (a phone cannot read local files) |

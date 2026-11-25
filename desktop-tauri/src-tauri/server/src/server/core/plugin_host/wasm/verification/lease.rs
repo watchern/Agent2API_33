@@ -101,12 +101,8 @@ impl Owner {
         let store = self.store.clone();
         let provider = self.provider.clone();
         let account = self.account.clone();
-        let checked_provider = provider.clone();
-        let record = crate::server::core::blocking::run(move || store.plugin_account(&account))
+        let record = crate::server::core::blocking::run(move || store.plugin_verification_snapshot(&provider, &account))
             .await.map_err(|_| unavailable())?.ok_or_else(|| failure(409, "verification_account_changed", "领取账号已删除或归属变化"))?;
-        if record["provider"].as_str() != Some(checked_provider.as_str()) {
-            return Err(failure(409, "verification_account_changed", "领取账号归属已变化"));
-        }
         if !self.life.alive() || super::super::super::host_for_provider(&self.provider)
             .is_none_or(|current| !Arc::ptr_eq(&current, &host)) { return Err(unavailable()); }
         Ok(record)

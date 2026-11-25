@@ -39,7 +39,11 @@ mod image_mcp;
 mod mcp;
 mod normalize;
 mod providers;
+mod provider_errors;
+mod provider_keys;
+mod provider_request;
 mod search;
+pub use provider_keys::{ProviderKeyConfig, ProviderKeyUpdate, MAX_PROVIDER_KEYS};
 mod skill_package;
 mod vision;
 
@@ -50,7 +54,7 @@ pub use install::{
 };
 pub use mcp::{dispatch as mcp_dispatch, McpRequestContext, McpServerKind, McpSpec};
 pub use account_search::test_provider;
-pub use search::{batch_items, run_fetch, run_search, SearchError, SearchErrorCode};
+pub use search::{batch_items, extract_limit, run_fetch, run_search, SearchError, SearchErrorCode};
 pub use skill_package::{
     build_skill_files, is_skill_variant, recommended_skill_variant, skill_variants, SkillFile,
     SkillVariant, WEB_SEARCH_SKILL_NAME, WEB_SEARCH_SKILL_VERSION,
@@ -68,7 +72,6 @@ use serde_json::{json, Value};
 
 use crate::server::config;
 use crate::server::core::account_store::AccountStore;
-use crate::server::core::crypto::{self, SecretScope};
 
 /// 配置在网关配置里的键名（kv 表一行）
 pub const KEY_TOOL_SERVICES: &str = "toolServices";
@@ -87,10 +90,27 @@ pub const IMAGE_GENERATION_VERSION: &str = "1.0.0";
 /// [`endpoint`] 与 `tool_runtime` 提供。
 pub const PROTOCOLS: [&str; 2] = ["skill", "mcp"];
 
-/// 密钥型来源同时支持搜索与抓取；账号型来源只支持搜索，默认不选中。
+/// 密钥型来源同时支持搜索与抓取；账号型来源由内置清单加已加载插件的 `web-search.capabilities` 动态发现。
 pub const API_KEY_PROVIDERS: [&str; 4] = ["tavily", "querit", "firecrawl", "ollama"];
-pub const ACCOUNT_PROVIDERS: [&str; 3] = ["workbuddy", "workbuddy-intl", "kiro"];
-pub const SEARCH_PROVIDERS: [&str; 7] = ["tavily", "querit", "firecrawl", "ollama", "workbuddy", "workbuddy-intl", "kiro"];
+pub const BUILTIN_ACCOUNT_PROVIDERS: [&str; 3] = ["workbuddy", "workbuddy-intl", "kiro"];
+
+pub fn discovered_account_providers() -> Vec<String> {
+    let mut providers: Vec<String> = BUILTIN_ACCOUNT_PROVIDERS
+        .iter()
+        .map(|item| item.to_string())
+        .collect();
+    for id in crate::server::core::plugin_host::installed_ids() {
+        if API_KEY_PROVIDERS.contains(&id.as_str()) || providers.iter().any(|item| item == &id) {
+            continue;
+        }
+        let supported = crate::server::core::plugin_host::lookup(&id)
+            .is_some_and(|adapter| adapter.web_search_capability().is_some());
+        if supported {
+            providers.push(id);
+        }
+    }
+    providers
+}
 
 /// 服务固定元数据（文案由前端按 id 映射，后端只回数据）
 pub const WEB_SEARCH_PACKAGE: &str = WEB_SEARCH_SKILL_NAME;
@@ -176,19 +196,40 @@ pub fn version(service: &str) -> &'static str {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct ProviderConfig {
-    /// `enc1:` 信封；空串 = 未配置
+    /// 旧版单密钥字段，读取后迁移到有序列表。
+    #[serde(skip_serializing_if = "String::is_empty")]
     pub encrypted_key: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
     pub key_hint: String,
+    pub keys: Vec<ProviderKeyConfig>,
     /// 账号型来源只保存账号引用，凭证仍由账号库与插件管理。
     pub account_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_results: Option<usize>,
     pub enabled: bool,
     pub updated_at: i64,
 }
 
 impl Default for ProviderConfig {
     fn default() -> Self {
-        Self { encrypted_key: String::new(), key_hint: String::new(), account_id: String::new(), enabled: false, updated_at: 0 }
+        Self {
+            encrypted_key: String::new(),
+            key_hint: String::new(),
+            keys: Vec::new(),
+            account_id: String::new(),
+            max_results: None,
+            enabled: false,
+            updated_at: 0,
+        }
     }
+}
+
+fn default_max_global_sources() -> usize {
+    normalize::DEFAULT_MAX_GLOBAL_SOURCES
+}
+
+fn default_long_query_policy() -> String {
+    "truncate".into()
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -204,7 +245,7 @@ impl Default for Selection {
     }
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct ToolConfig {
     /// service → protocol → 开关
@@ -214,9 +255,28 @@ pub struct ToolConfig {
     /// provider → 密钥与启用状态
     pub providers: BTreeMap<String, ProviderConfig>,
     pub selection: Selection,
+    #[serde(default = "default_max_global_sources")]
+    pub max_global_sources: usize,
+    #[serde(default = "default_long_query_policy")]
+    pub long_query_policy: String,
     pub vision: Option<VisionConfig>,
     #[serde(default, deserialize_with = "image_config::deserialize_stored")]
     pub image_generation: Option<image_config::ImageConfig>,
+}
+
+impl Default for ToolConfig {
+    fn default() -> Self {
+        Self {
+            enabled: BTreeMap::new(),
+            timeouts: BTreeMap::new(),
+            providers: BTreeMap::new(),
+            selection: Selection::default(),
+            max_global_sources: default_max_global_sources(),
+            long_query_policy: default_long_query_policy(),
+            vision: None,
+            image_generation: None,
+        }
+    }
 }
 
 impl ToolConfig {
@@ -234,15 +294,31 @@ impl ToolConfig {
                 .unwrap_or(30);
             self.timeouts.entry(service.to_string()).or_insert(fallback);
         }
-        for provider in SEARCH_PROVIDERS {
-            self.providers.entry(provider.to_string()).or_default();
+        for provider in API_KEY_PROVIDERS {
+            let entry = self.providers.entry(provider.to_string()).or_default();
+            provider_keys::normalize(entry);
+            if let (Some(limit), Some(meta)) = (entry.max_results, providers::api_provider_meta(provider)) {
+                entry.max_results = Some(limit.clamp(1, meta.max_results_limit));
+            }
         }
-        self.selection.search.retain(|item| is_search_provider(item));
+        for provider in discovered_account_providers() {
+            self.providers.entry(provider).or_default();
+        }
+        self.selection.search.retain(|item| !item.trim().is_empty());
         if self.selection.search.is_empty() {
             self.selection.search = Selection::default().search;
         }
         if !is_fetch_provider(&self.selection.fetch) {
             self.selection.fetch = "tavily".into();
+        }
+        self.max_global_sources = if self.max_global_sources == 0 {
+            normalize::DEFAULT_MAX_GLOBAL_SOURCES
+        } else {
+            self.max_global_sources
+                .clamp(normalize::MIN_GLOBAL_SOURCES, normalize::MAX_GLOBAL_SOURCES_LIMIT)
+        };
+        if !matches!(self.long_query_policy.as_str(), "truncate" | "skip" | "error") {
+            self.long_query_policy = default_long_query_policy();
         }
         self
     }
@@ -266,16 +342,25 @@ fn parse_stored(value: &serde_json::Value) -> ToolConfig {
 
 /// 在配置锁内做一次读改写：两个页面同时保存时不会互相覆盖（后写者基于前写者的结果）
 fn update(mutate: impl FnOnce(&mut ToolConfig)) -> Result<ToolConfig, String> {
+    try_update(|config_value| { mutate(config_value); Ok(()) })
+}
+
+fn try_update(mutate: impl FnOnce(&mut ToolConfig) -> Result<(), String>) -> Result<ToolConfig, String> {
     let mut next: Option<ToolConfig> = None;
+    let mut failure = None;
     let saved = crate::server::config::update_raw_field_with(KEY_TOOL_SERVICES, |value| {
         let mut current = parse_stored(value);
-        mutate(&mut current);
+        if let Err(error) = mutate(&mut current) {
+            failure = Some(error);
+            return;
+        }
         let current = current.normalized();
         if let Ok(serialized) = serde_json::to_value(&current) {
             *value = serialized;
             next = Some(current);
         }
     });
+    if let Some(error) = failure { return Err(error); }
     match (saved, next) {
         (true, Some(config_value)) => Ok(config_value),
         _ => Err("工具服务配置写入失败".into()),
@@ -371,27 +456,30 @@ pub fn list_services(protocol: Option<&str>) -> Vec<Value> {
 /* ─── 搜索提供商 ───────────────────────────────────────────── */
 
 pub fn is_search_provider(value: &str) -> bool {
-    SEARCH_PROVIDERS.contains(&value)
+    API_KEY_PROVIDERS.contains(&value) || is_account_provider(value)
 }
 
 pub fn is_account_provider(value: &str) -> bool {
-    ACCOUNT_PROVIDERS.contains(&value)
+    !API_KEY_PROVIDERS.contains(&value)
+        && (BUILTIN_ACCOUNT_PROVIDERS.contains(&value)
+            || crate::server::core::plugin_host::lookup(value)
+                .is_some_and(|adapter| adapter.web_search_capability().is_some()))
 }
 
 pub fn is_fetch_provider(value: &str) -> bool {
     API_KEY_PROVIDERS.contains(&value)
 }
 
-pub fn provider_display_name(provider: &str) -> &'static str {
+pub fn provider_display_name(provider: &str) -> String {
+    let builtin = providers::display_name(provider);
+    if !builtin.is_empty() {
+        return builtin.to_string();
+    }
     match provider {
-        "tavily" => "Tavily",
-        "querit" => "Querit",
-        "firecrawl" => "Firecrawl",
-        "ollama" => "Ollama Web Search",
-        "workbuddy" => "WorkBuddy 国内版",
-        "workbuddy-intl" => "WorkBuddy 国际版",
-        "kiro" => "Kiro",
-        _ => "",
+        "workbuddy" => "WorkBuddy 国内版".to_string(),
+        "workbuddy-intl" => "WorkBuddy 国际版".to_string(),
+        "kiro" => "Kiro".to_string(),
+        _ => crate::server::core::providers::label_of(provider),
     }
 }
 
@@ -408,22 +496,12 @@ pub async fn list_providers(store: &AccountStore) -> Value {
     let config_value = load();
     let mut rows: Vec<Value> = API_KEY_PROVIDERS.iter().map(|provider| {
         let entry = config_value.providers.get(*provider).cloned().unwrap_or_default();
-        json!({
-            "provider": provider,
-            "display_name": provider_display_name(provider),
-            "auth_type": "api_key",
-            "supports_search": true,
-            "supports_fetch": true,
-            "available": true,
-            "configured": !entry.encrypted_key.is_empty(),
-            "key_hint": if entry.key_hint.is_empty() { Value::Null } else { json!(entry.key_hint) },
-            "enabled": entry.enabled,
-            "updated_at": if entry.updated_at > 0 { json!(entry.updated_at) } else { Value::Null },
-        })
+        provider_keys::provider_row(provider, &entry)
     }).collect();
-    let account_rows = futures::future::join_all(ACCOUNT_PROVIDERS.iter().map(|provider| {
-        let entry = config_value.providers.get(*provider).cloned().unwrap_or_default();
-        account_search::provider_row(store, provider, entry)
+    let account_providers = discovered_account_providers();
+    let account_rows = futures::future::join_all(account_providers.iter().map(|provider| {
+        let entry = config_value.providers.get(provider.as_str()).cloned().unwrap_or_default();
+        account_search::provider_row(store, provider.clone(), entry)
     })).await;
     rows.extend(account_rows);
     Value::Array(rows)
@@ -434,7 +512,38 @@ pub fn provider_selection() -> Value {
     json!({
         "search_providers": config_value.selection.search,
         "fetch_provider": config_value.selection.fetch,
+        "max_global_sources": config_value.max_global_sources,
+        "long_query_policy": config_value.long_query_policy,
     })
+}
+
+fn validate_provider_max_results(provider: &str, max_results: Option<Option<usize>>) -> Result<Option<Option<usize>>, String> {
+    let Some(next) = max_results else {
+        return Ok(None);
+    };
+    let Some(value) = next else {
+        return Ok(Some(None));
+    };
+    if let Some(meta) = providers::api_provider_meta(provider) {
+        if !(1..=meta.max_results_limit).contains(&value) {
+            return Err(format!("{} 单次最多返回条数需在 1～{} 之间", provider_display_name(provider), meta.max_results_limit));
+        }
+        return Ok(Some(Some(value)));
+    }
+    if let Some(cap) = crate::server::core::plugin_host::lookup(provider).and_then(|adapter| adapter.web_search_capability()) {
+        if !cap.supports_max_results {
+            return Err(format!("{} 不支持自定义返回条数", provider_display_name(provider)));
+        }
+        let upper = cap.max_results_limit.unwrap_or(10);
+        if !(1..=upper).contains(&value) {
+            return Err(format!("{} 单次最多返回条数需在 1～{} 之间", provider_display_name(provider), upper));
+        }
+        return Ok(Some(Some(value)));
+    }
+    if !(1..=normalize::MAX_QUERY_RESULT_LIMIT).contains(&value) {
+        return Err(format!("单次最多返回条数需在 1～{} 之间", normalize::MAX_QUERY_RESULT_LIMIT));
+    }
+    Ok(Some(Some(value)))
 }
 
 pub fn update_provider(
@@ -443,12 +552,15 @@ pub fn update_provider(
     api_key: Option<&str>,
     enabled: Option<bool>,
     account_id: Option<&str>,
+    keys: Option<Vec<ProviderKeyUpdate>>,
+    max_results: Option<Option<usize>>,
 ) -> Result<Value, String> {
     if !is_search_provider(provider) {
         return Err("未知的搜索提供商".into());
     }
+    let validated_max_results = validate_provider_max_results(provider, max_results)?;
     if is_account_provider(provider) {
-        if api_key.is_some_and(|key| !key.trim().is_empty()) {
+        if keys.is_some() || api_key.is_some_and(|key| !key.trim().is_empty()) {
             return Err("该搜索来源使用已有账号，不接受 API Key".into());
         }
         let account_id = account_id.map(str::trim);
@@ -458,42 +570,34 @@ pub fn update_provider(
         let config_value = update(|config_value| {
             let entry = config_value.providers.entry(provider.to_string()).or_default();
             if let Some(id) = account_id { entry.account_id = id.to_string(); }
+            if let Some(limit) = validated_max_results { entry.max_results = limit; }
             if let Some(enabled) = enabled { entry.enabled = enabled; }
             entry.updated_at = crate::server::logging::now_ms();
         })?;
         let entry = config_value.providers.get(provider).cloned().unwrap_or_default();
-        return Ok(json!({ "success": true, "provider": provider, "account_id": entry.account_id }));
+        return Ok(json!({ "success": true, "provider": provider, "account_id": entry.account_id, "max_results": entry.max_results }));
     }
     if account_id.is_some() {
         return Err("该搜索来源使用 API Key，不接受账号绑定".into());
     }
-    let api_key = api_key.map(str::trim).filter(|value| !value.is_empty());
-    let encrypted = match api_key {
-        Some(key) => {
-            let sealed = crypto::seal(key.as_bytes(), SecretScope::Accounts)
-                .map_err(|_| "无法加密 API Key".to_string())?;
-            Some((sealed, key_hint(key)))
-        }
-        None => None,
-    };
-    let config_value = update(|config_value| {
+    if keys.is_some() && api_key.is_some() {
+        return Err("不能同时提交单密钥和密钥列表".into());
+    }
+    let prepared = keys.as_deref().map(provider_keys::prepare_updates).transpose()?;
+    let replacement = api_key.map(str::trim).filter(|value| !value.is_empty())
+        .map(provider_keys::prepare_legacy_key).transpose()?;
+    let config_value = try_update(|config_value| {
         let entry = config_value.providers.entry(provider.to_string()).or_default();
-        if let Some((sealed, hint)) = encrypted {
-            entry.encrypted_key = sealed;
-            entry.key_hint = hint;
-            entry.updated_at = crate::server::logging::now_ms();
-        }
-        if let Some(enabled) = enabled {
-            entry.enabled = enabled;
-        }
+        if let Some(items) = prepared { provider_keys::apply_updates(entry, items)?; }
+        if let Some(key) = replacement { provider_keys::replace_legacy_key(entry, key); }
+        if let Some(limit) = validated_max_results { entry.max_results = limit; }
+        if let Some(enabled) = enabled { entry.enabled = enabled; }
+        Ok(())
     })?;
     let entry = config_value.providers.get(provider).cloned().unwrap_or_default();
-    Ok(json!({
-        "success": true,
-        "provider": provider,
-        "configured": !entry.encrypted_key.is_empty(),
-        "key_hint": if entry.key_hint.is_empty() { Value::Null } else { json!(entry.key_hint) },
-    }))
+    let mut result = provider_keys::provider_row(provider, &entry);
+    result["success"] = json!(true);
+    Ok(result)
 }
 
 pub fn clear_provider_key(provider: &str) -> bool {
@@ -502,6 +606,7 @@ pub fn clear_provider_key(provider: &str) -> bool {
     }
     update(|config_value| {
         let entry = config_value.providers.entry(provider.to_string()).or_default();
+        entry.keys.clear();
         entry.encrypted_key.clear();
         entry.key_hint.clear();
         entry.updated_at = crate::server::logging::now_ms();
@@ -509,43 +614,25 @@ pub fn clear_provider_key(provider: &str) -> bool {
     .is_ok()
 }
 
-/// 读取某家当前配置（含解密后的密钥；仅服务端内部使用，禁止出现在日志/响应中）
-pub fn provider_key(provider: &str) -> Option<String> {
-    decrypt_provider_key(load().providers.get(provider)?)
-}
-
-fn decrypt_provider_key(entry: &ProviderConfig) -> Option<String> {
-    if entry.encrypted_key.is_empty() {
-        return None;
-    }
-    let bytes = crypto::open(&entry.encrypted_key, SecretScope::Accounts).ok()?;
-    String::from_utf8(bytes).ok().filter(|value| !value.is_empty())
-}
-
 pub fn configured_provider(provider: &str) -> bool {
-    load()
-        .providers
-        .get(provider)
-        .is_some_and(|entry| !entry.encrypted_key.is_empty() && entry.enabled)
+    load().providers.get(provider).is_some_and(|entry| entry.enabled && provider_keys::has_keys(entry))
 }
 
 /// 已启用且已配置密钥的提供商
 pub fn ready_providers() -> Vec<&'static str> {
     let config_value = load();
-    SEARCH_PROVIDERS
+    API_KEY_PROVIDERS
         .iter()
         .copied()
         .filter(|provider| {
-            config_value
-                .providers
-                .get(*provider)
-                .is_some_and(|entry| entry.enabled && !entry.encrypted_key.is_empty())
+            config_value.providers.get(*provider)
+                .is_some_and(|entry| entry.enabled && provider_keys::has_keys(entry) && provider_keys::usable(entry, "search"))
         })
         .collect()
 }
 
 /// 已选择但未启用或未配置密钥的提供商（展示名，供运行时返回可读配置错误）
-pub fn missing_selected_providers() -> Vec<&'static str> {
+pub fn missing_selected_providers() -> Vec<String> {
     let selected = load().selection.search;
     let ready = ready_providers();
     selected
@@ -559,6 +646,8 @@ pub fn missing_selected_providers() -> Vec<&'static str> {
 pub fn update_selection(
     search: Option<Vec<String>>,
     fetch: Option<String>,
+    max_global_sources: Option<usize>,
+    long_query_policy: Option<String>,
 ) -> Result<Value, String> {
     let mut next_search = None;
     if let Some(items) = search {
@@ -581,12 +670,32 @@ pub fn update_selection(
             return Err("该提供商不支持网页抓取".into());
         }
     }
+    if let Some(max_sources) = max_global_sources {
+        if !(normalize::MIN_GLOBAL_SOURCES..=normalize::MAX_GLOBAL_SOURCES_LIMIT).contains(&max_sources) {
+            return Err(format!(
+                "单次汇总总条数上限需在 {}～{} 之间",
+                normalize::MIN_GLOBAL_SOURCES,
+                normalize::MAX_GLOBAL_SOURCES_LIMIT
+            ));
+        }
+    }
+    if let Some(policy) = long_query_policy.as_deref() {
+        if !matches!(policy, "truncate" | "skip" | "error") {
+            return Err("搜索词超长处理方式无效".into());
+        }
+    }
     update(|config_value| {
         if let Some(items) = next_search {
             config_value.selection.search = items;
         }
         if let Some(provider) = fetch {
             config_value.selection.fetch = provider;
+        }
+        if let Some(max_sources) = max_global_sources {
+            config_value.max_global_sources = max_sources;
+        }
+        if let Some(policy) = long_query_policy {
+            config_value.long_query_policy = policy;
         }
     })?;
     Ok(provider_selection())

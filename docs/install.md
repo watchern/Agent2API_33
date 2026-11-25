@@ -131,7 +131,7 @@ journalctl -u agent2api -f
 >
 > 旧安装先下载包含本功能的新版服务端包，在新包目录执行一次 `sudo bash install.sh --upgrade`，补装升级组件后即可使用。自定义服务账号或安装路径不会被脚本强行改写，继续使用原部署方式升级。`AGENT2API_SYSTEMD_UPDATE=0` 可关闭面板入口；停用 `agent2api-updater.socket` 可停用升级组件。`AGENT2API_SELF_UPDATE` 仍为 Docker 专用，不要在裸机开启。
 >
-> 更新组件通过本机 socket 工作，不开放网络端口。默认从官方索引核验发布仓库；需固定仓库或为独立校验配置代理时，管理员可在 `/etc/agent2api/updater.env` 设置 `AGENT2API_UPDATER_REPO=owner/repo` 或 `HTTPS_PROXY`。替换失败会还原；新版启动未确认成功时保留 `/opt/agent2api/.before-update-*` 恢复文件并报告失败，不自动回退数据库。
+> 更新组件通过本机 socket 工作，不开放网络端口。发布策略与校验信息只从官网取得；独立校验需要代理时，可在 `/etc/agent2api/updater.env` 设置 `HTTPS_PROXY`。替换失败会还原；新版启动未确认成功时保留 `/opt/agent2api/.before-update-*` 恢复文件并报告失败，不自动回退数据库。
 
 ### 装完之后
 
@@ -211,7 +211,8 @@ services:
 | `AGENT2API_SELF_UPDATE` | 容器内的更新入口：默认 `1` 开启（面板可「下载并更新」）；置 `0` 关闭，只走手动升级 |
 | `AGENT2API_IMAGE_CACHE_MB` | 生成图片的内存下载缓存上限（MiB，默认 `128`，范围 8~4096）。写坏 / 越界回落默认值 |
 | `AGENT2API_IMAGE_COMPRESS_CACHE_MB` | 会话图片压缩结果的内存缓存上限（MiB，默认 `128`，范围 8~4096，口径同上） |
-| `WORKBUDDY_UPDATE_REPO` + `WORKBUDDY_UPDATE_API_BASE` | 进阶：把「检查更新 / 下载更新」换成自建源。前者换仓库（默认跟上游 `aimod-cc/Agent2API`，fork 后可改），后者换 API 根（默认 `https://api.github.com`，需返回与 GitHub 同形的 release JSON）。配了自建源后，下载白名单只额外放行**该源自己的域名**（按源的 scheme：配 `http://` 就允许明文下载，仅建议本地演练/内网镜像用）|
+
+软件与插件更新只通过 [Agent2API 官网](https://agent2api.dev/downloads) 检查版本和下载安装包，不再支持自定义更新源或 GitHub 加速源，也不需要 GitHub 令牌。连接官网的出网代理仍可在「更新设置」中选择。
 
 从源码构建：克隆本仓库后 `docker compose up -d --build`（镜像里只有网关与面板，不含 Rust 工具链）。
 
@@ -238,7 +239,7 @@ compose 用户在服务里加一行 `mem_limit: 1g`（`docker-compose.yml` 里�
 
 ### 容器内更新（可选）
 
-面板的「软件更新」页在容器里能直接「下载并更新」：下载官方 Release 里的 `agent2api-server-linux-<arch>.tar.gz`（校验 `.sha256`）→ 替换可执行文件与 `ui/` → 进程优雅退出、由 `restart` 策略拉起同一个容器。由 `AGENT2API_SELF_UPDATE` 控制（Dockerfile 默认 `1`），置 `0` 则只走手动升级。
+面板的「软件更新」页在容器里能直接「下载并更新」：从官网获取 `agent2api-server-linux-<arch>.tar.gz`，核对官网发布的 SHA-256 校验值后替换可执行文件与 `ui/`，再让进程优雅退出，由 `restart` 策略拉起同一个容器。由 `AGENT2API_SELF_UPDATE` 控制（Dockerfile 默认 `1`），置 `0` 则只走手动升级。
 
 同一个 `agent2api-server-linux-<arch>.tar.gz` 也是 [Linux 服务端](#linuxsystemd) 的安装包：包内的 `agent2api-server` 与 `ui/` 是这条更新链按名取的条目，另外还带着 `install.sh` / `agent2api.service` / `agent2api.env.example`。容器更新链只认前两个条目（其余读完即丢，见 `selfupdate::extract_bundle`），所以一份产物同时服务两种用途 —— 容器里解包替换，裸机上解包跑 `install.sh`。
 
@@ -287,8 +288,8 @@ print(resp.choices[0].message.content)
 | 形态 | 怎么装 | 适合 |
 | --- | --- | --- |
 | **浏览器 / PWA** | 手机浏览器打开 `/m`，可「添加到主屏幕」 | 临时看、不想装东西、iPhone 首选 |
-| **Android APK** | 装 `Agent2API-<版本>.apk` | 要图标、要全屏、要管多台服务器 |
-| **iOS IPA** | 装 `Agent2API-<版本>.ipa`（未签名，需自行重签） | 要图标、要全屏 |
+| **Android APK** | 从[官网下载页](https://agent2api.dev/downloads)或 Release 装 `Agent2API-<版本>.apk` | 要图标、要全屏、要管多台服务器 |
+| **iOS IPA** | 从[官网下载页](https://agent2api.dev/downloads)或 Release 装 `Agent2API-<版本>.ipa`（未签名，需自行重签） | 要图标、要全屏 |
 
 三者的界面是同一份代码，区别在「谁提供页面」：PWA 由网关出（所以必须开「同时开放网页管理面板」），APK / IPA 把界面打进包里（所以离线也能起界面，且不需要那个开关）。
 
@@ -342,7 +343,7 @@ Release 里的 `Agent2API-<版本>.ipa` **默认是未签名包** —— 苹果�
 
 **IPA 的已知限制**：
 
-- **应用内更新只能跳转**：iOS 不允许 App 自己下载并安装可执行代码，所以设置页的「软件更新」在 iOS 上给的是「去下载」按钮（打开 Release 页面），不会像 Android 那样直接下载安装。PWA 形态则走 Service Worker，刷新即可。
+- **应用内更新只能跳转下载**：iOS 不允许 App 自己下载并安装可执行代码，所以设置页「检查更新」在 iOS 上会提供「下载 IPA」（直连官方 CDN 下载 `.ipa` 包，再交给 AltStore / SideStore 或证书重签安装）和「官网下载页」入口，不会像 Android 那样自动静默覆盖安装。PWA 形态则走 Service Worker，刷新即可。
 - 局域网 `http://` 网关：`Info.plist` 已放开 ATS 明文限制并声明了本地网络用途；首次连接时系统会弹「允许访问本地网络」，必须点允许，否则所有请求都会失败且没有提示。
 - 其余与 APK 相同：界面随包版本走、协议默认 http。
 
@@ -370,7 +371,7 @@ Release 里的 `Agent2API-<版本>.ipa` **默认是未签名包** —— 苹果�
 | 一键签到、看签到记录 | 逐项领取新手福利与套餐 |
 | 启停模型、按提供商筛选 | 改模型映射、思考等级、能力位 |
 | 复制网关 Key、启停 Key | 新建 Key、设置可用范围白名单 |
-| 新增、编辑、删除手动 HTTP / SOCKS5 代理，同步 Clash Verge 端点，启停与测试连通性 | —（代理订阅与内置内核已下线） |
+| 新增、编辑、删除手动 HTTP / SOCKS5 代理，同步 EasyClash 端点，启停与测试连通性 | —（代理订阅与内置内核已下线） |
 | 启停定时任务、改间隔 | 改端口、路由、重试、超时、数据保留 |
 | 助手快捷查询（余额 / 重复模型 / 今日用量 / 限流账号） | 助手的自由对话与工具调用 |
 | 查看 Agent 接管状态、还原 | 改写客户端配置（手机读不到本机文件） |

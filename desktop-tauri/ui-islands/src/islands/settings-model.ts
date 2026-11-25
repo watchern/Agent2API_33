@@ -107,15 +107,13 @@ type ModelsDevView = {
 }
 
 /**
- * models.dev 面板的状态行：把「开关 + 数据来历 + 生成时刻 + 条数」写成一句话。
- *
- * 为什么不只写「已开启」：这个开关的价值全在**那份元数据是什么时候的、有多少
- * 条** —— 只报开关状态，用户没法判断「我的档位为什么还是老样子」是没开、
- * 是没拉到、还是这份快照本来就旧。
+ * models.dev 面板的状态行：把「数据来历 + 生成时刻 + 自动更新开关」写成一句话，
+ * 刷新进行中提示正在更新；总条数已由卡片右上角徽章展示，这里不再重复。
  */
-export function modelsDevStateText(state: ModelsDevView): string {
+export function modelsDevStateText(state: ModelsDevView, refreshing = false): string {
   if (state.status === 'loading') return STATES.appLoading
   if (state.status === 'unavailable') return STATES.modelsDevUnavailable
+  if (refreshing) return STATES.modelsDevRefreshing
   const origin = state.source === 'builtin'
     ? STATES.modelsDevSourceBuiltin
     : state.source === 'cache'
@@ -129,14 +127,11 @@ export function modelsDevStateText(state: ModelsDevView): string {
     ? String(shared().wbApp?.formatTime?.(state.updatedAt) ?? '')
     : ''
   if (!origin && !stamp && !state.count) return STATES.modelsDevEmpty
-  const at = stamp ? t('，{time}', { time: stamp }) : ''
-  const mode = state.enabled ? t('正在联网更新') : t('仅用现有数据、不联网刷新')
-  return t('{count} 条 · 来自{origin}{at} · {mode}', {
-    count: Number(state.count).toLocaleString('zh-CN'),
-    origin: origin || t('未知来源'),
-    at,
-    mode,
-  })
+  const source = origin || t('未知来源')
+  const mode = state.enabled ? t('自动更新已开启') : t('仅用本地数据')
+  return stamp
+    ? t('当前数据：{origin} · {time} · {mode}', { origin: source, time: stamp, mode })
+    : t('当前数据：{origin} · {mode}', { origin: source, mode })
 }
 
 /* ─── 桥与共享全局 ─────────────────────────── */
@@ -151,6 +146,15 @@ export type AppSettings = {
   lanPanel: boolean
   /** 轻量模式：关窗销毁界面进程（释放 WebView2 内存），托盘按需重建 */
   lightweightMode: boolean
+  hardwareAcceleration: boolean
+}
+
+export type GraphicsSettings = {
+  enabled: boolean
+  active: boolean
+  environmentOverride: boolean
+  compatibilityMode: boolean
+  restartRequired: boolean
 }
 
 /**
@@ -208,8 +212,6 @@ export type SystemInfo = {
     allowNoKey?: boolean | null
     v1FailClosed?: boolean | null
     panelGate?: boolean | null
-    githubTokenFilled?: boolean | null
-    githubTokenOrigin?: string | null
     updateProxy?: boolean | null
   }
   features?: {
@@ -322,6 +324,8 @@ export type SettingsBridge = {
   platform?: string
   getAppSettings(): Promise<AppSettings | null | undefined>
   saveAppSettings(patch: AppSettings): Promise<AppSettings | null | undefined>
+  getGraphicsSettings?(): Promise<GraphicsSettings>
+  saveGraphicsSettings?(enabled: boolean): Promise<void>
   exportAccounts(): Promise<ExportResult | null | undefined>
   importAccounts(): Promise<ImportResult | null | undefined>
   getRetention(): Promise<unknown>
@@ -338,6 +342,8 @@ export type SettingsBridge = {
   saveDebug(enabled: boolean): Promise<unknown>
   getSanitize(): Promise<unknown>
   saveSanitize(patch: boolean | SanitizePatch): Promise<unknown>
+  getWebToolEmulation?(): Promise<unknown>
+  saveWebToolEmulation?(enabled: boolean): Promise<unknown>
   getDeveloperRoleCompat(): Promise<unknown>
   saveDeveloperRoleCompat(enabled: boolean): Promise<unknown>
   getReasoningCollapse(): Promise<unknown>
@@ -403,6 +409,13 @@ export type SettingsBridge = {
     cloudSyncUpload?(): Promise<unknown>
     cloudSyncDownload?(): Promise<unknown>
     importCloudSyncKey?(password: string): Promise<unknown>
+    getNotifications?(): Promise<unknown>
+    saveNotifications?(payload: Record<string, unknown>): Promise<unknown>
+    testNotification?(payload: Record<string, unknown>): Promise<unknown>
+    getOauthSettings?(): Promise<unknown>
+    saveOauthSettings?(payload: Record<string, unknown>): Promise<unknown>
+    startOauthBind?(payload: Record<string, unknown>): Promise<unknown>
+    pollOauthState?(state: string): Promise<unknown>
 }
 
 /**
@@ -492,6 +505,7 @@ export async function openExternal(url: string): Promise<void> {
  */
 export const CATEGORIES = [
   { id: 'account', label: t('账户'), icon: 'accounts' },
+  { id: 'notifications', label: t('通知'), icon: 'bell' },
   { id: 'general', label: t('通用'), icon: 'sliders' },
   // 注：AI 助手的配置（对话模型 / 系统提示词 / 工具勾选）已搬到助手页自己的
   // 「助手设置」抽屉（见 assistant-settings-drawer.tsx）—— 那几项都是聊着聊着
@@ -500,7 +514,6 @@ export const CATEGORIES = [
   { id: 'display', label: t('显示'), icon: 'display' },
   { id: 'gateway', label: t('网关'), icon: 'traffic' },
   { id: 'providers', label: t('提供商'), icon: 'sliders' },
-  { id: 'retry', label: t('重试'), icon: 'refresh' },
   { id: 'timeout', label: t('超时'), icon: 'timer' },
   { id: 'security', label: t('安全'), icon: 'shield' },
   { id: 'data', label: t('数据'), icon: 'database' },
@@ -636,8 +649,8 @@ export const RETRY_FIELDS: NumberField[] = [
     label: t('切换账号重试次数'),
     unit: t('次'),
     min: 0,
-    max: 10,
-    hint: t('失败后最多再换几个账号试（填 N = 最多换 N 个，首发那个不算）。换到同一家名下另一个账号、或换到另一家，都各算一次；换满仍失败就返回错误。可填 0–10，0 表示失败立即报错。'),
+    max: 100,
+    hint: t('失败后最多再换几个账号试（填 N = 最多换 N 个，首发那个不算）。换到同一家名下另一个账号、或换到另一家，都各算一次；换满仍失败就返回错误。可填 0–100，0 表示失败立即报错。'),
   },
   {
     key: 'retryIntervalSeconds',
@@ -801,6 +814,7 @@ export function normalizeApp(saved: unknown, fallback: AppSettings): AppSettings
     if (typeof record.lanAccess === 'boolean') result.lanAccess = record.lanAccess
     if (typeof record.lanPanel === 'boolean') result.lanPanel = record.lanPanel
     if (typeof record.lightweightMode === 'boolean') result.lightweightMode = record.lightweightMode
+    if (typeof record.hardwareAcceleration === 'boolean') result.hardwareAcceleration = record.hardwareAcceleration
   }
   return result
 }
@@ -862,7 +876,7 @@ export const TIPS = {
   tray: t('默认关闭窗口不会退出程序，而是把窗口缩到系统托盘，转发继续在后台运行（OpenAI 客户端不受影响）；要彻底退出程序，请在托盘图标上右键选「退出」。关掉这个开关后，点关闭按钮即退出程序、转发随之中断。「开机自动启动」开启后，登录系统时会自动启动本程序（通常直接驻留托盘），不需要手动打开。'),
   lightweight: t('开启后，关闭窗口会销毁界面并释放 WebView 进程，网关转发、定时签到、余额查询仍在后台继续。ZCode 模型请求免验证时不受影响；上游要求人机验证时，需要重新打开界面，在账号的「套餐明细」中主动完成验证。此开关只在「关闭窗口时最小化到托盘」开启时有意义。'),
   networkAccess: t('默认仅本机可访问（127.0.0.1）。开启后监听所有 IPv4 网卡（0.0.0.0），访问范围由网络与防火墙决定，不限于局域网，也不会自动开放到公网。开启前必须注册面板管理员；管理接口需要管理员会话或网关 Key，API 调用需要启用的网关 Key，没有时会自动创建一把「默认」Key。「同时开放网页管理面板」默认关闭，开启后可从其他设备的浏览器登录管理；关闭它不影响 API 转发和本机桌面管理。修改任一开关都需要重启应用。'),
-  units: t('控制报表与请求日志里 Token 读数的写法：开启后按中文量级显示（1.2亿 / 8400万），关闭则用 k / M / B 缩写（与上游文档、接口字段的写法一致）。这只影响显示口径，不改变任何统计与存储的数值。'),
+  units: t('控制 Token 读数与费用展示的全局口径：Token 单位开启后按中文量级显示（1.2亿 / 8400万），关闭则用 k / M / B 缩写；计价货币可切换为美元 ($) 或人民币 (¥)，在模型管理、统计报表与请求日志中统一生效，均只影响显示口径。'),
   queue: t('只对「排队制」的上游生效：模型繁忙时上游不报错，只回一句「建议 N 秒后再来」，网关按建议时长等一会儿再发同一请求，等满次数仍排不上才把「排队中」作为错误返回（HTTP 503，文案会说明这不是登录态或额度问题）。等待发生在首个字节之前，吃的是「等待响应超时」那份预算 —— 两项设置一起决定一次请求最多卡多久；排队不会标记账号限额、也不会换账号（换谁都一样在排队）。保存后对下一个请求立即生效，不用重启。'),
   captchaPool: t('模型请求是否需要验证码由 ZCode 上游配置决定，领取验证与模型请求免验证分别处理。后台只检查配置和库存，不自动运行验证码或弹出拼图；需要验证时，在账号的「套餐明细」中点击「开始验证」。验证令牌一次性使用，短时间内过期，失败或取消后不会自动重试。'),
   captchaSides: t('两组设置分别用于桌面端托管的网页管理面板与网页端（Docker / 服务端）的浏览器面板。是否可被其他设备访问取决于网络访问与防火墙设置，不限于局域网。两端默认都开启人机验证，建议保持开启。'),
@@ -913,7 +927,7 @@ export const NOTES = {
   captcha: t('开启后，登录页在浏览器后台自动完成验证（对真人无感），而脚本每次尝试都要先算一道题 —— 暴力破解与抢注的成本显著上升。仅影响面板的登录 / 注册，与 API 客户端的 API Key 无关。桌面端与网页端各自独立：桌面端主要服务本机与局域网，网页端（Docker / 服务端）直接暴露在网络上的登录页风险更高，建议保持开启。'),
   panelLogin: t('当前浏览器以管理员身份登录着本面板。「退出登录」会撤销这台设备的登录会话（30 天内的自动续期一并失效），需要重新输入账号密码；其他已登录的设备不受影响。'),
   exportDanger: t('导出文件内含 accessToken / refreshToken / apiKey 等凭证与自定义提供商定义，可直接用于登录。请妥善保管，不要外传或上传到公共位置。'),
-  backupDanger: t('备份包含账号凭证、网关 Key、GitHub 令牌与云同步凭据的恢复密钥，整个文件受备份密码保护。请分开保管文件与密码；忘记密码无法恢复。'),
+  backupDanger: t('备份包含账号凭证、网关 Key 与云同步凭据的恢复密钥，整个文件受备份密码保护。请分开保管文件与密码；忘记密码无法恢复。'),
 } as const
 
 /** 状态行（`.settings-state`）的派生文案：与旧实现的赋值逐字一致 */
@@ -942,10 +956,11 @@ export const STATES = {
   corsOn: t('正在应答跨源请求：浏览器跨域请求可直连 /v1/*。'),
   corsOff: t('未开启，浏览器跨域无法直连网关。'),
   modelsDevUnavailable: t('未能读取 models.dev 元数据状态，请稍后重试'),
+  modelsDevRefreshing: t('正在从 models.dev 更新…'),
   /** 数据来历：内嵌快照（发版时那份）/ 上次刷新结果 / 刚拉的 */
-  modelsDevSourceBuiltin: t('随包内嵌的快照（发版时的那份）'),
-  modelsDevSourceCache: t('上次成功刷新的结果（存在本机数据库里）'),
-  modelsDevSourceNetwork: t('刚刚从 models.dev 拉到的最新数据'),
+  modelsDevSourceBuiltin: t('内置快照'),
+  modelsDevSourceCache: t('本地缓存'),
+  modelsDevSourceNetwork: t('在线拉取'),
   modelsDevEmpty: t('还没有装载任何数据。'),
   promptUnavailable: t('未能读取系统提示词设置，请稍后重试'),
   degradeUntilFallback: t('次日 00:00'),

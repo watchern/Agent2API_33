@@ -134,7 +134,7 @@ fn preview_json_with_accounts(state: &ServerState, payload: Preview, accounts: &
     });
     let keys = routing::CooldownKeys::new(&payload.model);
     let counts = state.upstream().connections().snapshot().into_iter().collect();
-    let (sunk, resting, open) = state.upstream().route_queue_facts(now);
+    let (sunk, resting, open) = state.upstream().route_queue_facts_for(&candidates, &keys, now);
     let facts = crate::server::core::limiter::sources::facts();
     let counters = crate::server::core::limiter::counter::facts();
     let limiter = candidates.iter().filter(|account| crate::server::core::limiter::evaluate::blocked(account, &keys.for_account(account), &facts, &counters, now))

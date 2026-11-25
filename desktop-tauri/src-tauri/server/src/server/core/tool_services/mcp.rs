@@ -12,7 +12,7 @@
 
 use serde_json::{json, Value};
 
-use super::search::batch_items;
+use super::search::{batch_items, extract_limit};
 use crate::server::logging;
 
 pub const MCP_MODERN_VERSION: &str = "2026-07-28";
@@ -36,6 +36,7 @@ pub struct McpRequestContext {
     pub base_url: String,
     pub store: crate::server::core::account_store::AccountStore,
     pub scope: Option<crate::server::core::key_scope::KeyScope>,
+    pub key_source: Option<std::sync::Arc<crate::server::config::model_key_source::Source>>,
     pub state: crate::server::ServerState,
     pub source: crate::server::request_stats::RequestSource,
     pub owner: String,
@@ -69,6 +70,12 @@ pub fn web_search_spec() -> McpSpec {
                             "items": { "type": "string", "minLength": 1 },
                             "minItems": 1,
                             "maxItems": 10
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "description": "Optional max results per query per provider (1-100); automatically clamped to each provider's supported limit.",
+                            "minimum": 1,
+                            "maximum": 100
                         }
                     },
                     "required": ["queries"],
@@ -193,9 +200,14 @@ async fn call_tool(
             let field = if operation == "search" { "queries" } else { "urls" };
             let items = batch_items(args.get(field), field)
                 .map_err(|error| ToolCallError::InvalidParams(error.message))?;
+            let limit = if operation == "search" {
+                extract_limit(args).map_err(|error| ToolCallError::InvalidParams(error.message))?
+            } else {
+                None
+            };
             let started = logging::now_ms();
             let outcome = if operation == "search" {
-                super::run_search(&ctx.store, ctx.scope.as_ref(), items.clone())
+                super::run_search(&ctx.store, ctx.scope.as_ref(), items.clone(), limit)
                     .await
                     .map(|run| (run.payload, run.successful))
             } else {

@@ -1,15 +1,58 @@
 import { ChildProcess } from "node:child_process"
-import { StringDecoder } from "node:string_decoder"
+import path from "node:path"
 import { scope } from "./fetch.mjs"
 
 const children = new Set()
-const MAX_LINE = 2 * 1024 * 1024
+let nodeSpawnDepth = 0
+
+function normalizePathValue(value) {
+  if (typeof value !== "string" || !value.trim()) return ""
+  const resolved = path.resolve(value.trim())
+  return process.platform === "win32" ? resolved.toLowerCase() : resolved
+}
+
+function readEnvValue(env, envPairs, key) {
+  if (env && typeof env[key] === "string" && env[key].trim()) return env[key]
+  if (Array.isArray(envPairs)) {
+    const prefix = `${key}=`
+    const hit = envPairs.find(entry => typeof entry === "string" && entry.startsWith(prefix))
+    if (hit) return hit.slice(prefix.length)
+  }
+  return ""
+}
+
+function resolveScopeHome(env, envPairs) {
+  const home = readEnvValue(env, envPairs, "HOME")
+    || readEnvValue(env, envPairs, "USERPROFILE")
+    || process.env.HOME
+    || process.env.USERPROFILE
+    || ""
+  const xdg = readEnvValue(env, envPairs, "XDG_CONFIG_HOME")
+  return `${normalizePathValue(home)}|${normalizePathValue(xdg)}`
+}
+
+function commandBaseName(command) {
+  if (typeof command !== "string" || !command.trim()) return ""
+  return path.basename(command.trim()).replace(/\.(?:exe|cmd|bat)$/i, "").toLowerCase()
+}
+
+function isUtilityCommand(command, args) {
+  const base = commandBaseName(command)
+  if (["which", "where", "powershell", "pwsh", "cmd", "taskkill", "kill", "security"].includes(base)) return true
+  if (!Array.isArray(args)) return false
+  return args.some(arg => typeof arg === "string" && /^(?:--version|-v|-V|--help|-h|help|version)$/i.test(arg.trim()))
+}
+
+function sameProxyScope(item, current) {
+  if (item.account && current.account) return item.account === current.account && item.home === current.home
+  return item.home === current.home
+}
 
 export function proxyAddress(proxy) {
   if (!proxy) return ""
   const protocol = proxy.protocol || "http"
   if (!["http", "https", "socks5", "socks5h"].includes(protocol) || !proxy.host || !Number.isInteger(proxy.port)
-    || proxy.port < 1 || proxy.port > 65535) throw new Error("ACP 代理配置无效，请重新选择代理。")
+    || proxy.port < 1 || proxy.port > 65535) throw new Error("本机客户端代理配置无效，请重新选择代理。")
   const host = proxy.host.includes(":") && !proxy.host.startsWith("[") ? `[${proxy.host}]` : proxy.host
   const url = new URL(`${protocol}://${host}:${proxy.port}`)
   if (proxy.username) url.username = proxy.username
@@ -17,103 +60,67 @@ export function proxyAddress(proxy) {
   return url.href.replace(/\/$/, "")
 }
 
-export function checkLocalProxy(provider, context) {
-  const address = proxyAddress(context.proxy)
-  if (provider.localProxy !== undefined && provider.localProxy !== address) {
-    throw new Error("ACP 的本机进程仍使用原来的代理。请先在插件页停用再启用 ACP 插件，再使用新的代理。")
+export function checkLocalProxy(provider, context, options = {}) {
+  const address = proxyAddress(context?.proxy)
+  if (!provider || !options.checkLive || isUtilityCommand(options.command, options.args)) return address
+  const current = {
+    account: typeof context?.account === "string" ? context.account : "",
+    home: resolveScopeHome(options.env, options.envPairs),
   }
-  provider.localProxy = address
+  for (const item of children) {
+    if (item.providerId !== provider.id || item.utility) continue
+    if (!sameProxyScope(item, current)) continue
+    if (item.proxy !== address) {
+      throw new Error("本机客户端进程仍使用原来的代理。请先在插件页停用再启用该插件，再使用新的代理。")
+    }
+  }
+  return address
 }
 
 function environment(env, context) {
   const result = { ...(env || process.env) }
   for (const key of Object.keys(result)) if (/^(?:https?|all|no)_proxy$|^NODE_USE_ENV_PROXY$/i.test(key)) delete result[key]
   const address = proxyAddress(context.proxy)
-  for (const name of ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"]) {
-    result[name] = address
-    if (process.platform !== "win32") result[name.toLowerCase()] = address
+  if (address) {
+    for (const name of ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"]) {
+      result[name] = address
+      if (process.platform !== "win32") result[name.toLowerCase()] = address
+    }
+    result.NODE_USE_ENV_PROXY = "1"
   }
   result.NO_PROXY = "localhost,127.0.0.1,::1"
   if (process.platform !== "win32") result.no_proxy = result.NO_PROXY
-  if (address) result.NODE_USE_ENV_PROXY = "1"
   return result
 }
 
 function stop(child) {
   if (child.exitCode !== null && child.exitCode !== undefined) return
-  try { child.stdin?.end() } catch {}
+  try { child.stdin?.end?.() } catch {}
   try { child.kill() } catch {}
   const timer = setTimeout(() => { try { child.kill("SIGKILL") } catch {} }, 1500)
-  timer.unref()
-  child.once("close", () => clearTimeout(timer))
+  timer.unref?.()
+  if (typeof child.once === "function") child.once("close", () => clearTimeout(timer))
+  else child.exited?.finally?.(() => clearTimeout(timer))
 }
 
-function observe(child, provider) {
-  const output = child.stdout
-  if (!output) return
-  let remainder = ""
-  const decoder = new StringDecoder("utf8")
-  let discarded = false
-  let images = false
-  let observing = true
-  const available = []
-  const collect = (values, depth = 0) => {
-    if (!Array.isArray(values) || depth > 6) return
-    for (const value of values) {
-      if (typeof value?.value === "string") available.push({ value: value.value })
-      if (Array.isArray(value?.options)) collect(value.options, depth + 1)
-    }
+function attachChildLifecycle(item, stopChild, attachClose) {
+  const { child, context } = item
+  children.add(item)
+  const abort = () => stopChild(child)
+  if (context.action !== "conversation") context.signal.addEventListener("abort", abort, { once: true })
+  context.lifetime?.addEventListener("abort", abort, { once: true })
+  if (context.action === "login.start") {
+    context.localCleanups ??= new Set()
+    context.localCleanups.add(abort)
   }
-  const emit = output.emit
-  const inspect = line => {
-    let value
-    try { value = JSON.parse(line) } catch { return }
-    if (value?.result?.protocolVersion === 1) images = value.result.agentCapabilities?.promptCapabilities?.image === true
-    const result = value?.result
-    if (typeof result?.sessionId !== "string" || !result.sessionId) return
-    const models = result.models?.availableModels
-    const options = result.configOptions
-    if (!Array.isArray(models) && !Array.isArray(options)) return
-    available.length = 0
-    for (const option of Array.isArray(options) ? options : []) {
-      if (option?.id === "model" || option?.category === "model") collect(option.options)
-    }
-    provider.localCatalog = { at: Date.now(), images,
-      models: (Array.isArray(models) ? models : []).filter(model => typeof model?.modelId === "string").map(model => ({ modelId: model.modelId })),
-      configOptions: [{ id: "model", options: [...available] }] }
-    observing = false
+  const complete = () => {
+    children.delete(item)
+    context.signal.removeEventListener("abort", abort)
+    context.lifetime?.removeEventListener("abort", abort)
+    context.localCleanups?.delete(abort)
   }
-  // 只旁观插件已经读取的目录应答，不接管管道、不保存消息或 Google 凭证。
-  output.emit = function (event, ...args) {
-    if (event === "data" && observing) {
-      const text = Buffer.isBuffer(args[0]) ? decoder.write(args[0]) : String(args[0])
-      const lines = text.split("\n")
-      for (let index = 0; index < lines.length; index++) {
-        const line = lines[index]
-        if (!discarded && remainder.length + line.length <= MAX_LINE) remainder += line
-        else { remainder = ""; discarded = true }
-        if (index < lines.length - 1) {
-          if (!discarded) inspect(remainder)
-          remainder = ""
-          discarded = false
-        }
-      }
-    }
-    return emit.call(this, event, ...args)
-  }
-}
-
-export async function waitLocalProcesses(context) {
-  const pending = [...children].filter(item => item.context === context && item.context.action !== "conversation")
-  if (!pending.length) return
-  await Promise.race([
-    Promise.all(pending.map(item => item.done)),
-    new Promise(resolve => { const timer = setTimeout(resolve, 500); timer.unref() }),
-  ])
-}
-
-export function hasLocalProcesses(context) {
-  return [...children].some(item => item.context === context)
+  attachClose(child, complete)
+  if (context.signal.aborted || context.lifetime?.aborted) abort()
 }
 
 export function installLocalProcesses() {
@@ -122,28 +129,36 @@ export function installLocalProcesses() {
     const context = scope.getStore()
     if (!context?.localProvider) return spawn.call(this, options)
     context.signal.throwIfAborted()
-    checkLocalProxy(context.localProvider, context)
-    const result = spawn.call(this, options)
-    const child = this
-    let finish
-    const done = new Promise(resolve => { finish = resolve })
-    const item = { child, context, done }
-    children.add(item)
-    const abort = () => stop(child)
-    if (context.action !== "conversation") context.signal.addEventListener("abort", abort, { once: true })
-    if (context.action === "login.start") {
-      context.localCleanups ??= new Set()
-      context.localCleanups.add(abort)
+    context.lifetime?.throwIfAborted()
+    const command = options?.file || (Array.isArray(options?.args) ? options.args[0] : "")
+    const args = Array.isArray(options?.args) ? options.args.slice(1) : []
+    const address = checkLocalProxy(context.localProvider, context, {
+      env: options?.env,
+      envPairs: options?.envPairs,
+      command,
+      args,
+      checkLive: true,
+    })
+    nodeSpawnDepth += 1
+    let result
+    try {
+      result = spawn.call(this, options)
+    } finally {
+      nodeSpawnDepth -= 1
     }
-    const complete = () => {
-      children.delete(item)
-      context.signal.removeEventListener("abort", abort)
-      context.localCleanups?.delete(abort)
-      finish()
+    const item = {
+      child: this,
+      context,
+      providerId: context.localProvider.id,
+      account: typeof context.account === "string" ? context.account : "",
+      home: resolveScopeHome(options?.env, options?.envPairs),
+      proxy: address,
+      utility: isUtilityCommand(command, args),
     }
-    child.once("close", complete)
-    child.once("error", complete)
-    if (context.action === "models.refresh" || context.action === "conversation") observe(child, context.localProvider)
+    attachChildLifecycle(item, stop, (child, complete) => {
+      child.once("close", complete)
+      child.once("error", complete)
+    })
     return result
   }
   // 子进程与插件请求使用同一出口，stdout 保留给宿主通信。
@@ -152,9 +167,20 @@ export function installLocalProcesses() {
     Bun[name] = function (input, options) {
       const context = scope.getStore()
       if (!context) return run.call(this, input, options)
-      if (context.localProvider) checkLocalProxy(context.localProvider, context)
       const next = { ...(Array.isArray(input) ? options : input) }
+      const rawCmd = Array.isArray(input) ? input : next.cmd
+      const command = Array.isArray(rawCmd) ? rawCmd[0] : rawCmd
+      const args = Array.isArray(rawCmd) ? rawCmd.slice(1) : []
       next.env = environment(next.env, context)
+      let address = ""
+      if (context.localProvider) {
+        address = checkLocalProxy(context.localProvider, context, {
+          env: next.env,
+          command,
+          args,
+          checkLive: name === "spawn",
+        })
+      }
       if (Array.isArray(next.stdio)) {
         next.stdio = [...next.stdio]
         if (next.stdio[0] === "inherit" || next.stdio[0] === 0) next.stdio[0] = "ignore"
@@ -162,7 +188,24 @@ export function installLocalProcesses() {
       }
       if (next.stdin === "inherit" || next.stdin === 0) next.stdin = "ignore"
       if (next.stdout === "inherit" || next.stdout === 1) next.stdout = 2
-      return Array.isArray(input) ? run.call(this, input, next) : run.call(this, next)
+      const spawned = Array.isArray(input) ? run.call(this, input, next) : run.call(this, next)
+      if (name === "spawn" && context.localProvider && nodeSpawnDepth === 0 && spawned && typeof spawned.kill === "function") {
+        if (!isUtilityCommand(command, args)) {
+          const item = {
+            child: spawned,
+            context,
+            providerId: context.localProvider.id,
+            account: typeof context.account === "string" ? context.account : "",
+            home: resolveScopeHome(next.env, null),
+            proxy: address,
+            utility: false,
+          }
+          attachChildLifecycle(item, stop, (child, complete) => {
+            child.exited?.finally?.(complete)
+          })
+        }
+      }
+      return spawned
     }
   }
 }

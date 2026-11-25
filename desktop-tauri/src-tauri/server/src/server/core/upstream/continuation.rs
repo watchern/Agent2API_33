@@ -756,7 +756,9 @@ impl Continuation {
             {
                 cache_creation = Some(cache_creation.unwrap_or(0).saturating_add(count));
             }
-            if repeat || !looks_truncated(&verdict) || rounds >= self.max_rounds || self.telemetry.is_cancelled() {
+            if repeat || !looks_truncated(&verdict) || rounds >= self.max_rounds || self.telemetry.is_cancelled()
+                || self.telemetry.replay_guard().blocked()
+            {
                 break;
             }
             // 没有 messages 数组就改不动（入口校验过，走到这里按不续处理）
@@ -912,6 +914,7 @@ impl Continuation {
                     && !repeat
                     && looks_truncated(&verdict)
                     && !telemetry.is_cancelled()
+                    && !telemetry.replay_guard().blocked()
                     // 客户端在这一轮 EOF 到「决定续写」之间断开了。上面那处
                     // `sender.send` 失败是唯一**已经发生**的探测点，而这个窗口里
                     // 原本没有任何探测 —— 断线之后照样会白打一轮上游（带全量历史，
@@ -1013,6 +1016,7 @@ async fn forward_round_with(
     allowed_providers: Option<KeyScope>,
     mut body: Value,
 ) -> Result<ForwardOutcome, crate::server::errors::GatewayError> {
+    if telemetry.replay_guard().blocked() { return Err(super::replay_guard::blocked_error()); }
     if telemetry.vision_continuation().is_none() && body.get("_wb_route_group_id").and_then(Value::as_str).is_some() {
         let snapshot = telemetry.snapshot();
         let candidate = snapshot.route.as_ref().and_then(|route| route.get("pickedCandidate")).and_then(Value::as_str).unwrap_or("");
@@ -1351,8 +1355,8 @@ mod truncation_criteria {
         assert_eq!(9, round.completion, "同一轮里后到的 usage 是最终值");
 
         let rounds = [
-            usage::UsageTokens { prompt: 10, completion: 9, total: 19, cache_read: 4, credit: Some(0.25) },
-            usage::UsageTokens { prompt: 20, completion: 5, total: 25, cache_read: 0, credit: Some(0.5) },
+            usage::UsageTokens { prompt: 10, completion: 9, total: 19, cache_read: 4, cache_creation: 0, cache_creation_1h: 0, credit: Some(0.25) },
+            usage::UsageTokens { prompt: 20, completion: 5, total: 25, cache_read: 0, cache_creation: 0, cache_creation_1h: 0, credit: Some(0.5) },
         ];
         let merged = sum_tokens(&rounds);
         assert_eq!(30, merged.prompt, "每轮的 prompt 都含全部历史，真实成本按轮求和");
