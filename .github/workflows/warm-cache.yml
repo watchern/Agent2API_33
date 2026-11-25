@@ -103,24 +103,9 @@ jobs:
         with:
           workspaces: desktop-tauri/src-tauri -> ../../target
 
-      # 临时诊断：把编译错误写进 STEP_SUMMARY，便于从 check-run API 匿名读取。
-      # 拿到错误后还原这段。
       - name: 预热 Rust 编译
-        shell: bash
+        run: cargo build --release
         working-directory: desktop-tauri/src-tauri
-        run: |
-          set -o pipefail
-          cargo build --release 2>&1 | tee build-diag.log
-          status=${PIPESTATUS[0]}
-          if [ "$status" -ne 0 ]; then
-            {
-              echo "### cargo build --release 失败（exit $status）"
-              echo '```'
-              grep -E '^(error|warning:)|^  -->|^   -->|could not compile' build-diag.log | head -80
-              echo '```'
-            } >> "$GITHUB_STEP_SUMMARY"
-          fi
-          exit "$status"
 
   # ── Docker 镜像缓存预热 ─────────────────────────────────────
   # BuildKit 的 gha 缓存 key 不含 job 名，这个 job 名不影响命中。

@@ -257,7 +257,9 @@ async fn open_inner(params: &Value, body: Option<RequestBody>, pinned: Option<re
         if capture.is_some() {
             sent_body = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
         }
-        body_bytes = Some(bytes);
+        // base64 解码得到 Vec<u8>，而 body_bytes 统一存 bytes::Bytes（可廉价 clone
+        // 供多候选地址重试复用）——显式转换，避免合并遗留的类型不匹配。
+        body_bytes = Some(bytes::Bytes::from(bytes));
     }
     deadline.check()?;
     let handle = lifecycle::register(params, deadline, capture.clone(), sensitive, system_proxy_when_unset)?;
