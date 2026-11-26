@@ -211,6 +211,10 @@ pub const RESERVED_KV_KEYS: &[&str] = &[
     // 上游客户端版本号的持久化缓存、同步排期与手动冷却（core::upstream_versions）。
     // 属于本机同步状态而非配置项；不进云同步，也不能在修改普通配置时被误删。
     "upstreamVersionCache",
+    // 脚本插件包与提供商标识的跨机映射（core::plugin_host::script::identities），随云同步迁移。
+    "scriptPluginIdentities",
+    // 本机直连 Agent 采集配置与目录列表（core::local_direct），属于本机配置，不随网关配置保存被清空。
+    "localDirectAgents",
 ];
 
 /// 这个键是否属于「其它零散状态」（即不归网关配置管）。
@@ -360,26 +364,27 @@ pub fn is_reserved(key: &str) -> bool {
 /// `NULL` = 这一家没上报（旧行 / 不提供该读数），0 = 确实零消耗；用 0 兜底会
 /// 把「没读到」画成「花了 0 积分」，比缺一列更难排查。
 ///
-/// ── 版本 33：logs 补 (level, id DESC) 索引（[`schema_logs_level`]）────
+/// ── 版本 33-35：上游 3.6.0 新特性 ────────────────────────────
+/// v33 = `schema_task_plugins.sql`（定时任务插件体系）、
+/// v34 = `schema_privacy_redaction.sql`（隐私脱敏）、
+/// v35 = `schema_local_direct.sql`（本机直连采集）。这三条来自上游 beta 线。
+///
+/// ── 版本 36：logs 补 (level, id DESC) 索引（[`schema_logs_level`]）────
 /// 未读失败角标的水位查询（WHERE level='error' ORDER BY id DESC LIMIT 1，
 /// 管理面板 20 秒一轮）在百万行日志表上无索引即全表扫（实测 ~5 秒），且
 /// 扫描期间单连接互斥把余额查询/账号列表全部排到 6-10 秒后——账号页余额
 /// 查询因此批量超时。见 schema_logs_level.sql 的头部说明。
 ///
-/// **编号为什么是 33 而不是 30**：这条迁移原本占 v30，而合入上游 3.5.1
-/// 后上游的 v30/v31/v32 已被 `schema_usage_diagnostics` /
-/// `schema_checkin_records_index` / `schema_model_pricing` 占用。
-/// 迁移按 `PRAGMA user_version` 逐版本执行、每个版本只跑一次，所以把这条
-/// 挪到 33：
-///   · 已经升到 30 的库（索引已建）→ 升 31/32/33 时再跑一次同一条 SQL，
-///     脚本是 `CREATE INDEX IF NOT EXISTS`，幂等，不会报错；
-///   · 停在 29 或更早的库 → 依次跑完 30/31/32/33，四条迁移一次到位。
-///   · 上游谱系的库（30/31/32 各有各的含义）→ v33 让它们也补上这条索引。
+/// **编号为什么往后挪**：这条迁移原本占 v30，合入上游 3.5.1 时挪到 v33，
+/// 如今合入上游 3.6.0 时 v33-v35 又被上游新特性占用，于是再顺延到 36。
+/// 迁移按 `PRAGMA user_version` 逐版本执行、每个版本只跑一次，`CREATE INDEX
+/// IF NOT EXISTS` 幂等，已经建过索引的库重跑无害；停在更早版本的库会依次
+/// 跑完全部版本。
 ///
 /// 但**同号不同义**的代价不止索引这一条：上游 v30 的「加 diagnostics 列」
-/// 对停在 30 的本 fork 旧版库是**整段没跑过**的。那一条由 v34 兜底
-/// （见下面的 v34 段）。
-/// ── 版本 34：补齐 v30 撞号漏掉的 `account_usage_records.diagnostics` 列 ──
+/// 对停在 30 的本 fork 旧版库是**整段没跑过**的。那一条由 v37 兜底
+/// （见下面的 v37 段）。
+/// ── 版本 37：补齐 v30 撞号漏掉的 `account_usage_records.diagnostics` 列 ──
 /// 上游 v30 是 `ALTER TABLE account_usage_records ADD COLUMN diagnostics TEXT`，
 /// 而本 fork 的 v30 曾是「logs 补 (level, id DESC) 索引」——**同一个版本号在
 /// 两条谱系里含义不同**。迁移按 `PRAGMA user_version` 逐版本推进、每个版本只跑
@@ -389,13 +394,13 @@ pub fn is_reserved(key: &str) -> bool {
 ///     `core::usage_records` 的 `RECORD_COLUMNS` 已经带上了这一列（上游
 ///     v3.5.1 的用量诊断读数就存在它里面），于是每一次余额查询都报
 ///     「no such column: diagnostics」—— 整条账号页余额链路瘫掉。
-///   · 从**上游 3.5.1** 升上来 → v30 已经是「加 diagnostics 列」，不缺。
+///   · 从**上游 3.5.1 / 3.6.0** 升上来 → v30 已经是「加 diagnostics 列」，不缺。
 ///
 /// 所以这一版做的是**幂等补列**：先查 `PRAGMA table_info` 看列在不在，
 /// 不在才 ALTER。已在的库（上游谱系 / 全新库）跑它等于空操作。
 ///
-/// 为什么不用「把上游 v30 挪到 34、本 fork 的索引挪回 30」：上游 3.5.1 的
-/// user_version 已经推进到 32，它的 v30/v31/v32 语义对**已经在 32 的库**是
+/// 为什么不用「把上游 v30 挪到 37、本 fork 的索引挪回 30」：上游的
+/// user_version 已经推进到 35，它的 v30-v35 语义对**已经在 35 的库**是
 /// 既成事实；改编号会让那些库跳过本该跑的迁移。只能往后加补偿版本。
 ///
 /// 为什么不用 `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`：SQLite 不支持这个
@@ -405,7 +410,7 @@ pub fn is_reserved(key: &str) -> bool {
 /// 顺带把上游 v32 的 `cost_usd` / `cache_creation_tokens` / `unpriced_requests`
 /// 一并按同样的方式兜住：那几条也是 `ALTER TABLE ADD COLUMN`（非幂等），
 /// 撞号同样可能让它们对某些库整段没跑过。
-pub const SCHEMA_VERSION: i64 = 34;
+pub const SCHEMA_VERSION: i64 = 37;
 
 /// 版本 1 的全部表与索引：改造前所有 JSON / JSONL 文件的对应形态。
 ///
@@ -1148,15 +1153,19 @@ fn apply_version(
         30 => conn.execute_batch(include_str!("schema_usage_diagnostics.sql")),
         31 => conn.execute_batch(include_str!("schema_checkin_records_index.sql")),
         32 => conn.execute_batch(include_str!("schema_model_pricing.sql")),
-        // v33：logs 补 (level, id DESC) 索引（未读失败角标水位查询的根治，
-        // 见 schema_logs_level.sql 头部说明）。原为 v30，与上游的三条迁移
-        // 撞号后顺延到 33；脚本幂等，重跑无害。
-        33 => conn.execute_batch(include_str!("schema_logs_level.sql")),
-        // v34：补齐 v30 撞号可能漏跑的那些 `ALTER TABLE ADD COLUMN`（见
-        // SCHEMA_VERSION 的 v34 段）。逐列查 `PRAGMA table_info`，缺了才加
+        // v33-v35：上游 3.6.0 新特性（任务插件 / 隐私脱敏 / 本机直连采集）。
+        33 => conn.execute_batch(include_str!("schema_task_plugins.sql")),
+        34 => conn.execute_batch(include_str!("schema_privacy_redaction.sql")),
+        35 => conn.execute_batch(include_str!("schema_local_direct.sql")),
+        // v36：logs 补 (level, id DESC) 索引（未读失败角标水位查询的根治，
+        // 见 schema_logs_level.sql 头部说明）。原为 v30，两轮合入上游后
+        // 依次顺延到 33、36；脚本幂等，重跑无害。
+        36 => conn.execute_batch(include_str!("schema_logs_level.sql")),
+        // v37：补齐 v30 撞号可能漏跑的那些 `ALTER TABLE ADD COLUMN`（见
+        // SCHEMA_VERSION 的 v37 段）。逐列查 `PRAGMA table_info`，缺了才加
         // —— 上游谱系 / 全新库跑它等于空操作，从本 fork 旧版升上来的库
         // 才会真正补上那一列。
-        34 => ensure_columns_34(conn),
+        37 => ensure_columns_34(conn),
         _ => Ok(()),
     }
 }

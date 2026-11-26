@@ -109,7 +109,7 @@ fn preview_json_with_accounts(state: &ServerState, payload: Preview, accounts: &
         let profile = if let Some(mut profile) = global_draft {
             let sorting = crate::server::core::account_order::sorting(accounts, crate::server::logging::now_ms());
             for (provider, rules) in &sorting.rules {
-                let automatic = rules.iter().any(|rule| crate::server::core::account_order::rule_enabled(provider, rule));
+                let automatic = rules.iter().any(|rule| sorting.rule_enabled(provider, rule));
                 if automatic { profile.account_order.remove(provider); }
             }
             profile

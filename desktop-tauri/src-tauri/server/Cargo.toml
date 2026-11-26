@@ -1,6 +1,6 @@
 [package]
 name = "agent2api-server"
-version = "3.5.2-beta-0"
+version = "3.6.1-beta-0"
 description = "Agent2API 网关本体 — AI 路由网关与 Agent 客户端接管（桌面端与 headless 服务器共用）"
 authors = ["Agent2API"]
 edition = "2021"
@@ -115,6 +115,10 @@ jsonc-parser = { version = "=0.33.1", features = ["cst", "serde_json"] }
 # ALTCHA 机器人校验的 challenge 签名（HMAC-SHA256，见 server/altcha.rs）
 hmac = "0.12"
 chrono = "0.4"
+chrono-tz = "0.10"
+croner = "5.0"
+rquickjs = { version = "0.14", features = ["futures"] }
+qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 futures = "0.3"
 tokio-stream = "0.1"
 tokio-util = { version = "0.7", features = ["io"] }

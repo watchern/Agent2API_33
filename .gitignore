@@ -15,6 +15,7 @@ desktop-tauri/target/
 .verify/
 _verify*/
 prototype/
+prototypes/
 .codeartsdoer/
 # 排查模型目录时导出的临时快照
 .tmp_catalog.json

@@ -34,7 +34,7 @@ fn has_column(conn: &Connection, table: &str, column: &str) -> bool {
 ///
 /// 这条用例是 v30 撞号的直接回归测试：v30 在两条谱系里含义不同，而迁移按
 /// `user_version` 逐版本推进、每个版本只跑一次 ⇒ 停在 30 的库永远不会执行
-/// 上游 v30 的那条 `ALTER TABLE`。v34 的幂等补列是唯一的补救路径。
+/// 上游 v30 的那条 `ALTER TABLE`。v37 的幂等补列是唯一的补救路径。
 #[test]
 fn fork_v30_database_gains_the_upstream_diagnostics_column() {
     let conn = Connection::open_in_memory().unwrap();
@@ -61,7 +61,7 @@ fn fork_v30_database_gains_the_upstream_diagnostics_column() {
     );
 }
 
-/// v34 的补列对**已经有这些列**的库是空操作（上游谱系 / 全新库都走这条路）。
+/// v37 的补列对**已经有这些列**的库是空操作（上游谱系 / 全新库都走这条路）。
 #[test]
 fn column_backfill_is_idempotent_for_databases_that_already_have_the_columns() {
     let conn = Connection::open_in_memory().unwrap();

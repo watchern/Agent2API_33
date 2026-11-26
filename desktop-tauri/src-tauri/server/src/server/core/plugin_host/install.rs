@@ -394,6 +394,7 @@ impl PackRegistry {
         let tmp = path.with_extension("json.tmp");
         std::fs::write(&tmp, text).map_err(|e| format!("写临时文件失败: {e}"))?;
         std::fs::rename(&tmp, &path).map_err(|e| format!("替换注册表失败: {e}"))?;
+        super::pack_view::clear_cache();
         super::startup::configure_packs(self);
         // 装卸 / 启停包会改「哪些家有展示名」，清掉 provider_label 缓存。
         super::invalidate_provider_labels();
