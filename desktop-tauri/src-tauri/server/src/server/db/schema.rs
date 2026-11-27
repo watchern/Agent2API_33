@@ -410,7 +410,24 @@ pub fn is_reserved(key: &str) -> bool {
 /// 顺带把上游 v32 的 `cost_usd` / `cache_creation_tokens` / `unpriced_requests`
 /// 一并按同样的方式兜住：那几条也是 `ALTER TABLE ADD COLUMN`（非幂等），
 /// 撞号同样可能让它们对某些库整段没跑过。
-pub const SCHEMA_VERSION: i64 = 37;
+///
+/// ── 版本 38：补齐 v33/v34 撞号漏掉的任务插件表与隐私脱敏列 ──
+/// 合入上游 3.6.0 时 v33-v35 被上游新特性占用（任务插件 / 隐私脱敏 /
+/// 本机直连），fork 自己的 logs 索引与补列迁移顺延到 36、37。但**本 fork
+/// 旧版**的 v33/v34 曾是「logs 索引」和「补列」——从那条谱系升上来的库
+/// user_version 已经到 34，于是：
+///   · v33（`schema_task_plugins.sql`：task_plugins / task_jobs /
+///     task_job_runs 三表 + 索引）永不执行 ⇒ 定时任务插件每 5 秒报
+///     `no such table: task_jobs`，功能整块失效；
+///   · v34（`schema_privacy_redaction.sql`：requests.privacy_hits 列）
+///     永不执行 ⇒ 请求统计查询报 `no such column: privacy_hits`；
+///   · v35 的本机直连表反而跑到了（它的号在本 fork 旧谱系里没占过）。
+///
+/// 这一版与 v37 同一套手法：CREATE 语句用 `IF NOT EXISTS` 整段重放（幂等），
+/// 两条裸 ALTER（`privacy_hits` / `origin`）用 [`table_has_column`] 逐列守门
+/// 后再补。上游谱系 / 全新库跑它等于空操作。建表脚本见
+/// `schema_upstream_v33_v35_backfill.sql`。
+pub const SCHEMA_VERSION: i64 = 38;
 
 /// 版本 1 的全部表与索引：改造前所有 JSON / JSONL 文件的对应形态。
 ///
@@ -1166,6 +1183,8 @@ fn apply_version(
         // —— 上游谱系 / 全新库跑它等于空操作，从本 fork 旧版升上来的库
         // 才会真正补上那一列。
         37 => ensure_columns_34(conn),
+        // v38：补齐 v33/v34 撞号漏掉的任务插件表与 privacy_hits 列。
+        38 => ensure_upstream_v33_v35(conn),
         _ => Ok(()),
     }
 }
@@ -1232,6 +1251,44 @@ fn table_has_column(
         }
     }
     Ok(if found_table { Some(false) } else { None })
+}
+
+/// 补齐上游 v33/v34/v35 被撞号跳过的对象（v38 幂等补偿迁移）。
+///
+/// 背景：本 fork 旧版的 v33/v34 曾是「logs 索引」和「补列」，上游 3.6.0
+/// 把 v33-v35 重新定义为任务插件 / 隐私脱敏 / 本机直连。从 fork 旧谱系
+/// （user_version=34）升上来的库跳过 v33/v34，于是任务插件三张表与
+/// `requests.privacy_hits` 列永远不在 —— 日志里每 5 秒刷一次
+/// `no such table: task_jobs`，请求统计查询报 `no such column: privacy_hits`。
+///
+/// 手法与 [`ensure_columns_34`] 一致：
+///   · 建表 / 建索引整段来自 `schema_upstream_v33_v35_backfill.sql`，全是
+///     `CREATE ... IF NOT EXISTS`，重复执行是空操作；
+///   · 两条裸 ALTER 用 [`table_has_column`] 逐列守门，缺了才加。列定义与
+///     上游 `schema_privacy_redaction.sql` / `schema_local_direct.sql`
+///     **逐字一致**（NOT NULL 必须带 DEFAULT，否则旧行插不进去）。
+///
+/// 表本身不在时跳过 ALTER 而不是硬加：全新库 / 上游谱系的库该有的都有，
+/// 这里纯属空跑；只有撞号受损的库才真正补东西。
+fn ensure_upstream_v33_v35(conn: &Connection) -> rusqlite::Result<()> {
+    // 三张任务表 + 本机直连两张表及其索引，全是 IF NOT EXISTS，整段重放安全。
+    conn.execute_batch(include_str!("schema_upstream_v33_v35_backfill.sql"))?;
+
+    // 两条裸 ALTER 非幂等，逐列守门。
+    const COLUMNS: &[(&str, &str, &str)] = &[
+        ("requests", "privacy_hits", "TEXT NOT NULL DEFAULT '[]'"),
+        ("requests", "origin", "TEXT NOT NULL DEFAULT 'gateway'"),
+    ];
+    for &(table, column, definition) in COLUMNS {
+        match table_has_column(conn, table, column)? {
+            Some(true) | None => continue, // 列已在 / 表不在（不该发生）—— 都不 ALTER
+            Some(false) => {}
+        }
+        conn.execute_batch(&format!(
+            "ALTER TABLE {table} ADD COLUMN {column} {definition};"
+        ))?;
+    }
+    Ok(())
 }
 
 /// 版本 22：把「模型目录刷新」那条任务的**失败冷却**清掉（数据修复，无 DDL）。
