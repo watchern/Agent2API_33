@@ -14,6 +14,7 @@ desktop-tauri/target/
 .zcode/
 .verify/
 _verify*/
+.antigravitycli
 prototype/
 prototypes/
 .codeartsdoer/

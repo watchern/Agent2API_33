@@ -1870,8 +1870,11 @@ export async function refreshPrivacy(): Promise<void> {
   toast(t('隐私脱敏设置已刷新'))
 }
 
-export async function savePrivacyConfig(patch: PrivacyPatch, message?: string): Promise<boolean> {
-  if (busyScope) { repaint(); return false }
+export async function savePrivacyConfig(
+  patch: PrivacyPatch,
+  message?: string,
+): Promise<{ ok: boolean; error?: string }> {
+  if (busyScope) { repaint(); return { ok: false } }
   beginBusy('privacy')
   try {
     const api = shared().workbuddyDesktop
@@ -1886,10 +1889,11 @@ export async function savePrivacyConfig(patch: PrivacyPatch, message?: string): 
         : t('隐私脱敏设置仅本次运行生效，写入数据库失败，请检查配置目录'),
       state.saved ? 'ok' : 'err',
     )
-    return true
+    return { ok: true }
   } catch (error) {
-    toast(t('保存失败：{message}', { message: errorMessage(error) }), 'err')
-    return false
+    const detail = errorMessage(error)
+    toast(t('保存失败：{message}', { message: detail }), 'err')
+    return { ok: false, error: detail }
   } finally {
     endBusy()
   }
@@ -2211,6 +2215,7 @@ export async function refreshModelsDev(): Promise<void> {
     const status = String(result?.status || '')
     if (status === 'refreshed') {
       toast(t('models.dev 元数据已更新（{count} 条）', { count: Number(result?.count) || 0 }))
+      void (window as unknown as { wbProviders?: { refreshCustom?: () => Promise<unknown> } }).wbProviders?.refreshCustom?.()
     } else if (status === 'failed') {
       toast(t('刷新失败：{message}', { message: String(result?.message || '') }), 'err')
     } else {

@@ -3,7 +3,6 @@ import { Alert, Button, Empty, EmptyDescription, EmptyTitle, StatusDot, cn } fro
 import { t } from '../i18n'
 import { confirm, errorMessage, getAgentStore, loadPanel, removeConfiguration, subscribeAgentStore, toast } from './agent-state'
 import { kindLabel, protocolLabel } from './agent-model'
-import { quickBlockReason } from './agent-quick-model'
 import { ProfileDialog } from './agent-profile-dialog'
 import { ApplyDialog } from './agent-preview'
 import { AgentActions, AgentIcon } from './agent-actions'
@@ -12,12 +11,10 @@ import type { AgentClient, AgentOperation, AgentProfile } from './agent-types'
 export function ProfileEditor({
   client,
   onAdd,
-  onQuickConnect,
   onOpenPath,
 }: {
   client: AgentClient
   onAdd: () => void
-  onQuickConnect: () => void
   onOpenPath: () => void
 }) {
   const store = React.useSyncExternalStore(subscribeAgentStore, getAgentStore, getAgentStore)
@@ -26,7 +23,6 @@ export function ProfileEditor({
   const busy = Boolean(store.busy)
   const disabled = busy || Boolean(client.storeError)
   const profiles = client.configurations
-  const canQuickConnect = client.writable && !quickBlockReason(client)
   const remove = async (profile: AgentProfile) => {
     if (profile.liveId) { setApplying({ profile, operation: 'config-delete' }); return }
     if (!await confirm(t('删除配置？'), t('此配置未在客户端中使用，删除不会改变当前使用的配置。'), t('删除'))) return
@@ -50,17 +46,12 @@ export function ProfileEditor({
         <EmptyTitle>{t('还没有配置')}</EmptyTitle>
         <EmptyDescription>
           {client.writable
-            ? canQuickConnect
-              ? t('可以直接一键接入本网关，或手动添加其他服务配置')
-              : t('手动新增一套配置后即可应用到客户端')
+            ? t('新增一套配置后即可应用到客户端')
             : t('未读取到可识别的客户端配置')}
         </EmptyDescription>
         {client.writable && <div className='mt-2 flex flex-wrap items-center justify-center gap-2'>
-          {canQuickConnect && <Button size='sm' disabled={disabled} onClick={onQuickConnect}>
-            <AgentIcon name='bolt' />{t('一键接入本网关')}
-          </Button>}
-          <Button variant={canQuickConnect ? 'outline' : 'default'} size='sm' disabled={disabled} onClick={onAdd}>
-            <AgentIcon name='plus' />{t('手动新增配置')}
+          <Button size='sm' disabled={disabled} onClick={onAdd}>
+            <AgentIcon name='plus' />{t('新增配置')}
           </Button>
         </div>}
       </Empty>}
@@ -70,7 +61,24 @@ export function ProfileEditor({
           : profile.status === 'disabled' ? t('已停用') : ''
         const name = profile.name || profile.id
         const duplicateName = profiles.some(other => other !== profile && (other.name || other.id) === name)
-        const models = profile.models.length ? profile.models.map(model => model.id) : profile.model ? [profile.model] : []
+        const claudeTierSummary = client.id === 'claude-code'
+          ? (['opus', 'sonnet', 'haiku', 'subagent'] as const)
+            .map(tier => {
+              const value = profile.claudeModels?.[tier]
+              if (!value) return ''
+              const label = tier === 'subagent' ? t('子 Agent') : tier[0].toUpperCase() + tier.slice(1)
+              return `${label} → ${value}`
+            })
+            .filter(Boolean)
+          : []
+        const uniqueClaudeTargets = new Set(Object.values(profile.claudeModels || {}).filter(Boolean))
+        const models = client.id === 'claude-code' && uniqueClaudeTargets.size > 1
+          ? claudeTierSummary
+          : profile.models.length
+            ? profile.models.map(model => model.id)
+            : profile.model
+              ? [profile.model]
+              : claudeTierSummary
         const actionLabel = profile.status === 'disabled' ? t('启用') : client.supportsDefault ? t('使用此配置') : t('添加到客户端')
         return <div key={`${profile.liveId || 'saved'}:${profile.id}`} className={cn('agent-configuration-row', active && 'is-current')}>
           <span className='agent-configuration-mark' aria-hidden='true'>{profile.kind === 'gateway' ? 'A2' : name.slice(0, 2).toUpperCase()}</span>

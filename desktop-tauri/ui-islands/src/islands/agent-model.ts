@@ -1,13 +1,16 @@
 import { t } from '../i18n'
 import { newId } from '../../../ui-shared/ids'
+import { catalogModel, type CatalogModel } from './agent-catalog'
 import type { AgentClient, AgentModel, AgentOperation, AgentProfile } from './agent-types'
 import { modelLevels } from './agent-model-config'
+
+export const AGENT_MODEL_LIMIT = 200
 
 export function protocolLabel(value: string): string {
   return { anthropic: 'Anthropic Messages', responses: 'OpenAI Responses', openai_chat: 'OpenAI Chat Completions', gemini: 'Gemini API', native: t('客户端原生配置') }[value] || value
 }
 export function kindLabel(value: string): string {
-  return { gateway: t('本网关'), official: t('官方直连'), relay: t('第三方中转'), local: t('本机服务') }[value] || value
+  return { gateway: t('本网关'), official: t('自定义服务'), relay: t('自定义服务'), local: t('自定义服务') }[value] || value
 }
 export function detectionLabel(client: AgentClient): string {
   return {
@@ -54,7 +57,21 @@ export function validateDraft(client: AgentClient, profile: AgentProfile): strin
   }
   if (profile.authMode === 'key' && !profile.apiKey && !profile.hasApiKey) return t('请填写 API Key')
   if (profile.authMode === 'env' && !/^[A-Za-z_][A-Za-z0-9_]*$/.test(profile.envKey)) return t('请填写有效的环境变量名')
-  if (client.supportsModels && !(['codex', 'claude-code'].includes(client.id) && inherited && !profile.models.length)) {
+
+  if (client.id === 'claude-code') {
+    const hasTier = Object.values(profile.claudeModels).some(value => value.trim())
+    if (!inherited && !profile.model.trim() && !hasTier) return t('请至少为一个档位选择映射模型或路由组')
+    if (profile.models.length > 200) return t('最多选择 {n} 个模型', { n: 200 })
+    const ids = new Set<string>()
+    for (const model of profile.models) {
+      if (!model.id.trim() || ids.has(model.id.trim())) return t('模型 ID 不能为空或重复')
+      ids.add(model.id.trim())
+      if (model.effort && model.effort !== 'default' && !modelLevels(client, model.reasoningLevels, profile.protocol).includes(model.effort)) return t('模型或客户端不支持所选思考等级')
+    }
+    return ''
+  }
+
+  if (client.supportsModels && !(client.id === 'codex' && inherited && !profile.models.length)) {
     if (!profile.models.length) return t('请至少添加一个模型')
     if (profile.models.length > 200) return t('最多选择 {n} 个模型', { n: 200 })
     const ids = new Set<string>()
@@ -72,3 +89,46 @@ export function validateDraft(client: AgentClient, profile: AgentProfile): strin
 }
 
 export function profileSignature(profile: AgentProfile): string { return JSON.stringify(profile) }
+
+export function selectProfileModels(profile: AgentProfile, models: AgentModel[]): Partial<AgentProfile> {
+  const selected = models.find(model => model.id === profile.model)?.id || models[0]?.id || ''
+  return {
+    models,
+    model: selected,
+    effort: selected === profile.model ? profile.effort : '',
+    ...(Object.values(profile.claudeModels).some(Boolean) ? { claudeModels: syncClaudeTiers(profile.claudeModels, profile.model, selected) } : {}),
+  }
+}
+
+export function fillDefaultProfile(client: AgentClient, profile: AgentProfile, catalog: CatalogModel[], preferred: string): AgentProfile {
+  if (client.supportsModels && profile.models.length) {
+    return {
+      ...profile,
+      models: profile.models.map(model => {
+        const known = catalog.find(item => item.id === model.id)
+        if (!known) return model
+        const inferred = catalogModel(client, known)
+        return {
+          ...model,
+          name: model.name === model.id ? inferred.name : model.name,
+          contextWindow: model.contextWindow ?? inferred.contextWindow,
+          maxOutputTokens: model.maxOutputTokens ?? inferred.maxOutputTokens,
+          supportsTools: model.supportsTools ?? inferred.supportsTools,
+          supportsImages: model.supportsImages ?? inferred.supportsImages,
+          supportsVideo: model.supportsVideo ?? inferred.supportsVideo,
+          supportsReasoning: model.supportsReasoning ?? inferred.supportsReasoning,
+          reasoningLevels: [...new Set([...inferred.reasoningLevels, ...model.reasoningLevels])],
+        }
+      }),
+    }
+  }
+  const selected = catalog.find(model => model.id === profile.model) || catalog.find(model => model.id === preferred)
+    || catalog.find(model => model.supportsTools === true) || catalog[0]
+  if (!selected) return profile
+  return {
+    ...profile,
+    model: selected.id,
+    ...(client.supportsModels ? { models: [catalogModel(client, selected)] } : {}),
+    ...(client.id === 'claude-code' ? { claudeModels: syncClaudeTiers(profile.claudeModels, profile.model, selected.id) } : {}),
+  }
+}

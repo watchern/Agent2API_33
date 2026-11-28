@@ -2,7 +2,7 @@ import * as React from 'react'
 import { mountOnPage } from '../island-lazy'
 import { createRoot } from 'react-dom/client'
 import {
-  Alert, Button, Card, Dialog, DialogBody, DialogContent, DialogFooter, DialogHeader,
+  Button, Card, Dialog, DialogBody, DialogContent, DialogFooter, DialogHeader,
   DialogTitle, Empty, EmptyDescription, EmptyTitle,
 } from '@ui'
 import { InstalledPluginCard, StorePluginCard } from './plugins-cards'
@@ -28,7 +28,7 @@ import { PluginPageToolbar, type PluginSortKey } from './plugins-toolbar'
 import { PluginCategoryRail, pluginRailSubtitle, pluginRailTitle, type PluginRailKey } from './plugins-rail'
 import { applicablePluginItems, missingPluginItems, pluginBatchItems, type PluginBatchAction, type PluginBatchItem } from '../../../ui-shared/plugins-batch-items'
 import { usePluginBatch, waitScriptOperation, type PluginRequest } from '../../../ui-shared/plugins-batch-runner'
-import { PluginBatchConfirm, PluginBatchProgress, PluginBatchToolbar } from '../../../ui-shared/plugins-batch-view'
+import { PluginBatchDialog, PluginBatchProgress, PluginBatchToolbar } from '../../../ui-shared/plugins-batch-view'
 import { PluginMissingBanner, PluginMissingDialog } from '../../../ui-shared/plugins-missing'
 import { PluginCatalogStatus } from '../../../ui-shared/plugins-catalog-status'
 import { ScriptCatalogStatus } from '../../../ui-shared/plugins-script-catalog'
@@ -38,6 +38,7 @@ import { buildUnifiedRows, filterAndSortRows, indexScriptPackages, type UnifiedP
 import type { PluginStatusFilter } from '../../../ui-shared/plugins-filters'
 import { TaskPluginsSection } from '../../../ui-shared/task-plugins-section'
 import { PluginScheduledFilterBar, usePluginsTaskData } from './plugins-scheduled-pane'
+import { PluginErrorBanner, type PluginErrorBannerState } from '../../../ui-shared/plugins-error-banner'
 import '../styles/plugins-page.css'
 
 const VIEW_MODE_KEY = 'agent2api-plugins-view-mode'
@@ -94,7 +95,6 @@ function PluginsPage(): React.ReactElement {
   const [taskCreateRequest, setTaskCreateRequest] = React.useState(0)
   const [selecting, setSelecting] = React.useState(false)
   const [selected, setSelected] = React.useState(new Set<string>())
-  const [batchConfirm, setBatchConfirm] = React.useState<{ action: PluginBatchAction; items: PluginBatchItem[] } | null>(null)
   const [missingOpen, setMissingOpen] = React.useState(false)
   const listRef = React.useRef<HTMLDivElement>(null)
   const taskData = usePluginsTaskData()
@@ -474,8 +474,8 @@ function PluginsPage(): React.ReactElement {
       return row ? [{ ...row, required: item.required }] : []
     })
     const targets = applicablePluginItems(current, action)
-    if (targets.length) setBatchConfirm({ action, items: targets })
-  }, [])
+    if (targets.length) batch.prepare(action, targets)
+  }, [batch.prepare])
 
   React.useEffect(() => {
     if (!payload) return
@@ -545,13 +545,40 @@ function PluginsPage(): React.ReactElement {
     scheduled: taskData.totalCount,
     scheduledUpdatable: taskData.updatableCount,
   }), [railCounts, taskData.totalCount, taskData.updatableCount])
+
+  React.useEffect(() => {
+    if (!payload) return
+    const taskUpdatable = taskData.loaded ? taskData.updatableCount : (payload.taskUpdateCount ?? 0)
+    bridge().wbApp?.updatePluginsBadge?.(railCounts.updatable + taskUpdatable)
+  }, [payload, railCounts.updatable, taskData.loaded, taskData.updatableCount])
   const toolbarCount = isScheduledRail ? taskData.countMatching(taskStatus, deferredKeyword) : filteredRows.length
   const showCommunityCatalogStatus = (rail === 'all' || rail === 'community') && Boolean(catalog?.error)
   const isMagpieRail = rail === 'magpie-official' || rail === 'magpie-recommended' || rail === 'magpie-third-party'
   const showScriptCatalogStatus = Boolean(
     scripts?.catalog && (isMagpieRail || (rail === 'all' && (scripts.catalog.refreshing || scripts.catalog.marketError || scripts.catalog.githubError)))
   )
-  const topError = isScheduledRail ? taskData.error : (error || syncError || (typeof scriptCtrl.failure === 'string' ? scriptCtrl.failure : ''))
+  const topBanner: PluginErrorBannerState | null = isScheduledRail
+    ? (taskData.error ? {
+      message: taskData.error,
+      retryDisabled: locked,
+      onRetry: () => { void taskData.refresh() },
+      onDismiss: taskData.clearError,
+    } : null)
+    : error ? {
+      message: error,
+      retryDisabled: locked,
+      onRetry: () => { void forceLoad() },
+      onDismiss: () => setError(''),
+    } : syncError ? {
+      message: syncError,
+      retryDisabled: locked,
+      onRetry: () => {
+        void bridge().wbApp?.refresh?.().then(refreshed => {
+          if (mounted.current && refreshed === true) setSyncError('')
+        })
+      },
+      onDismiss: () => setSyncError(''),
+    } : scriptCtrl.failureBanner
 
   const renderRow = (row: UnifiedPluginRow) => {
     const selectionDisabled = locked || batchItemByKey.get(row.selectionKey)?.active === true
@@ -630,7 +657,7 @@ function PluginsPage(): React.ReactElement {
             onScript={handleOpenScript}
             onDiagnostics={handleOpenDiagnostics}
           />
-          {topError ? <Alert variant='destructive' className='whitespace-pre-wrap break-words'>{topError}</Alert> : null}
+          {topBanner ? <PluginErrorBanner {...topBanner} t={t} /> : null}
           {!isScheduledRail && (missing.required.length || missing.bindable.length || missing.unresolved.length) ? <PluginMissingBanner
             count={missing.required.length + missing.bindable.length + missing.unresolved.length}
             accounts={missingAccounts} onOpen={handleOpenMissing} t={t} /> : null}
@@ -647,8 +674,7 @@ function PluginsPage(): React.ReactElement {
             visibleKeys={selectableVisibleKeys}
             selected={selected} disabled={locked} onSelection={changeSelection} onAction={confirmBatch}
             onExit={handleExitBatch} t={t} /> : null}
-          {batch.task ? <PluginBatchProgress task={batch.task} t={t} onClose={batch.clear}
-            onRetry={items => confirmBatch(batch.task!.action, items)} /> : null}
+          {batch.backgroundVisible ? <PluginBatchProgress model={batch} t={t} /> : null}
           {fileInstall.backgroundVisible ? <PluginFileInstallProgress model={fileInstall} t={t} /> : null}
         </div>
 
@@ -755,9 +781,7 @@ function PluginsPage(): React.ReactElement {
       onOpenScheduledTasks={() => { fileInstall.close(); bridge().wbApp?.showPage?.('scheduled') }}
       t={t}
     />
-    {batchConfirm ? <PluginBatchConfirm key={`${batchConfirm.action}:${batchConfirm.items.map(item => item.key).join('|')}`}
-      action={batchConfirm.action} items={batchConfirm.items} disabled={locked} t={t} onClose={() => setBatchConfirm(null)}
-      onConfirm={() => { const { action, items } = batchConfirm; setBatchConfirm(null); void batch.execute(action, items) }} /> : null}
+    <PluginBatchDialog model={batch} disabled={locked} t={t} />
     {missingOpen ? <PluginMissingDialog required={missing.required} bindable={missing.bindable} unresolved={missing.unresolved}
       disabled={locked} t={t} onClose={() => setMissingOpen(false)}
       onInstall={items => { setMissingOpen(false); void batch.execute('install', items) }}
@@ -790,7 +814,7 @@ function PluginsPage(): React.ReactElement {
       }} /> : null}
     {detailsItem ? <PluginDetailsDialog name={pluginName(detailsItem.id, detailsItem.name)}
       description={pluginDescription(detailsItem.id, detailsItem.description)} version={detailsItem.version}
-      sourceLabel={t('社区插件')} icon={detailsItem.icon} artwork={detailsItem.id === 'agent2api-web-providers' ? 'web' : 'providers'}
+      sourceLabel={t('社区插件')} downloads={detailsItem.downloads} icon={detailsItem.icon} artwork={detailsItem.id === 'agent2api-web-providers' ? 'web' : 'providers'}
       t={t} onClose={() => setDetailsStore(null)}
       metadata={detailsItem.error ? <div className='text-xs text-warning'>{errorMessage(detailsItem.reason)}</div>
         : detailsItem.version && !detailsInstallable ? <p className='m-0 text-xs text-warning'>{t('当前平台暂无包')}</p> : null}

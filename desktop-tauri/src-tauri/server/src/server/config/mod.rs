@@ -96,10 +96,10 @@ pub use account_sort::{
     AddedSortDirection, BalanceSortDirection, CreditSortDirection,
 };
 pub use assistant_config::*;
-pub use privacy_config::{set_privacy_settings, KEY_PRIVACY_REDACTION};
+pub use privacy_config::{save_privacy_settings, PrivacySaveError, KEY_PRIVACY_REDACTION};
 pub use sanitize_config::{
-    set_sanitize_settings, SanitizePatch, SanitizeSettings, KEY_SANITIZE_PROVIDERS,
-    KEY_SANITIZE_RULES, MAX_SANITIZE_PROVIDERS,
+    default_sanitize_providers, set_sanitize_settings, SanitizePatch, SanitizeSettings,
+    KEY_SANITIZE_PROVIDERS, KEY_SANITIZE_RULES, MAX_SANITIZE_PROVIDERS,
 };
 pub use routing_groups::{RoutingGroup, RoutingMember};
 pub use routing_profiles::{
@@ -197,7 +197,7 @@ pub struct RuntimeConfig {
     debug_mode: bool,
     /// 规则在配置读取 / 保存时编译，请求间共享，同一次转发使用完整快照。
     sanitize: SanitizeSettings,
-    privacy: std::sync::Arc<crate::server::core::privacy::CompiledPrivacySettings>,
+    privacy: privacy_config::PrivacyConfigSnapshot,
     /// 开发者角色兼容开关（设置页「网关 → 开发者角色兼容」）。
     ///
     /// 与 `sanitize_fingerprints` 同一理由：转发层**每次发送前**都要判一次
@@ -1951,6 +1951,12 @@ pub fn set_routing(patch: RoutingPatch) -> bool {
                 .raw
                 .insert(KEY_ROUTING_STICKY.to_string(), Value::from(sticky.as_str()));
             next.sticky = sticky;
+        }
+        if let Some(priority) = patch.priority {
+            config
+                .raw
+                .insert(KEY_ROUTING_PRIORITY.to_string(), Value::from(priority.as_str()));
+            next.priority = priority;
         }
         let mut write_bool = |key: &str, value: bool, slot: &mut bool| {
             config.raw.insert(key.to_string(), Value::Bool(value));

@@ -66,6 +66,9 @@ use rusqlite::Connection;
 #[path = "schema_tests.rs"]
 mod tests;
 
+#[path = "schema_local_direct_v36.rs"]
+mod local_direct_v36;
+
 /// `kv` 表里**不属于网关配置**的固定键名（模块头「两类键名绝不能相撞」讲的
 /// 就是它与配置顶层键的关系）。
 ///
@@ -369,22 +372,27 @@ pub fn is_reserved(key: &str) -> bool {
 /// v34 = `schema_privacy_redaction.sql`（隐私脱敏）、
 /// v35 = `schema_local_direct.sql`（本机直连采集）。这三条来自上游 beta 线。
 ///
-/// ── 版本 36：logs 补 (level, id DESC) 索引（[`schema_logs_level`]）────
+/// ── 版本 36-38：上游 3.6.1 新特性 ────────────────────────────
+/// v36 = `local_direct_v36::migrate_local_direct_antigravity`（本机直连的
+/// Antigravity 账号归属）、v37 = `schema_request_protocol.sql`（请求协议列）、
+/// v38 = `schema_api_key_usage.sql`（API Key 用量列）。来自上游 3.6.1 正式版。
+///
+/// ── 版本 39：logs 补 (level, id DESC) 索引（[`schema_logs_level`]）────
 /// 未读失败角标的水位查询（WHERE level='error' ORDER BY id DESC LIMIT 1，
 /// 管理面板 20 秒一轮）在百万行日志表上无索引即全表扫（实测 ~5 秒），且
 /// 扫描期间单连接互斥把余额查询/账号列表全部排到 6-10 秒后——账号页余额
 /// 查询因此批量超时。见 schema_logs_level.sql 的头部说明。
 ///
 /// **编号为什么往后挪**：这条迁移原本占 v30，合入上游 3.5.1 时挪到 v33，
-/// 如今合入上游 3.6.0 时 v33-v35 又被上游新特性占用，于是再顺延到 36。
-/// 迁移按 `PRAGMA user_version` 逐版本执行、每个版本只跑一次，`CREATE INDEX
-/// IF NOT EXISTS` 幂等，已经建过索引的库重跑无害；停在更早版本的库会依次
-/// 跑完全部版本。
+/// 合入上游 3.6.0 时挪到 36，如今合入上游 3.6.1 时 v36-v38 又被上游占用，
+/// 于是再顺延到 39。迁移按 `PRAGMA user_version` 逐版本执行、每个版本只跑
+/// 一次，`CREATE INDEX IF NOT EXISTS` 幂等，已经建过索引的库重跑无害；停在
+/// 更早版本的库会依次跑完全部版本。
 ///
 /// 但**同号不同义**的代价不止索引这一条：上游 v30 的「加 diagnostics 列」
-/// 对停在 30 的本 fork 旧版库是**整段没跑过**的。那一条由 v37 兜底
-/// （见下面的 v37 段）。
-/// ── 版本 37：补齐 v30 撞号漏掉的 `account_usage_records.diagnostics` 列 ──
+/// 对停在 30 的本 fork 旧版库是**整段没跑过**的。那一条由 v40 兜底
+/// （见下面的 v40 段）。
+/// ── 版本 40：补齐 v30 撞号漏掉的 `account_usage_records.diagnostics` 列 ──
 /// 上游 v30 是 `ALTER TABLE account_usage_records ADD COLUMN diagnostics TEXT`，
 /// 而本 fork 的 v30 曾是「logs 补 (level, id DESC) 索引」——**同一个版本号在
 /// 两条谱系里含义不同**。迁移按 `PRAGMA user_version` 逐版本推进、每个版本只跑
@@ -394,13 +402,13 @@ pub fn is_reserved(key: &str) -> bool {
 ///     `core::usage_records` 的 `RECORD_COLUMNS` 已经带上了这一列（上游
 ///     v3.5.1 的用量诊断读数就存在它里面），于是每一次余额查询都报
 ///     「no such column: diagnostics」—— 整条账号页余额链路瘫掉。
-///   · 从**上游 3.5.1 / 3.6.0** 升上来 → v30 已经是「加 diagnostics 列」，不缺。
+///   · 从**上游 3.5.1 / 3.6.0 / 3.6.1** 升上来 → v30 已经是「加 diagnostics 列」，不缺。
 ///
 /// 所以这一版做的是**幂等补列**：先查 `PRAGMA table_info` 看列在不在，
 /// 不在才 ALTER。已在的库（上游谱系 / 全新库）跑它等于空操作。
 ///
-/// 为什么不用「把上游 v30 挪到 37、本 fork 的索引挪回 30」：上游的
-/// user_version 已经推进到 35，它的 v30-v35 语义对**已经在 35 的库**是
+/// 为什么不用「把上游 v30 挪到 40、本 fork 的索引挪回 30」：上游的
+/// user_version 已经推进到 38，它的 v30-v38 语义对**已经在 38 的库**是
 /// 既成事实；改编号会让那些库跳过本该跑的迁移。只能往后加补偿版本。
 ///
 /// 为什么不用 `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`：SQLite 不支持这个
@@ -411,7 +419,7 @@ pub fn is_reserved(key: &str) -> bool {
 /// 一并按同样的方式兜住：那几条也是 `ALTER TABLE ADD COLUMN`（非幂等），
 /// 撞号同样可能让它们对某些库整段没跑过。
 ///
-/// ── 版本 38：补齐 v33/v34 撞号漏掉的任务插件表与隐私脱敏列 ──
+/// ── 版本 41：补齐 v33/v34 撞号漏掉的任务插件表与隐私脱敏列 ──
 /// 合入上游 3.6.0 时 v33-v35 被上游新特性占用（任务插件 / 隐私脱敏 /
 /// 本机直连），fork 自己的 logs 索引与补列迁移顺延到 36、37。但**本 fork
 /// 旧版**的 v33/v34 曾是「logs 索引」和「补列」——从那条谱系升上来的库
@@ -423,11 +431,26 @@ pub fn is_reserved(key: &str) -> bool {
 ///     永不执行 ⇒ 请求统计查询报 `no such column: privacy_hits`；
 ///   · v35 的本机直连表反而跑到了（它的号在本 fork 旧谱系里没占过）。
 ///
-/// 这一版与 v37 同一套手法：CREATE 语句用 `IF NOT EXISTS` 整段重放（幂等），
+/// 这一版与 v40 同一套手法：CREATE 语句用 `IF NOT EXISTS` 整段重放（幂等），
 /// 两条裸 ALTER（`privacy_hits` / `origin`）用 [`table_has_column`] 逐列守门
 /// 后再补。上游谱系 / 全新库跑它等于空操作。建表脚本见
 /// `schema_upstream_v33_v35_backfill.sql`。
-pub const SCHEMA_VERSION: i64 = 38;
+///
+/// ── 版本 42：补齐 v36-v38 撞号漏掉的本机直连归正 / 请求协议列 / API Key 用量表 ──
+/// 合入上游 3.6.1 时 v36-v38 又被上游新特性占用（本机直连 Antigravity 归属 /
+/// 请求协议 / API Key 用量），fork 自己的 logs 索引、补列、task 补偿顺延到
+/// 39-41。但**本 fork 旧版**（3.6.1-beta-0/1）的 v36-v38 曾是「logs 索引 /
+/// 补列 / task 三表补偿」——从那条谱系升上来的库 user_version 已经到 37/38，
+/// 于是：
+///   · v36 的数据归正（`local_direct_v36::migrate_local_direct_antigravity`）不跑；
+///   · v37 的 `client_protocol` / `upstream_protocol` 两列不跑 ⇒ 请求详情按
+///     新协议读列时报 `no such column`；
+///   · v38 的 `api_key_usage_events` 表与索引不跑 ⇒ API Key 用量统计整块失效。
+///
+/// 这一版沿用同一套手法：v36 是按条件 UPDATE 的数据迁移（重跑空操作）、v38
+/// 是 `CREATE ... IF NOT EXISTS` 整段重放、v37 两条裸 ALTER 用 [`table_has_column`]
+/// 逐列守门。上游谱系 / 全新库跑它等于空操作。
+pub const SCHEMA_VERSION: i64 = 42;
 
 /// 版本 1 的全部表与索引：改造前所有 JSON / JSONL 文件的对应形态。
 ///
@@ -1174,17 +1197,23 @@ fn apply_version(
         33 => conn.execute_batch(include_str!("schema_task_plugins.sql")),
         34 => conn.execute_batch(include_str!("schema_privacy_redaction.sql")),
         35 => conn.execute_batch(include_str!("schema_local_direct.sql")),
-        // v36：logs 补 (level, id DESC) 索引（未读失败角标水位查询的根治，
-        // 见 schema_logs_level.sql 头部说明）。原为 v30，两轮合入上游后
-        // 依次顺延到 33、36；脚本幂等，重跑无害。
-        36 => conn.execute_batch(include_str!("schema_logs_level.sql")),
-        // v37：补齐 v30 撞号可能漏跑的那些 `ALTER TABLE ADD COLUMN`（见
-        // SCHEMA_VERSION 的 v37 段）。逐列查 `PRAGMA table_info`，缺了才加
+        // v36-v38：上游 3.6.1 新特性（本机直连 Antigravity 归属 / 请求协议列 / API Key 用量列）。
+        36 => local_direct_v36::migrate_local_direct_antigravity(conn),
+        37 => conn.execute_batch(include_str!("schema_request_protocol.sql")),
+        38 => conn.execute_batch(include_str!("schema_api_key_usage.sql")),
+        // v39：logs 补 (level, id DESC) 索引（未读失败角标水位查询的根治，
+        // 见 schema_logs_level.sql 头部说明）。原为 v30，三轮合入上游后
+        // 依次顺延到 33、36、39；脚本幂等，重跑无害。
+        39 => conn.execute_batch(include_str!("schema_logs_level.sql")),
+        // v40：补齐 v30 撞号可能漏跑的那些 `ALTER TABLE ADD COLUMN`（见
+        // SCHEMA_VERSION 的 v40 段）。逐列查 `PRAGMA table_info`，缺了才加
         // —— 上游谱系 / 全新库跑它等于空操作，从本 fork 旧版升上来的库
         // 才会真正补上那一列。
-        37 => ensure_columns_34(conn),
-        // v38：补齐 v33/v34 撞号漏掉的任务插件表与 privacy_hits 列。
-        38 => ensure_upstream_v33_v35(conn),
+        40 => ensure_columns_34(conn),
+        // v41：补齐 v33/v34 撞号漏掉的任务插件表与 privacy_hits 列。
+        41 => ensure_upstream_v33_v35(conn),
+        // v42：补齐 v36-v38 撞号漏掉的本机直连归正 / 请求协议列 / API Key 用量表。
+        42 => ensure_upstream_v36_v38(conn),
         _ => Ok(()),
     }
 }
@@ -1282,6 +1311,30 @@ fn ensure_upstream_v33_v35(conn: &Connection) -> rusqlite::Result<()> {
     for &(table, column, definition) in COLUMNS {
         match table_has_column(conn, table, column)? {
             Some(true) | None => continue, // 列已在 / 表不在（不该发生）—— 都不 ALTER
+            Some(false) => {}
+        }
+        conn.execute_batch(&format!(
+            "ALTER TABLE {table} ADD COLUMN {column} {definition};"
+        ))?;
+    }
+    Ok(())
+}
+
+/// v42 补偿：v36-v38 在 fork 谱系里被 logs / 补列 / task 占用，旧库跳过了
+/// 上游 3.6.1 的三条迁移。逐条重放，全部幂等。
+fn ensure_upstream_v36_v38(conn: &Connection) -> rusqlite::Result<()> {
+    // v36：数据归正，只 UPDATE 仍带旧占位值的行，重跑没有副作用。
+    local_direct_v36::migrate_local_direct_antigravity(conn)?;
+    // v38：建表 + 建索引都是 IF NOT EXISTS，整段重放安全。
+    conn.execute_batch(include_str!("schema_api_key_usage.sql"))?;
+    // v37：两条裸 ALTER 非幂等，逐列守门。
+    const COLUMNS: &[(&str, &str, &str)] = &[
+        ("requests", "client_protocol", "TEXT NOT NULL DEFAULT ''"),
+        ("requests", "upstream_protocol", "TEXT NOT NULL DEFAULT ''"),
+    ];
+    for &(table, column, definition) in COLUMNS {
+        match table_has_column(conn, table, column)? {
+            Some(true) | None => continue,
             Some(false) => {}
         }
         conn.execute_batch(&format!(

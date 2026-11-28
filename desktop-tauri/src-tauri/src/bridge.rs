@@ -367,6 +367,7 @@ const BRIDGE_JS: &str = r#"
     createKey: payload => call('POST', '/api/keys', payload || {}),
     updateKey: (id, patch) => call('PATCH', '/api/keys/' + encodeURIComponent(id), patch),
     deleteKey: id => call('DELETE', '/api/keys/' + encodeURIComponent(id)),
+    resetKeyUsage: id => call('POST', '/api/keys/' + encodeURIComponent(id) + '/reset-usage', {}),
 
     // ── 多账号 ──
     getAccounts: query => call('GET', '/api/accounts' + toQuery(query)),
@@ -480,7 +481,10 @@ const BRIDGE_JS: &str = r#"
     createProxyPoolItem: payload => call('POST', '/api/proxies/pool', payload || {}),
     updateProxyPoolItem: payload => call('POST', '/api/proxies/pool/update', payload || {}),
     setProxyPoolItemEnabled: payload => call('POST', '/api/proxies/pool/enable', payload || {}),
-    removeProxyPoolItem: id => call('POST', '/api/proxies/pool/remove', { id: String(id || '') }),
+    removeProxyPoolItem: (id, options) => call('POST', '/api/proxies/pool/remove', {
+      id: String(id || ''),
+      ...(options && options.resetUpdateProxy === true ? { resetUpdateProxy: true } : {}),
+    }),
     testProxyPoolItem: id => call('POST', '/api/proxies/pool/test', { id: String(id || '') }),
     syncClashToProxyPool: () => call('POST', '/api/proxies/pool/sync-clash', {}),
     // ── 代理设置（「网络代理」页的设置弹窗：测试目标网址）──
@@ -856,7 +860,7 @@ const BRIDGE_JS: &str = r#"
     // 只读、只要 `packs[].ui[]` 与 `enabled` 两个字段，但仍然走完整端点：
     // 另开一条「只给页面清单」的端点会让「菜单」与「插件状态」两个事实分开取，
     // 装 / 卸之后两边可能对不上。
-    getPlugins: () => call('GET', '/api/plugins'),
+    getPlugins: rev => call('GET', rev ? '/api/plugins' + toQuery({ rev }) : '/api/plugins'),
     // ── 侧边栏布局（分组 / 顺序 / 显隐）──
     // 布局的权威副本在库里（`kv` 的 `sidebarLayout` 键），页面侧的
     // localStorage 只是首帧缓存 —— 桌面壳与网页端是两个 origin，localStorage

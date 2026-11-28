@@ -1,16 +1,15 @@
 import * as React from 'react'
 import { mountOnPage } from '../island-lazy'
+import '../styles/agent-redesign.css'
 import { Alert, Button, Card, Collapsible, CollapsibleContent, CollapsibleTrigger, Empty, EmptyDescription, EmptyTitle, InputGroup, InputGroupAddon, InputGroupInput, NavItem, NavList, SegmentedControl, Sidebar, Skeleton, Spinner, StatusDot, cn } from '@ui'
 import { t } from '../i18n'
 import { clearFilters, counts, getAgentStore, isDesktopEnvironment, loadPanel, selectClient, selectedClient, setFilter, setQuery, subscribeAgentStore, visibleClients, type LoadOptions } from './agent-state'
 import { blankProfile, detectionLabel } from './agent-model'
 import { ProfileEditor } from './agent-editor'
-import { LocalDirectSection } from './agent-local-direct-card'
+import { LocalDirectDockItem, LocalDirectPanel, useLocalDirect } from './agent-local-direct-card'
 import { PathDialog } from './agent-path-dialog'
 import { ApplyDialog } from './agent-preview'
 import { ProfileDialog } from './agent-profile-dialog'
-import { QuickConnectDialog } from './agent-quick-connect'
-import { quickBlockReason } from './agent-quick-model'
 import { AgentActions, AgentIcon } from './agent-actions'
 import { dshTargetLabel } from './agent-dsh'
 import type { AgentClient, AgentOperation, AgentProfile } from './agent-types'
@@ -39,6 +38,8 @@ function formatDetectedTime(detectedAt: number): string {
 export function AgentPage() {
   const store = React.useSyncExternalStore(subscribeAgentStore,getAgentStore,getAgentStore)
   const [tab, setTab] = React.useState<string>('config')
+  const [directSelected, setDirectSelected] = React.useState(false)
+  const localDirect = useLocalDirect()
   const client = selectedClient()
   const list = visibleClients(store)
   const stats = counts(store)
@@ -52,6 +53,7 @@ export function AgentPage() {
     : detectedTime
       ? t('上次检测 {time}', { time: detectedTime })
       : ''
+  const showDirectPanel = directSelected && Boolean(localDirect.status)
 
   return <Card render={<section/>} className='panel agent-panel'>
     <div className='toolbar agent-toolbar'>
@@ -74,7 +76,6 @@ export function AgentPage() {
       <span className='min-w-0 flex-1'>{store.error}</span>
       <Button variant='outline' size='sm' disabled={isDetecting || Boolean(store.busy)} onClick={() => void loadPanel({ force: true })}>{t('重新检测')}</Button>
     </Alert>}
-    <LocalDirectSection />
     <div className='agent-body'>
       <Sidebar className='agent-rail p-0 gap-0' aria-label={t('客户端清单')}><NavList className='agent-rail-scroll'>
         {initialLoading ? Array.from({ length: 8 }, (_, index) => (
@@ -87,16 +88,19 @@ export function AgentPage() {
             <Skeleton className='size-2 shrink-0 rounded-full' />
           </div>
         )) : <>
-          {detected.length>0&&<><div className='agent-rail-label'>{t('已检测到')}（{detected.length}）</div>{detected.map(item=><ClientRow key={item.id} client={item} active={item.id===store.selected}/>)}</>}
-          {missing.length>0&&<><div className='agent-rail-label'>{t('未检测到')}（{missing.length}）</div>{missing.map(item=><ClientRow key={item.id} client={item} active={item.id===store.selected}/>)}</>}
+          {detected.length>0&&<><div className='agent-rail-label'>{t('已检测到')}（{detected.length}）</div>{detected.map(item=><ClientRow key={item.id} client={item} active={!showDirectPanel && item.id===store.selected} onPick={() => { setDirectSelected(false); selectClient(item.id) }} />)}</>}
+          {missing.length>0&&<><div className='agent-rail-label'>{t('未检测到')}（{missing.length}）</div>{missing.map(item=><ClientRow key={item.id} client={item} active={!showDirectPanel && item.id===store.selected} onPick={() => { setDirectSelected(false); selectClient(item.id) }} />)}</>}
           {!list.length&&<Empty>
             <span>{t('没有匹配的客户端')}</span>
             {(store.query || store.filter !== 'all') && <Button variant='outline' size='sm' onClick={clearFilters}>{t('清除筛选')}</Button>}
           </Empty>}
         </>}
-      </NavList></Sidebar>
+      </NavList>
+      {localDirect.status ? <LocalDirectDockItem status={localDirect.status} active={showDirectPanel} onSelect={() => setDirectSelected(true)} /> : null}
+      </Sidebar>
       <div className='agent-detail'>
-        {initialLoading ? <div className='agent-detail-center'>
+        {showDirectPanel ? <LocalDirectPanel controller={localDirect} />
+        : initialLoading ? <div className='agent-detail-center'>
           <Spinner className='size-6 text-primary' />
           <p className='text-sm text-subtle'>{t('正在检测本机客户端与配置文件…')}</p>
         </div> : store.clients.length > 0 && !list.length ? <Empty className='agent-detail-center'>
@@ -112,7 +116,7 @@ export function AgentPage() {
   </Card>
 }
 
-function ClientRow({client,active}:{client:AgentClient;active:boolean}) {
+function ClientRow({client,active,onPick}:{client:AgentClient;active:boolean;onPick:()=>void}) {
   const live = client.configurations.find(profile => profile.status === 'active' || profile.status === 'enabled')
   const dotVariant = client.readError
     ? 'destructive'
@@ -131,7 +135,7 @@ function ClientRow({client,active}:{client:AgentClient;active:boolean}) {
           ? t('尚未启用配置')
           : detectionLabel(client)
   return <NavItem active={active} icon={<ClientAvatar client={client}/>} trailing={<StatusDot variant={dotVariant} className={cn(active && 'agent-status-active')}/>}
-    className={cn('agent-client',active&&'is-active',!client.detected&&'is-missing')} onClick={()=>selectClient(client.id)}>
+    className={cn('agent-client',active&&'is-active',!client.detected&&'is-missing')} onClick={onPick}>
     <span className='agent-client-main'><span className='agent-client-name'>{client.name}{client.version&&<span className='agent-client-ver'>{client.version}</span>}</span>
       <span className='agent-client-sub'>{subtitle}</span></span>
   </NavItem>
@@ -140,7 +144,6 @@ function ClientRow({client,active}:{client:AgentClient;active:boolean}) {
 function ClientDetail({client, tab, onTabChange}:{client:AgentClient; tab:string; onTabChange:(next:string)=>void}) {
   const store = React.useSyncExternalStore(subscribeAgentStore,getAgentStore,getAgentStore)
   const [pathOpen,setPathOpen] = React.useState(false)
-  const [quickOpen,setQuickOpen] = React.useState(false)
   const [restore,setRestore] = React.useState<AgentOperation|null>(null)
   const [creating, setCreating] = React.useState<AgentProfile | null>(null)
   const [detailsOpen, setDetailsOpen] = React.useState(false)
@@ -148,8 +151,6 @@ function ClientDetail({client, tab, onTabChange}:{client:AgentClient; tab:string
   const busy = Boolean(store.busy)
   const desktop = isDesktopEnvironment()
   const addReason = client.readError || client.storeError || (!client.writable ? client.supportNote : '')
-  const canQuickConnect = client.writable && !quickBlockReason(client)
-  const showHeaderQuick = canQuickConnect && !client.viaGateway && client.configurations.length > 0
   const add = () => {
     onTabChange('config')
     setCreating({ ...blankProfile(client, store.gateway), name: client.supportsGateway ? 'Agent2API' : '', gatewayKeyId: store.gatewayKeys[0]?.id || '' })
@@ -160,10 +161,8 @@ function ClientDetail({client, tab, onTabChange}:{client:AgentClient; tab:string
         {!client.writable && <span>{detectionLabel(client)}</span>}
         {client.id === 'dsh' && dshTarget && <span>{dshTargetLabel(dshTarget.profile, dshTarget.label)}</span>}</div></div>
       <div className='agent-dhead-actions'>
-        {showHeaderQuick && <Button size='sm' disabled={busy} onClick={() => setQuickOpen(true)}><AgentIcon name='bolt' />{t('一键接入')}</Button>}
-        <Button size='sm' variant={showHeaderQuick || (canQuickConnect && !client.configurations.length) ? 'outline' : 'default'} disabled={busy || Boolean(addReason)} title={addReason || undefined} onClick={add}><AgentIcon name='plus' />{t('新增配置')}</Button>
+        <Button size='sm' variant='default' disabled={busy || Boolean(addReason)} title={addReason || undefined} onClick={add}><AgentIcon name='plus' />{t('新增配置')}</Button>
         <AgentActions label={t('客户端选项')} disabled={busy} actions={[
-          ...(canQuickConnect ? [{ label: t('一键接入本网关'), onClick: () => setQuickOpen(true) }] : []),
           { label: t('重新检测'), onClick: () => void loadPanel({ force: true }) },
           { label: client.id === 'dsh' ? t('选择配置目标') : t('指定配置路径'), onClick: () => setPathOpen(true) },
           ...(client.applied.canUndo ? [{ label: t('撤销上次应用'), onClick: () => setRestore('restore') }] : []),
@@ -179,7 +178,7 @@ function ClientDetail({client, tab, onTabChange}:{client:AgentClient; tab:string
     </> : <>
       {!client.detected && <p className='agent-detection-hint'>{t('未找到客户端程序或配置文件')}{client.writable ? ` · ${t('可先新增配置，安装后再使用')}` : ''}</p>}
       {!client.writable && !client.readError && <Alert variant='warning' className='mt-4'>{client.supportNote}</Alert>}
-      <ProfileEditor client={client} onAdd={add} onQuickConnect={() => setQuickOpen(true)} onOpenPath={() => setPathOpen(true)} />
+      <ProfileEditor client={client} onAdd={add} onOpenPath={() => setPathOpen(true)} />
       {client.applied.error && <Alert variant='warning' className='mt-4'>{client.applied.error}</Alert>}
       {client.applied.pendingRecovery && <Alert variant='warning' className='mt-4 flex flex-wrap items-center justify-between gap-3'><span>{t('上次应用未完整结束，请先查看恢复预览。')}</span>
         <Button variant='outline' size='sm' disabled={busy} onClick={() => setRestore('restore')}>{t('撤销上次应用')}</Button></Alert>}
@@ -196,7 +195,6 @@ function ClientDetail({client, tab, onTabChange}:{client:AgentClient; tab:string
       </Collapsible>
     </>}
     {pathOpen&&<PathDialog client={client} onClose={()=>setPathOpen(false)}/>}
-    {quickOpen&&<QuickConnectDialog client={client} onClose={()=>setQuickOpen(false)}/>}
     {creating&&<ProfileDialog client={client} profile={creating} creating onClose={()=>setCreating(null)}/>}
     {restore&&<ApplyDialog client={client} operation={restore} onClose={()=>setRestore(null)}/>}
   </>

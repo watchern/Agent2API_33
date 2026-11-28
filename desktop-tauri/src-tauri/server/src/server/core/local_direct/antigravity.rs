@@ -10,8 +10,11 @@ use crate::server::request_stats::{
     RequestSource,
 };
 
+use super::antigravity_account::{detect_root_email, resolve_account_identity};
 use super::protobuf::{
-    decode_workspace_uri, parse_gen_metadata, parse_step_metadata, strip_gemini_deployment_suffix,
+    canonical_reasoning_level, decode_workspace_uri, extract_reasoning_from_display_label,
+    parse_gen_metadata, parse_step_metadata, split_model_effort_suffix,
+    strip_gemini_deployment_suffix,
 };
 use super::sqlite_reader::{file_fingerprint, open_readonly_with_snapshot};
 
@@ -35,6 +38,7 @@ struct ExtractedStep {
     step_index: i64,
     model_raw: String,
     model_norm: String,
+    reasoning: String,
     began_ms: Option<i64>,
     first_ms: Option<i64>,
     ended_ms: Option<i64>,
@@ -43,6 +47,38 @@ struct ExtractedStep {
     cache_write: i64,
     cache_read: i64,
     response_id: String,
+}
+
+pub(super) fn split_transcript_model_and_reasoning(raw: &str) -> (String, String, Option<String>) {
+    let (no_paren, paren_level) = extract_reasoning_from_display_label(raw);
+    let deploy_stripped = strip_gemini_deployment_suffix(&no_paren);
+    let (base, suffix_level) = split_model_effort_suffix(
+        &deploy_stripped,
+        paren_level.as_deref() == Some("max"),
+    );
+    let reasoning = paren_level.or(suffix_level);
+    if reasoning.is_some() {
+        (base.clone(), base, reasoning)
+    } else {
+        (no_paren, deploy_stripped, None)
+    }
+}
+
+pub(super) fn transcript_row_explicit_reasoning(row: &serde_json::Value) -> Option<String> {
+    for key in [
+        "reasoning_effort",
+        "reasoningEffort",
+        "thinking_level",
+        "thinkingLevel",
+        "effort",
+    ] {
+        if let Some(raw) = row.get(key).and_then(serde_json::Value::as_str) {
+            if let Some(level) = canonical_reasoning_level(raw) {
+                return Some(level.to_string());
+            }
+        }
+    }
+    None
 }
 
 pub struct ScanBatch {
@@ -267,6 +303,8 @@ fn build_ingest_item(
     summary: Option<&ConversationSummaryMeta>,
     db_path: Option<&Path>,
     transcript_path: Option<&Path>,
+    detected_email: Option<&str>,
+    account_names: &HashMap<String, String>,
     step: ExtractedStep,
 ) -> LocalDirectIngestItem {
     let now = crate::server::logging::now_ms();
@@ -308,17 +346,21 @@ fn build_ingest_item(
         format!("antigravity:{}:{}:s:{}", root.kind, conv_id, step.step_index)
     };
     let request_id = stable_request_id(&source_key);
+    let (account_id, account_name) =
+        resolve_account_identity(&root.kind, detected_email, account_names, ts, now);
 
     let mut entry = NewRequestEntry::new(model.clone(), 200);
     entry.id = request_id.clone();
     entry.ts = Some(ts);
     entry.duration_ms = duration_ms;
     entry.first_response_ms = first_response_ms;
-    entry.provider = Some("local-direct".to_string());
-    entry.account_id = "local-direct".to_string();
-    entry.account_name = "本机直连".to_string();
+    entry.provider = Some("antigravity".to_string());
+    entry.account_id = account_id;
+    entry.account_name = account_name;
     entry.client_model = client_model;
     entry.upstream_model = model;
+    entry.client_reasoning = step.reasoning.clone();
+    entry.upstream_reasoning = step.reasoning;
     entry.prompt_tokens = prompt_tokens;
     entry.completion_tokens = completion_tokens;
     entry.total_tokens = total_tokens;
@@ -363,6 +405,8 @@ fn scan_conversation_db(
     conv_id: &str,
     summary: Option<&ConversationSummaryMeta>,
     transcript_path: Option<&Path>,
+    detected_email: Option<&str>,
+    account_names: &HashMap<String, String>,
     prev_state: Option<&LocalDirectFileState>,
     force_rescan: bool,
 ) -> (Vec<LocalDirectIngestItem>, Option<LocalDirectFileState>, bool) {
@@ -379,7 +423,7 @@ fn scan_conversation_db(
     }
 
     let parsed = open_readonly_with_snapshot(db_path, |conn| {
-        let mut gen_models: HashMap<i64, String> = HashMap::new();
+        let mut gen_models: HashMap<i64, (String, String)> = HashMap::new();
         let mut step_to_gen: HashMap<i64, i64> = HashMap::new();
 
         if let Ok(mut stmt) = conn.prepare("SELECT idx, data FROM gen_metadata ORDER BY idx ASC") {
@@ -388,8 +432,14 @@ fn scan_conversation_db(
                 let gen_idx: i64 = row.get(0)?;
                 let data: Vec<u8> = row.get(1)?;
                 let parsed = parse_gen_metadata(gen_idx, &data);
-                if let Some(model) = parsed.model {
-                    gen_models.insert(gen_idx, model);
+                if parsed.model.is_some() || parsed.reasoning.is_some() {
+                    gen_models.insert(
+                        gen_idx,
+                        (
+                            parsed.model.unwrap_or_default(),
+                            parsed.reasoning.unwrap_or_default(),
+                        ),
+                    );
                 }
                 for (step_idx, g_idx) in parsed.step_indices {
                     step_to_gen.insert(step_idx, g_idx);
@@ -413,20 +463,35 @@ fn scan_conversation_db(
         return (Vec::new(), None, false);
     };
 
-    let mut fallback_models: Vec<(i64, &String)> = gen_models.iter().map(|(k, v)| (*k, v)).collect();
+    let mut fallback_models: Vec<(i64, &(String, String))> =
+        gen_models.iter().map(|(k, v)| (*k, v)).collect();
     fallback_models.sort_by_key(|(k, _)| *k);
 
-    let resolve_model = |gen_idx: i64| -> (String, String) {
-        if let Some(raw) = gen_models.get(&gen_idx) {
-            return (raw.clone(), strip_gemini_deployment_suffix(raw));
+    let resolve_model = |gen_idx: i64| -> (String, String, String) {
+        if let Some((raw, reasoning)) = gen_models.get(&gen_idx) {
+            return (
+                raw.clone(),
+                strip_gemini_deployment_suffix(raw),
+                reasoning.clone(),
+            );
         }
-        if let Some((_, raw)) = fallback_models.iter().rfind(|(idx, _)| *idx <= gen_idx) {
-            return ((*raw).clone(), strip_gemini_deployment_suffix(raw));
+        if let Some((_, (raw, reasoning))) =
+            fallback_models.iter().rfind(|(idx, _)| *idx <= gen_idx)
+        {
+            return (
+                raw.clone(),
+                strip_gemini_deployment_suffix(raw),
+                reasoning.clone(),
+            );
         }
-        if let Some((_, raw)) = fallback_models.last() {
-            return ((*raw).clone(), strip_gemini_deployment_suffix(raw));
+        if let Some((_, (raw, reasoning))) = fallback_models.last() {
+            return (
+                raw.clone(),
+                strip_gemini_deployment_suffix(raw),
+                reasoning.clone(),
+            );
         }
-        (String::new(), String::new())
+        (String::new(), String::new(), String::new())
     };
 
     // 按 response_id 合并同一次模型调用拆分出的多条 step；无 response_id 则保留原步。
@@ -451,7 +516,7 @@ fn scan_conversation_db(
             .copied()
             .or(meta.gen_idx)
             .unwrap_or(0);
-        let (model_raw, model_norm) = resolve_model(gen_idx);
+        let (model_raw, model_norm, reasoning) = resolve_model(gen_idx);
 
         if !meta.response_id.is_empty() {
             if let Some(&pos) = resp_positions.get(&meta.response_id) {
@@ -476,6 +541,9 @@ fn scan_conversation_db(
                     existing.model_raw = model_raw;
                     existing.model_norm = model_norm;
                 }
+                if existing.reasoning.is_empty() && !reasoning.is_empty() {
+                    existing.reasoning = reasoning;
+                }
                 continue;
             }
             resp_positions.insert(meta.response_id.clone(), collapsed.len());
@@ -485,6 +553,7 @@ fn scan_conversation_db(
             step_index: step_idx,
             model_raw,
             model_norm,
+            reasoning,
             began_ms: meta.began_ms,
             first_ms: meta.first_ms,
             ended_ms: meta.ended_ms,
@@ -523,6 +592,8 @@ fn scan_conversation_db(
             summary,
             Some(db_path),
             transcript_path,
+            detected_email,
+            account_names,
             step,
         ));
     }
@@ -555,6 +626,8 @@ fn scan_transcript_fallback(
     summary: Option<&ConversationSummaryMeta>,
     db_path: Option<&Path>,
     transcript_path: &Path,
+    detected_email: Option<&str>,
+    account_names: &HashMap<String, String>,
     prev_state: Option<&LocalDirectFileState>,
     force_rescan: bool,
 ) -> (Vec<LocalDirectIngestItem>, Option<LocalDirectFileState>) {
@@ -579,8 +652,8 @@ fn scan_transcript_fallback(
         prev_state.map(|s| s.last_step_idx).unwrap_or(-1)
     };
 
-    // 若同会话 DB 里已有 gen_metadata 模型，顺手读出最新模型名给 agy JSONL 复用。
-    let db_model = db_path
+    // 若同会话 DB 里已有 gen_metadata 模型与思考等级，顺手读出最新信息给 agy JSONL 复用。
+    let (db_model, db_reasoning) = db_path
         .and_then(|p| {
             open_readonly_with_snapshot(p, |conn| {
                 let mut stmt = conn.prepare("SELECT idx, data FROM gen_metadata ORDER BY idx DESC LIMIT 1")?;
@@ -588,7 +661,11 @@ fn scan_transcript_fallback(
                 if let Some(row) = rows.next()? {
                     let gen_idx: i64 = row.get(0)?;
                     let data: Vec<u8> = row.get(1)?;
-                    return Ok(parse_gen_metadata(gen_idx, &data).model);
+                    let parsed = parse_gen_metadata(gen_idx, &data);
+                    return Ok(Some((
+                        parsed.model.unwrap_or_default(),
+                        parsed.reasoning.unwrap_or_default(),
+                    )));
                 }
                 Ok(None)
             })
@@ -647,10 +724,14 @@ fn scan_transcript_fallback(
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(ToString::to_string);
-        let (model_raw, model_norm) = match row_model {
-            Some(m) => (m.clone(), strip_gemini_deployment_suffix(&m)),
-            None => (db_model.clone(), norm_db_model.clone()),
+        let (model_raw, model_norm, row_reasoning) = match row_model {
+            Some(m) => split_transcript_model_and_reasoning(&m),
+            None => (db_model.clone(), norm_db_model.clone(), None),
         };
+        let reasoning = row_reasoning
+            .or_else(|| transcript_row_explicit_reasoning(&row))
+            .or_else(|| (!db_reasoning.is_empty()).then(|| db_reasoning.clone()))
+            .unwrap_or_default();
         let ts = row
             .get("created_at")
             .and_then(serde_json::Value::as_str)
@@ -662,10 +743,13 @@ fn scan_transcript_fallback(
             summary,
             db_path,
             Some(transcript_path),
+            detected_email,
+            account_names,
             ExtractedStep {
                 step_index,
                 model_raw,
                 model_norm,
+                reasoning,
                 began_ms: ts,
                 first_ms: None,
                 ended_ms: ts,
@@ -689,11 +773,22 @@ fn scan_transcript_fallback(
     (items, Some(state))
 }
 
-/// 扫描指定发现根目录集合中的增量请求与文件水位。
+/// 扫描指定发现根目录集合中的增量请求与文件水位（不带账号备注映射的快捷入口，供测试复用）。
 pub fn scan_discovered_roots(
     roots: Vec<DiscoveredRoot>,
     file_states: &HashMap<String, LocalDirectFileState>,
     force_rescan: bool,
+) -> ScanBatch {
+    let empty_names = HashMap::new();
+    scan_discovered_roots_with_accounts(roots, file_states, force_rescan, &empty_names)
+}
+
+/// 扫描指定发现根目录集合中的增量请求与文件水位，并结合本机账号与面板备注映射补全具体账号。
+pub fn scan_discovered_roots_with_accounts(
+    roots: Vec<DiscoveredRoot>,
+    file_states: &HashMap<String, LocalDirectFileState>,
+    force_rescan: bool,
+    account_names: &HashMap<String, String>,
 ) -> ScanBatch {
     // 确保 Antigravity 客户端名已在内建目录注册（无副作用引用）。
     let _ = catalog::CLIENTS;
@@ -705,6 +800,7 @@ pub fn scan_discovered_roots(
     for root in roots.into_iter().filter(|r| r.exists) {
         let root_path = Path::new(&root.path);
         let summaries = load_conversation_summaries(root_path);
+        let detected_email = detect_root_email(&root);
         let mut handled_convs = HashSet::new();
 
         let conv_dir = root_path.join("conversations");
@@ -728,6 +824,8 @@ pub fn scan_discovered_roots(
                     &conv_id,
                     summary,
                     transcript.as_deref(),
+                    detected_email.as_deref(),
+                    account_names,
                     prev,
                     force_rescan,
                 );
@@ -746,6 +844,8 @@ pub fn scan_discovered_roots(
                             summary,
                             Some(&path),
                             tp,
+                            detected_email.as_deref(),
+                            account_names,
                             tp_prev,
                             force_rescan,
                         );
@@ -783,6 +883,8 @@ pub fn scan_discovered_roots(
                     summary,
                     None,
                     &tp,
+                    detected_email.as_deref(),
+                    account_names,
                     tp_prev,
                     force_rescan,
                 );
@@ -802,7 +904,8 @@ pub fn scan_all(
     custom_paths: &[String],
     file_states: &HashMap<String, LocalDirectFileState>,
     force_rescan: bool,
+    account_names: &HashMap<String, String>,
 ) -> ScanBatch {
     let roots = discover_roots(custom_paths);
-    scan_discovered_roots(roots, file_states, force_rescan)
+    scan_discovered_roots_with_accounts(roots, file_states, force_rescan, account_names)
 }

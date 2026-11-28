@@ -403,6 +403,7 @@ impl ServerState {
         // 聚合读同一个库（schema v9 的聚合索引），装句柄即可 —— 事实表的刷新
         // 由 usage_query 的心跳循环驱动（见 limiter 模块头）。
         core::limiter::install(db.clone());
+        core::key_usage::install(db.clone());
         // 出网代理池（「网络代理」页维护的命名代理；账号按 id 引用它们）：
         // 与任务状态同为「kv 固定键 + 整份读写」的形态，把同一个 `Db` 传进去。
         // 它不参与启动预热，位置只要求早于任何一次 `/api/proxies/pool*` 请求。
@@ -791,7 +792,7 @@ impl ServerState {
         core::usage_query::spawn_sweeper(state.store.clone());
 
         // 本机直连 Agent 采集器（Antigravity 等不走网关的本地请求）：后台增量采集与去重合并。
-        core::local_direct::spawn(state.request_stats());
+        core::local_direct::spawn(state.request_stats(), Some(state.store.clone()));
 
         // ── 提供商插件（用户安装的包）─────────────────────────────
         // 后台启动：握手要 spawn 子进程，可能要等几秒。这里不 await ——

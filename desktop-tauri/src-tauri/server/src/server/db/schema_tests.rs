@@ -67,7 +67,8 @@ fn fork_v30_database_gains_the_upstream_diagnostics_column() {
 /// `no such table: task_jobs`，请求统计报 `no such column: privacy_hits`。
 ///
 /// 复刻方式：1..=32 照上游跑，33/34 跑 fork 旧谱系的内容（logs 索引 + 补列），
-/// 35..37 照上游跑 —— 这样 user_version=37 且恰好缺 v33/v34 的对象。
+/// 35 照上游跑，36/37 再跑 fork 旧谱系的 logs 索引 + 补列 —— 这样
+/// user_version=37 且恰好缺 v33/v34 的对象。
 #[test]
 fn fork_v34_database_gains_the_upstream_task_tables_and_privacy_column() {
     let conn = Connection::open_in_memory().unwrap();
@@ -79,9 +80,12 @@ fn fork_v34_database_gains_the_upstream_task_tables_and_privacy_column() {
     conn.execute_batch(include_str!("schema_logs_level.sql"))
         .unwrap();
     ensure_columns_34(&conn).unwrap();
-    for version in 35..=37 {
-        apply_version(&conn, version, &mut cleaned).unwrap();
-    }
+    apply_version(&conn, 35, &mut cleaned).unwrap();
+    // fork 旧谱系的 v36/v37：logs 索引 + 补列，而不是上游的本机直连归正 /
+    // 请求协议列。
+    conn.execute_batch(include_str!("schema_logs_level.sql"))
+        .unwrap();
+    ensure_columns_34(&conn).unwrap();
     conn.pragma_update(None, "user_version", 37).unwrap();
 
     let tables = table_names(&conn);
@@ -122,9 +126,55 @@ fn upstream_backfill_is_idempotent_for_databases_that_already_have_everything() 
 
     // 直接再跑一次补偿函数（不经版本号），必须不报错、不新增对象。
     ensure_upstream_v33_v35(&conn).unwrap();
+    ensure_upstream_v36_v38(&conn).unwrap();
     assert_eq!(table_names(&conn), tables);
+    assert!(has_column(&conn, "requests", "client_protocol"));
+    assert!(has_column(&conn, "requests", "upstream_protocol"));
     migrate(&conn).unwrap();
     assert_eq!(version(&conn), SCHEMA_VERSION);
+}
+
+/// 从 fork 3.6.1-beta-1（user_version=38，v36-v38 分别是 logs 索引 / 补列 /
+/// task 补偿）升上来的库，必须补回上游 3.6.1 的本机直连归正、两条请求协议列
+/// 和 `api_key_usage_events` 表。缺了后两者，请求详情按新协议读列会报
+/// `no such column`，API Key 用量统计整块失效。
+#[test]
+fn fork_v38_database_gains_the_upstream_v36_v38_objects() {
+    let conn = Connection::open_in_memory().unwrap();
+    let mut cleaned = 0;
+    for version in 1..=32 {
+        apply_version(&conn, version, &mut cleaned).unwrap();
+    }
+    // fork 旧谱系 v33/v34。
+    conn.execute_batch(include_str!("schema_logs_level.sql"))
+        .unwrap();
+    ensure_columns_34(&conn).unwrap();
+    // v35 上游本机直连表。
+    apply_version(&conn, 35, &mut cleaned).unwrap();
+    // fork 旧谱系 v36/v37。
+    conn.execute_batch(include_str!("schema_logs_level.sql"))
+        .unwrap();
+    ensure_columns_34(&conn).unwrap();
+    // fork 旧谱系 v38：task 三表 / privacy_hits 补偿。
+    ensure_upstream_v33_v35(&conn).unwrap();
+    conn.pragma_update(None, "user_version", 38).unwrap();
+
+    assert!(!has_column(&conn, "requests", "client_protocol"), "前置条件：fork 旧库不应有 client_protocol 列");
+    assert!(!has_column(&conn, "requests", "upstream_protocol"), "前置条件：fork 旧库不应有 upstream_protocol 列");
+    assert!(
+        !table_names(&conn).iter().any(|t| t == "api_key_usage_events"),
+        "前置条件：fork 旧库不应有 api_key_usage_events 表"
+    );
+
+    migrate(&conn).unwrap();
+
+    assert_eq!(version(&conn), SCHEMA_VERSION);
+    assert!(has_column(&conn, "requests", "client_protocol"), "升级后必须有 client_protocol 列");
+    assert!(has_column(&conn, "requests", "upstream_protocol"), "升级后必须有 upstream_protocol 列");
+    assert!(
+        table_names(&conn).iter().any(|t| t == "api_key_usage_events"),
+        "升级后必须有 api_key_usage_events 表"
+    );
 }
 
 /// v37 的补列对**已经有这些列**的库是空操作（上游谱系 / 全新库都走这条路）。
@@ -209,4 +259,91 @@ fn migration_failure_does_not_advance_the_version_and_can_be_retried() {
         .unwrap();
     migrate(&conn).unwrap();
     assert_eq!(version(&conn), SCHEMA_VERSION);
+}
+
+#[test]
+fn v36_migrates_local_direct_antigravity_requests_and_daily_provider_stats() {
+    let conn = Connection::open_in_memory().unwrap();
+    let mut cleaned = 0;
+    for v in 1..=35 {
+        apply_version(&conn, v, &mut cleaned).unwrap();
+    }
+    conn.pragma_update(None, "user_version", 35).unwrap();
+
+    conn.execute(
+        "INSERT INTO requests (id, ts, model, account_id, account_name, status, provider, client, origin) \
+         VALUES ('req-ld-1', 1760000000000, 'gemini-4-neon', 'local-direct', '本机直连', 200, 'local-direct', 'Antigravity', 'local_direct')",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO local_direct_refs (request_id, agent_id, root_kind, source_key, ts) \
+         VALUES ('req-ld-1', 'antigravity', 'desktop', 'k-1', 1760000000000)",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO requests (id, ts, model, account_id, account_name, status, provider, client, origin) \
+         VALUES ('req-ld-2', 1760000001000, 'gemini-4-neon', 'local-direct:antigravity:custom@example.com', '我的号', 200, 'local-direct', 'Antigravity', 'local_direct')",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO local_direct_refs (request_id, agent_id, root_kind, source_key, ts) \
+         VALUES ('req-ld-2', 'antigravity', 'cli', 'k-2', 1760000001000)",
+        [],
+    )
+    .unwrap();
+
+    let daily_stats = serde_json::json!([
+        {"provider": "antigravity", "requests": 2, "successful": 2, "tokens": 100, "costUsd": 0.1, "unpricedRequests": 0},
+        {"provider": "local-direct", "requests": 3, "successful": 3, "tokens": 250, "costUsd": 0.25, "unpricedRequests": 1}
+    ])
+    .to_string();
+    conn.execute(
+        "INSERT INTO request_daily (date, requests, successful, tokens, provider_stats) \
+         VALUES ('2026-11-26', 5, 5, 350, ?1)",
+        [daily_stats],
+    )
+    .unwrap();
+
+    migrate(&conn).unwrap();
+    assert_eq!(version(&conn), SCHEMA_VERSION);
+
+    let (p1, aid1, aname1): (String, String, String) = conn
+        .query_row(
+            "SELECT provider, account_id, account_name FROM requests WHERE id='req-ld-1'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(p1, "antigravity");
+    assert_eq!(aid1, "local-direct:antigravity:desktop");
+    assert_eq!(aname1, "桌面版");
+
+    let (p2, aid2, aname2): (String, String, String) = conn
+        .query_row(
+            "SELECT provider, account_id, account_name FROM requests WHERE id='req-ld-2'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(p2, "antigravity");
+    assert_eq!(aid2, "local-direct:antigravity:custom@example.com");
+    assert_eq!(aname2, "我的号");
+
+    let merged_raw: String = conn
+        .query_row(
+            "SELECT provider_stats FROM request_daily WHERE date='2026-11-26'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let merged: Vec<serde_json::Value> = serde_json::from_str(&merged_raw).unwrap();
+    assert_eq!(merged.len(), 1);
+    assert_eq!(merged[0]["provider"], "antigravity");
+    assert_eq!(merged[0]["requests"], 5);
+    assert_eq!(merged[0]["successful"], 5);
+    assert_eq!(merged[0]["tokens"], 350);
+    assert_eq!(merged[0]["unpricedRequests"], 1);
 }

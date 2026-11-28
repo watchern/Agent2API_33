@@ -1984,6 +1984,7 @@ pub fn shim_js() -> &'static str {
     createKey: function (payload) { return call('POST', '/api/keys', payload || {}); },
     updateKey: function (id, patch) { return call('PATCH', '/api/keys/' + encodeURIComponent(id), patch); },
     deleteKey: function (id) { return call('DELETE', '/api/keys/' + encodeURIComponent(id)); },
+    resetKeyUsage: function (id) { return call('POST', '/api/keys/' + encodeURIComponent(id) + '/reset-usage', {}); },
 
     // ── 多账号 ──
     getAccounts: function (query) { return call('GET', '/api/accounts' + toQuery(query)); },
@@ -2084,7 +2085,11 @@ pub fn shim_js() -> &'static str {
     createProxyPoolItem: function (payload) { return call('POST', '/api/proxies/pool', payload || {}); },
     updateProxyPoolItem: function (payload) { return call('POST', '/api/proxies/pool/update', payload || {}); },
     setProxyPoolItemEnabled: function (payload) { return call('POST', '/api/proxies/pool/enable', payload || {}); },
-    removeProxyPoolItem: function (id) { return call('POST', '/api/proxies/pool/remove', { id: String(id || '') }); },
+    removeProxyPoolItem: function (id, options) {
+      var body = { id: String(id || '') };
+      if (options && options.resetUpdateProxy === true) body.resetUpdateProxy = true;
+      return call('POST', '/api/proxies/pool/remove', body);
+    },
     testProxyPoolItem: function (id) { return call('POST', '/api/proxies/pool/test', { id: String(id || '') }); },
     syncClashToProxyPool: function () { return call('POST', '/api/proxies/pool/sync-clash', {}); },
     // 代理设置（「网络代理」页的设置弹窗；与桌面壳 bridge.rs 的同名方法
@@ -2418,7 +2423,7 @@ pub fn shim_js() -> &'static str {
     getLogStats: function () { return call('GET', '/api/logs/stats'); },
     // 插件页面清单（侧边栏动态菜单用）。与 desktop 壳的 bridge.rs 同名方法
     // **必须成对维护** —— 只改一边会让 headless 面板里插件页静默消失。
-    getPlugins: function () { return call('GET', '/api/plugins'); },
+    getPlugins: function (rev) { return call('GET', rev ? '/api/plugins' + toQuery({ rev: rev }) : '/api/plugins'); },
     // 侧边栏布局（分组 / 顺序 / 显隐）。与 desktop 壳 bridge.rs 的同名方法
     // **必须成对维护** —— 漏了这一边，网页端就改不到库里的那份布局，
     // 「在 WebUI 里隐藏的菜单客户端也跟着隐藏」这条功能等于不存在。

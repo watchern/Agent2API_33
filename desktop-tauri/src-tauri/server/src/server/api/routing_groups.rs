@@ -93,8 +93,8 @@ fn preview_json_with_accounts(state: &ServerState, payload: Preview, accounts: &
     let mut member_blocked = Vec::new();
     let group = payload.group.or_else(|| profiles.group_for_model(&payload.model).cloned());
     let mut candidates = if let Some(group) = &group {
-        settings = group.settings(base);
-        let projection = routing_groups::project(group, accounts, &payload.needs, None);
+        settings = group.settings(profiles.settings_for("", base));
+        let projection = routing_groups::project(group, &accounts, &payload.needs, None);
         member_blocked = projection.blocked;
         projection.accounts
     } else {
@@ -107,7 +107,8 @@ fn preview_json_with_accounts(state: &ServerState, payload: Preview, accounts: &
         }
         settings = snapshot.settings_for(&payload.model, base);
         let profile = if let Some(mut profile) = global_draft {
-            let sorting = crate::server::core::account_order::sorting(accounts, crate::server::logging::now_ms());
+            profile.account_order_mode.clear();
+            let sorting = crate::server::core::account_order::sorting(&accounts, crate::server::logging::now_ms());
             for (provider, rules) in &sorting.rules {
                 let automatic = rules.iter().any(|rule| sorting.rule_enabled(provider, rule));
                 if automatic { profile.account_order.remove(provider); }
@@ -141,7 +142,8 @@ fn preview_json_with_accounts(state: &ServerState, payload: Preview, accounts: &
         .map(routing_groups::attempt_key).collect();
     let facts_at = started.elapsed();
     let meta = routing::PlanMeta { strategy: settings.strategy, sunk: &sunk, resting: &resting, open: &open,
-        limiter_blocked: &limiter, cursor: None, provider_cursors: None, sticky_account: None };
+        limiter_blocked: &limiter, cursor: None, provider_cursors: None, sticky_account: None,
+        sticky_beats_order: settings.priority.sticky_beats_order() };
     let mut plan = routing::plan_route(&candidates, &keys, &counts, &[], now, &meta);
     if payload.fail_first {
         if let Some(first) = plan.ordered.first() {
@@ -169,7 +171,7 @@ fn preview_json_with_accounts(state: &ServerState, payload: Preview, accounts: &
     let rows_at = started.elapsed();
     let result = json!({ "model": payload.model, "customized": group.is_some() || profiles.model_profile(&payload.model).is_some(),
         "group": group, "preview": true, "settings": super::routing_api::routing_json(settings),
-        "queue": { "strategy": settings.strategy.as_str(), "sticky": settings.sticky.as_str(),
+        "queue": { "strategy": settings.strategy.as_str(), "sticky": settings.sticky.as_str(), "priority": settings.priority.as_str(),
             "pickedId": plan.ordered.first().map(|entry| &entry.id), "ordered": ordered, "blocked": blocked } });
     let render_at = started.elapsed();
     if render_at.as_millis() > 1_000 {

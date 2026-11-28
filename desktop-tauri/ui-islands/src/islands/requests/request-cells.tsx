@@ -7,6 +7,7 @@ import { numberText } from '../accounts-shared'
 import { apiKeyRequestLabel, clientRequestLabel } from './source-filters'
 import { ClientBrand, ProviderBrand } from './request-brand'
 import { visionDetail } from '../../../../ui-shared/request-vision-detail'
+import { describeRequestProtocol } from '../../../../ui-shared/request-protocol'
 import { formatCost, pricingSourceLabel, usePricingDisplay, type ModelPricingInfo } from '../model-pricing'
 
 export type RequestEntry = {
@@ -15,6 +16,7 @@ export type RequestEntry = {
   provider?: string; providerLabel?: string; accountId?: string; accountName?: string
   model?: string; clientModel?: string; upstreamModel?: string
   clientReasoning?: string; upstreamReasoning?: string
+  clientProtocol?: string; upstreamProtocol?: string
   durationMs?: number; firstResponseMs?: number | null
   promptTokens?: number; completionTokens?: number; totalTokens?: number; cacheReadTokens?: number
   cacheCreationTokens?: number; cacheCreation1hTokens?: number
@@ -80,7 +82,6 @@ function formatDurationCompact(ms: unknown): string {
 
 const SPEED_TIP = t('生成速度：输出 token ÷ 流式段用时（总用时 − 首响）；流式段不足总用时一半时按总用时计')
 const STREAM_MS_FLOOR = 500
-const LONG_OUTPUT_TOKEN_FLOOR = 100
 
 type MetricTone = 'good' | 'info' | 'warn' | 'bad' | ''
 
@@ -113,19 +114,6 @@ function ttftTone(ms: unknown): MetricTone {
   if (value < 2000) return 'good'
   if (value < 5000) return 'info'
   if (value < 10_000) return 'warn'
-  return 'bad'
-}
-
-function durationTone(entry: RequestEntry, ok: boolean, speedRate: number | null): MetricTone {
-  if (!ok) return ''
-  const ms = Number(entry.durationMs) || 0
-  if (ms <= 0) return ''
-  const completion = Number(entry.completionTokens) || 0
-  if (completion >= LONG_OUTPUT_TOKEN_FLOOR && speedRate !== null) return speedTone(speedRate)
-  const sec = ms / 1000
-  if (sec < 5) return 'good'
-  if (sec < 15) return 'info'
-  if (sec < 30) return 'warn'
   return 'bad'
 }
 
@@ -182,6 +170,24 @@ function countRetries(entry: RequestEntry): number {
     const retries = (item as { retries?: unknown[] } | null)?.retries
     return sum + (Array.isArray(retries) ? retries.length : 0)
   }, 0)
+}
+
+export function formatModelWithReasoning(name: string, level: string, origin?: string): string {
+  if (!level) return name
+  const lowerName = name.toLowerCase()
+  const lowerLevel = level.toLowerCase()
+  if (lowerName.endsWith(`(${lowerLevel})`) || lowerName.endsWith(`（${lowerLevel}）`)) {
+    return name
+  }
+  if (
+    origin === 'local_direct'
+    && lowerLevel !== 'max'
+    && (lowerName.endsWith(`-${lowerLevel}`) || lowerName.endsWith(`_${lowerLevel}`))
+    && name.length > level.length + 1
+  ) {
+    return `${name.slice(0, -(level.length + 1))}(${level})`
+  }
+  return `${name}(${level})`
 }
 
 export function providerLabelOf(id: string): string {
@@ -395,6 +401,13 @@ export function RequestCell({
       const fromBackend = String(entry.providerLabel ?? '').trim()
       const provider = fromBackend ? t(fromBackend) : (id ? providerLabelOf(id) : '')
       const providerTitle = id && id !== provider ? t('{name}（{id}）', { name: provider, id }) : provider
+      const rawAccountId = String(entry.accountId ?? '')
+      const localDirectTail = rawAccountId.startsWith('local-direct:')
+        ? rawAccountId.split(':').slice(2).join(':')
+        : ''
+      const accountTitle = localDirectTail
+        ? (localDirectTail.includes('@') ? localDirectTail : entry.accountName)
+        : (entry.accountId || entry.accountName)
       return (
         <span key={key} className={className}>
           {provider ? (
@@ -404,7 +417,7 @@ export function RequestCell({
               title={t('这条明细没有记录提供商（旧数据或请求未走到转发）')}>—</span>
           )}
           {entry.accountName ? (
-            <span className='req-acct req-sub-indent' title={namesHidden ? undefined : entry.accountId || entry.accountName}>
+            <span className='req-acct req-sub-indent' title={namesHidden ? undefined : accountTitle}>
               {namesHidden ? maskName(entry.accountName) : entry.accountName}
             </span>
           ) : (
@@ -421,7 +434,7 @@ export function RequestCell({
       const shown = String(entry.model ?? '').trim()
       const clientLevel = String(entry.clientReasoning ?? '').trim()
       const upstreamLevel = String(entry.upstreamReasoning ?? '').trim()
-      const tag = (name: string, level: string) => (level ? `${name}(${level})` : name)
+      const tag = (name: string, level: string) => formatModelWithReasoning(name, level, entry.origin)
       const isMapped = Boolean(client && upstream && upstream.toLowerCase() !== client.toLowerCase())
       const mainText = isMapped ? tag(upstream, upstreamLevel) : tag(shown, upstreamLevel || clientLevel)
       const subText = isMapped ? tag(client, clientLevel) : ''
@@ -436,6 +449,32 @@ export function RequestCell({
           {subText ? (
             <span className='req-model-line sub' title={t('下游请求的模型：{model}', { model: subText })}>
               ↳ {subText}
+            </span>
+          ) : null}
+        </span>
+      )
+    }
+
+    case 'protocol': {
+      const proto = describeRequestProtocol(entry.clientProtocol, entry.upstreamProtocol, t)
+      if (!proto.mainLabel) {
+        return (
+          <span key={key} className={`${className} req-protocol-stack`}>
+            <span className='req-model-line is-empty'>—</span>
+          </span>
+        )
+      }
+      const mainTitle = proto.converted
+        ? t('转发到上游的协议：{protocol}', { protocol: proto.mainFullLabel })
+        : t('请求协议：{protocol}', { protocol: proto.mainFullLabel })
+      return (
+        <span key={key} className={`${className} req-protocol-stack`}>
+          <span className='req-model-line' title={mainTitle}>
+            {proto.mainLabel}
+          </span>
+          {proto.subLabel ? (
+            <span className='req-model-line sub' title={t('下游请求的协议：{protocol}', { protocol: proto.subFullLabel })}>
+              ↳ {proto.subLabel}
             </span>
           ) : null}
         </span>
@@ -460,8 +499,6 @@ export function RequestCell({
         )
       }
       const first = formatFirstResponseCompact(entry.firstResponseMs)
-      const speedRate = ok ? tokensPerSecondNumber(entry) : null
-      const durCls = `req-dur-line${toneClass(durationTone(entry, ok, speedRate))}`
       const firstCls = `req-dur-line sub${ok ? toneClass(ttftTone(entry.firstResponseMs)) : ''}`
       const tipLines = [
         `${t('总耗时')}：${formatDurationExact(entry.durationMs)}`,
@@ -469,7 +506,7 @@ export function RequestCell({
       ].filter(Boolean)
       return (
         <span key={key} className={className} title={tipLines.join('\n')}>
-          <span className={durCls}>{formatDurationCompact(entry.durationMs)}</span>
+          <span className='req-dur-line'>{formatDurationCompact(entry.durationMs)}</span>
           {first ? <span className={firstCls}>{t('首字 {time}', { time: first })}</span> : null}
         </span>
       )
